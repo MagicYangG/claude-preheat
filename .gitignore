@@ -21,3 +21,6 @@ schedule.json
 # local tool state - NEVER publish (contains personal identifiers)
 .claude/
 .vscode/
+
+# local promo assets (videos live here, never ship)
+/claude-ignite-promo/
