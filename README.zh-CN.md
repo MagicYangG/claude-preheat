@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文** | [日本語](README.ja.md) | [한국어](README.ko.md)
 
+![claude-preheat 演示](docs/demo.gif)
+
 针对在 Windows 上使用 Claude Code CLI 的 Claude 订阅用户，本工具提供可视化的窗口额度定时预热：5 小时额度窗口由额度空窗期的第一条消息锚定，定时发出一条极小的 ping 就能把窗口抢先锚在你规定的时刻，让你真正开展工作时可以横跨两个 5 小时额度窗口。具体包含：
 
 1. 以周为维度，窗口额度定时预热

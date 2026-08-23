@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | **한국어**
 
+![claude-preheat 데모](docs/demo.gif)
+
 Windows에서 Claude Code CLI로 작업하는 Claude 구독 사용자를 위한 도구입니다. 5시간 사용량 윈도우는 활성 윈도우가 없을 때 보낸 첫 메시지에 앵커됩니다 — 예약된 아주 작은 핑으로 원하는 시각에 윈도우를 앵커해, 실제 작업이 5시간 윈도우 두 개에 걸쳐 이어지게 합니다. 제공 기능은 두 가지:
 
 1. 주 단위 정기 예열
