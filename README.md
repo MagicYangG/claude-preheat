@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-![claude-preheat demo](docs/demo.gif)
+![claude-preheat demo](docs/demo.webp)
 
 For Claude subscribers who work in the Claude Code CLI on Windows. The 5-hour usage window is anchored by the first message sent while no window is active — a scheduled tiny ping anchors it at the time you choose, so your real session spans two 5-hour windows instead of being cut mid-flow. Two flavors:
 
