@@ -24,3 +24,6 @@ schedule.json
 
 # local promo assets (videos live here, never ship)
 /claude-ignite-promo/
+
+# macOS runtime logs
+launchd-err.log

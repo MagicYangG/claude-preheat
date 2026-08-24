@@ -90,17 +90,42 @@ if ($existingMatch.Success -and $existingMatch.Value -eq $blockText -and -not $h
     }
 }
 
+$onMac = $false
+try { if ($IsMacOS) { $onMac = $true } } catch { }
+
 # 3) v0.2 -> v0.3 cleanup: relay is gone (claude CLI >= 2.1.234 auto-continues
 # at limit reset natively). Only the relay probe task is ours to remove here -
-# ClaudePreheat-* tasks are live and stay untouched.
-$probeTask = Get-ScheduledTask -TaskName 'ClaudeRelay-Probe' -ErrorAction SilentlyContinue
-if ($probeTask) {
-    Unregister-ScheduledTask -TaskName 'ClaudeRelay-Probe' -Confirm:$false
-    Write-Host "[ok] removed v0.2 scheduled task ClaudeRelay-Probe"
+# ClaudePreheat-* tasks are live and stay untouched. (Windows-only history:
+# no v0.2 install ever existed on macOS.)
+if (-not $onMac) {
+    $probeTask = Get-ScheduledTask -TaskName 'ClaudeRelay-Probe' -ErrorAction SilentlyContinue
+    if ($probeTask) {
+        Unregister-ScheduledTask -TaskName 'ClaudeRelay-Probe' -Confirm:$false
+        Write-Host "[ok] removed v0.2 scheduled task ClaudeRelay-Probe"
+    }
 }
 $legacyJson = @(Get-ChildItem -Path (Join-Path $repoDir 'armed'), (Join-Path $repoDir 'done') -Filter *.json -ErrorAction SilentlyContinue)
 if ($legacyJson.Count -gt 0) {
     Write-Host "[note] armed\ and done\ hold v0.2 relay leftovers - inert now, safe to delete"
+}
+
+# 4) macOS: the profile functions only exist inside pwsh, but Mac users live in
+# zsh - drop thin shims into ~/.local/bin so `preheat` / `claude-panel` work
+# from any shell
+if ($onMac) {
+    $binDir = Join-Path $HOME '.local/bin'
+    if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
+    $pwshBin = (Get-Process -Id $PID).Path
+    foreach ($pair in @(@('preheat', 'preheat.ps1'), @('claude-panel', 'panel.ps1'))) {
+        $shim = Join-Path $binDir $pair[0]
+        $body = "#!/bin/bash`nexec `"$pwshBin`" -NoProfile -File `"$(Join-Path $repoDir $pair[1])`" `"`$@`"`n"
+        [System.IO.File]::WriteAllText($shim, $body, (New-Object System.Text.UTF8Encoding($false)))
+        & chmod +x $shim
+        Write-Host "[ok] shim $shim"
+    }
+    if (($env:PATH -split ':') -notcontains $binDir) {
+        Write-Warning "$binDir is not on PATH - add to ~/.zshrc:  export PATH=`"`$HOME/.local/bin:`$PATH`""
+    }
 }
 
 Write-Host ""

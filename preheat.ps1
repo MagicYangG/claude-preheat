@@ -47,6 +47,10 @@ $WindowHours = 5
 $DayMap   = @{ Mon = 'Monday'; Tue = 'Tuesday'; Wed = 'Wednesday'; Thu = 'Thursday'; Fri = 'Friday'; Sat = 'Saturday'; Sun = 'Sunday' }
 $DayOrder = @('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
 
+# OS adapter: scheduling backends (Task Scheduler / launchd), wake warnings,
+# toasts, home-dir resolution. Shared with panel.ps1.
+. (Join-Path $Root 'platform.ps1')
+
 function Read-Config {
     if (-not (Test-Path $ConfigPath)) { throw "schedule.json not found at $ConfigPath" }
     Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -88,16 +92,15 @@ function Resolve-ClaudeExe {
         }
         return $src
     }
-    foreach ($cand in @("$env:APPDATA\npm\claude.cmd", "$env:USERPROFILE\.local\bin\claude.exe")) {
+    $cands = if ($OnMac) {
+        @((Join-Path $HOME '.local/bin/claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude')
+    } else {
+        @("$env:APPDATA\npm\claude.cmd", "$env:USERPROFILE\.local\bin\claude.exe")
+    }
+    foreach ($cand in $cands) {
         if (Test-Path $cand) { return $cand }
     }
     throw 'claude CLI not found (PATH incomplete in this context and no known fallback matched)'
-}
-
-function Resolve-HostShell {
-    $p = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($p) { return $p.Source }
-    (Get-Command powershell).Source
 }
 
 function Get-Proxy {
@@ -134,52 +137,21 @@ function Get-FireSpecs($config) {
     $specs
 }
 
-function New-PreheatAction {
-    # via run-hidden.vbs: a console action flashes a cmd window at every fire
-    New-ScheduledTaskAction -Execute 'wscript.exe' `
-        -Argument ('//B //Nologo "{0}" "{1}" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "{2}" "fire"' -f `
-            (Join-Path $Root 'run-hidden.vbs'), (Resolve-HostShell), (Join-Path $Root 'preheat.ps1'))
-}
-
-function New-PreheatSettings {
-    New-ScheduledTaskSettingsSet -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
-}
-
-function Test-WakeTimers {
-    # warn if wake timers are disabled in the active power plan (AC)
-    try {
-        $out = powercfg /query SCHEME_CURRENT SUB_SLEEP RTCWAKE 2>$null
-        # locale-invariant: first line containing a 0x value is the AC setting index
-        # (localized label text would mojibake under BOM-less UTF-8 on powershell.exe 5.1)
-        $line = ($out | Select-String '0x[0-9a-fA-F]{8}' | Select-Object -First 1)
-        if ($line) {
-            $v = $line.ToString()
-            if ($v -match '0x0+$') {
-                Write-Warning 'Wake timers DISABLED on AC power - preheat cannot wake the PC from sleep. Enable: powercfg -> Sleep -> Allow wake timers'
-            } elseif ($v -match '0x0*2$') {
-                Write-Warning 'Wake timers = "important only" - a user scheduled task may NOT wake the PC. Set to Enabled to be safe.'
-            }
-        }
-    } catch { }
-}
-
 function Invoke-Apply {
     $config = Read-Config
     $specs  = Get-FireSpecs $config
     # resolve claude path now, in an interactive shell where PATH is complete
     Write-State @{ claude = (Resolve-ClaudeExe); pwsh = (Resolve-HostShell); appliedAt = (Get-Date).ToString('s') }
-    Get-ScheduledTask -TaskName "$TaskWkPrefix*" -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
-    $action   = New-PreheatAction
-    $settings = New-PreheatSettings
+    Remove-PreheatJobs "$TaskWkPrefix*"
+    try { Remove-StaleOnceJobs } catch { }
     foreach ($s in $specs) {
         # StartBoundary must be in the future, else the scheduler's week alignment
         # can skip the nearest occurrence (observed: Sat task jumping a full week)
         $at = (Get-Date).Date + $s.FireTime
         if ($at -le (Get-Date)) { $at = $at.AddDays(1) }
-        $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $s.Days -At $at
         $dayTag  = ($s.Days | ForEach-Object { $_.Substring(0, 3) }) -join ''
         $name    = '{0}-{1}-{2}' -f $TaskWkPrefix, $s.FireTime.ToString('hhmm'), $dayTag
-        Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+        Register-PreheatJob -Name $name -Days $s.Days -At $at
         Write-Host ('registered  {0}  fire {1}  -> reset {2}  [{3}]' -f $name, $s.FireTime.ToString('hh\:mm'), $s.Reset, ($s.Days -join ','))
     }
     Write-Log @{ ev = 'apply'; tasks = $specs.Count }
@@ -221,7 +193,7 @@ function Get-LastLocalActivity {
     # last locally visible Claude usage, judged by transcript CONTENT.
     # Blind to phone/web usage - like any local observation.
     try {
-        $proj = Join-Path $HOME '.claude\projects'
+        $proj = Join-Path (Join-Path (Get-ClaudeHome) '.claude') 'projects'
         if (-not (Test-Path $proj)) { return $null }
         $files = @(Get-ChildItem -Path $proj -Filter '*.jsonl' -Recurse -File -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 8)
@@ -235,28 +207,9 @@ function Get-LastLocalActivity {
     } catch { return $null }
 }
 
-function Send-Toast($ok) {
-    try {
-        if (Get-Module -ListAvailable -Name BurntToast) {
-            Import-Module BurntToast -ErrorAction Stop
-            $msg = if ($ok) { 'window preheated' } else { 'preheat FAILED - check preheat-log.jsonl' }
-            New-BurntToastNotification -Text 'claude-preheat', $msg | Out-Null
-        }
-    } catch { }
-}
-
-function Remove-StaleOnceTasks {
-    Get-ScheduledTask -TaskName "$TaskOncePrefix*" -ErrorAction SilentlyContinue | ForEach-Object {
-        $info = $_ | Get-ScheduledTaskInfo
-        if (-not $info.NextRunTime -or $info.NextRunTime -lt (Get-Date).AddMinutes(-3)) {
-            $_ | Unregister-ScheduledTask -Confirm:$false
-        }
-    }
-}
-
 function Invoke-Fire {
     # nothing before the ping may block the ping
-    try { Remove-StaleOnceTasks } catch { }
+    try { Remove-StaleOnceJobs } catch { }
     $proxy = Get-Proxy
     if ($proxy) { $env:HTTPS_PROXY = $proxy; $env:HTTP_PROXY = $proxy }
     if (-not (Test-Path $FirePit)) {
@@ -340,9 +293,8 @@ function Invoke-Fire {
 
 function Invoke-Once($fireAt, $label) {
     if ($fireAt -le (Get-Date)) { throw "fire time $fireAt is in the past" }
-    $trigger = New-ScheduledTaskTrigger -Once -At $fireAt
-    $name    = '{0}-{1}' -f $TaskOncePrefix, $fireAt.ToString('yyyyMMdd-HHmm')
-    Register-ScheduledTask -TaskName $name -Action (New-PreheatAction) -Trigger $trigger -Settings (New-PreheatSettings) -Force | Out-Null
+    $name = '{0}-{1}' -f $TaskOncePrefix, $fireAt.ToString('yyyyMMdd-HHmm')
+    Register-PreheatJob -Name $name -At $fireAt
     Write-Log @{ ev = 'schedule-once'; fireAt = $fireAt.ToString('s'); label = $label }
     Write-Host ('one-shot registered: fire at {0}  ({1})' -f $fireAt.ToString('yyyy-MM-dd HH:mm'), $label)
 }
@@ -370,11 +322,10 @@ function Invoke-Status {
     }
     Write-Host ''
     Write-Host '-- scheduled preheats --'
-    $tasks = Get-ScheduledTask -TaskName 'ClaudePreheat*' -ErrorAction SilentlyContinue
-    if ($tasks) {
+    $tasks = @(Get-PreheatJobs)
+    if ($tasks.Count -gt 0) {
         foreach ($t in $tasks) {
-            $info = $t | Get-ScheduledTaskInfo
-            Write-Host ('{0}  next: {1}' -f $t.TaskName.PadRight(40), $info.NextRunTime)
+            Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $t.next)
         }
     } else {
         Write-Host '(none - run: preheat apply)'
@@ -411,14 +362,10 @@ function Invoke-StatusJson {
     $lastIso = $null
     if ($last) { $lastIso = $last.ToString('yyyy-MM-ddTHH:mm:ss') }
     $tasks = @()
-    $rawTasks = Get-ScheduledTask -TaskName 'ClaudePreheat*' -ErrorAction SilentlyContinue
-    if ($rawTasks) {
-        foreach ($t in $rawTasks) {
-            $info = $t | Get-ScheduledTaskInfo
-            $next = $null
-            if ($info.NextRunTime) { $next = $info.NextRunTime.ToString('yyyy-MM-ddTHH:mm:ss') }
-            $tasks += @{ name = $t.TaskName; next = $next }
-        }
+    foreach ($t in @(Get-PreheatJobs)) {
+        $next = $null
+        if ($t.next) { $next = $t.next.ToString('yyyy-MM-ddTHH:mm:ss') }
+        $tasks += @{ name = $t.name; next = $next }
     }
     $out = @{ lastActivity = $lastIso; tasks = $tasks }
     ConvertTo-Json -InputObject $out -Compress -Depth 6
@@ -430,7 +377,7 @@ function Get-HistoryTimestamps([int]$days = 30) {
     # ~\.claude\history.jsonl logs one line per user prompt with an epoch-ms
     # timestamp - the cheapest full activity record there is (transcripts
     # would mean reading hundreds of MB for the same numbers)
-    $h = Join-Path $env:USERPROFILE '.claude\history.jsonl'
+    $h = Join-Path (Join-Path (Get-ClaudeHome) '.claude') 'history.jsonl'
     $out = New-Object System.Collections.Generic.List[datetime]
     if (-not (Test-Path $h)) { return ,$out }
     $cut = (Get-Date).AddDays(-$days)
@@ -594,7 +541,7 @@ function Invoke-Learn {
 }
 
 function Invoke-Off {
-    Get-ScheduledTask -TaskName 'ClaudePreheat*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+    Remove-PreheatJobs 'ClaudePreheat*'
     Write-Log @{ ev = 'off' }
     Write-Host 'all preheat tasks removed'
 }
@@ -620,7 +567,7 @@ function Invoke-StatusLineSetup {
     if ($onOff -notin @('on', 'off')) { Write-Host 'usage: preheat statusline on | off'; return }
     $tap = Join-Path $Root 'statusline-tap.cjs'
     $sidecar = Join-Path $Root 'statusline-original.json'
-    $claudeDir = Join-Path $env:USERPROFILE '.claude'
+    $claudeDir = Join-Path (Get-ClaudeHome) '.claude'
     $candFiles = @((Join-Path $claudeDir 'settings.local.json'), (Join-Path $claudeDir 'settings.json'))
     $readCmd = {
         param($path)

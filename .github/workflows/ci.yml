@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main, macos-support]
+  workflow_dispatch:
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: self-test (48+ cases)
+        shell: pwsh
+        run: ./test.ps1
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: self-test (48+ cases)
+        shell: pwsh
+        run: ./test.ps1
+      - name: launchd end-to-end (stubbed claude)
+        shell: pwsh
+        run: ./.github/workflows/e2e-mac.ps1

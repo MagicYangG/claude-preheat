@@ -230,6 +230,47 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $lines = @(Get-Content $LogPath)
         ($before -gt 2MB) -and ($lines.Count -eq 1001) -and ($lines[-1] -like '*"ev":"test"*')
     }
+
+    Write-Host '-- platform: job names + launchd mapping (pure, runs on any OS) --'
+    Test-Case 'launchd label round-trip preserves the job name' {
+        (ConvertFrom-LaunchdLabel (ConvertTo-LaunchdLabel 'ClaudePreheat-Wk-0400-MonTueWedThuFri')) -eq 'ClaudePreheat-Wk-0400-MonTueWedThuFri'
+    }
+    Test-Case 'weekly name -> next run: encoded weekday + time, always in the future' {
+        $n = Get-JobNextRun 'ClaudePreheat-Wk-0330-MonTueWedThu'
+        ($n -gt (Get-Date)) -and ($n.Hour -eq 3) -and ($n.Minute -eq 30) -and
+            (@('Monday', 'Tuesday', 'Wednesday', 'Thursday') -contains $n.DayOfWeek.ToString())
+    }
+    Test-Case 'once name -> next run: exact datetime parsed from the name' {
+        (Get-JobNextRun 'ClaudePreheat-Once-20261231-1530') -eq ([datetime]::new(2026, 12, 31, 15, 30, 0))
+    }
+    Test-Case 'unrecognized job name -> null next run' {
+        $null -eq (Get-JobNextRun 'SomethingElse')
+    }
+    Test-Case 'weekly plist: one Weekday dict per day, hour/minute, paths, PATH snapshot' {
+        $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Wk-0400-SatSun' -Days @('Saturday', 'Sunday') `
+            -At ([datetime]::new(2026, 1, 1, 4, 0, 0)) -HostShell '/usr/local/bin/pwsh' -ScriptPath '/repo/preheat.ps1' -PathEnv '/usr/bin:/bin'
+        (([regex]::Matches($xml, '<key>Weekday</key>')).Count -eq 2) -and
+            ($xml -like '*<key>Weekday</key><integer>6</integer>*') -and
+            ($xml -like '*<key>Weekday</key><integer>0</integer>*') -and
+            ($xml -like '*<key>Hour</key><integer>4</integer>*') -and
+            ($xml -like '*<string>/usr/local/bin/pwsh</string>*') -and
+            ($xml -like '*<string>/repo/preheat.ps1</string>*') -and
+            ($xml -like '*<key>PATH</key><string>/usr/bin:/bin</string>*') -and
+            ($xml -like '*com.claude-preheat.Wk-0400-SatSun*')
+    }
+    Test-Case 'once plist: pins Month and Day (stale cleanup neutralizes the yearly repeat)' {
+        $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260824-1530' -Days @() `
+            -At ([datetime]::new(2026, 8, 24, 15, 30, 0)) -HostShell '/p' -ScriptPath '/s' -PathEnv '/b'
+        ($xml -like '*<key>Month</key><integer>8</integer>*') -and
+            ($xml -like '*<key>Day</key><integer>24</integer>*') -and
+            ($xml -like '*<key>Minute</key><integer>30</integer>*') -and
+            ($xml -notlike '*Weekday*')
+    }
+    Test-Case 'plist XML-escapes ampersands in paths and PATH' {
+        $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260101-0000' -Days @() `
+            -At ([datetime]::new(2026, 1, 1, 0, 0, 0)) -HostShell '/a&b/pwsh' -ScriptPath '/s' -PathEnv '/x&y'
+        ($xml -like '*/a&amp;b/pwsh*') -and ($xml -like '*/x&amp;y*') -and ($xml -notlike '*<string>/a&b/pwsh</string>*')
+    }
 }
 
 # ------------------------------------------------------------------ panel.ps1
@@ -375,7 +416,7 @@ Test-Case 'panel page ships bilingual: string table, language toggle, persisted 
         ($h -match 'function t\(')
 }
 Test-Case 'the scheduled-task registrar keeps -WakeToRun (sleep must not eat a fire)' {
-    (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match '-WakeToRun'
+    (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8) -match '-WakeToRun'
 }
 Test-Case 'Quote-Arg doubles backslash runs before quotes (argv-splice guard)' {
     # Windows argv parsing treats  \"  as an escaped quote: quoting that only

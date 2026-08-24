@@ -40,6 +40,9 @@ $PreheatScript = Join-Path $Root 'preheat.ps1'
 $PanelLog     = Join-Path $Root 'panel-log.txt'
 $ConfigPath   = Join-Path $Root 'schedule.json'
 
+# OS adapter: job listing (Task Scheduler / launchd), host-shell resolution
+. (Join-Path $Root 'platform.ps1')
+
 # cache for the preheat-status read: it runs in-process, but each uncached
 # poll is still a Get-ScheduledTask + Get-ScheduledTaskInfo query, so keep a
 # short TTL
@@ -50,11 +53,6 @@ $PreheatStatusCacheTtlSec  = 30
 $script:LearnCache         = @{ value = $null; ts = [datetime]::MinValue }
 $LearnCacheTtlSec          = 600
 
-function Resolve-HostShell {
-    $p = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($p) { return $p.Source }
-    (Get-Command powershell).Source
-}
 $Shell = Resolve-HostShell
 
 function Write-PanelLog([string]$line) {
@@ -138,11 +136,10 @@ function Get-ResultMessage($res) {
 function Get-PreheatStatusObject {
     $tasks = @()
     try {
-        foreach ($t in @(Get-ScheduledTask -TaskName 'ClaudePreheat*' -ErrorAction SilentlyContinue)) {
-            $info = $t | Get-ScheduledTaskInfo
+        foreach ($t in @(Get-PreheatJobs)) {
             $next = $null
-            if ($info.NextRunTime) { $next = $info.NextRunTime.ToString('yyyy-MM-ddTHH:mm:ss') }
-            $tasks += @{ name = $t.TaskName; next = $next }
+            if ($t.next) { $next = $t.next.ToString('yyyy-MM-ddTHH:mm:ss') }
+            $tasks += @{ name = $t.name; next = $next }
         }
     } catch { }
     @{ tasks = $tasks }
@@ -414,7 +411,8 @@ Write-Host ''
 Write-PanelLog ('start ' + $Prefix)
 
 if (-not $NoBrowser) {
-    try { Start-Process $Prefix } catch { }
+    # Start-Process on a bare URL only works on Windows; macOS uses open(1)
+    try { if ($OnMac) { & open $Prefix } else { Start-Process $Prefix } } catch { }
 }
 
 try {
