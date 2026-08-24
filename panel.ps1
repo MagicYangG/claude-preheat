@@ -382,7 +382,15 @@ function Handle-Request($context) {
 
 $Prefix = "http://localhost:$Port/"
 # singleton guard: a second instance must fail loudly, never zombie (observed live)
-if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
+# Get-NetTCPConnection is Windows-only; macOS asks lsof the same question
+$portBusy = $false
+if ($OnMac) {
+    & lsof -nP -iTCP:$Port -sTCP:LISTEN 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { $portBusy = $true }
+} elseif (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
+    $portBusy = $true
+}
+if ($portBusy) {
     Write-Host ('port {0} already listening - panel is probably running; open {1}' -f $Port, $Prefix)
     exit 2
 }
