@@ -281,9 +281,16 @@ $panelProc = $null
 try {
     $shell = 'pwsh'
     if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) { $shell = 'powershell' }
-    $panelProc = Start-Process $shell -PassThru -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'panel.ps1'),
-        '-Port', $panelPort, '-NoBrowser')
+    $spArgs = @{
+        FilePath = $shell; PassThru = $true
+        ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'panel.ps1'),
+            '-Port', $panelPort, '-NoBrowser')
+    }
+    # -WindowStyle exists only on Windows editions of Start-Process
+    $onWin = $true
+    try { if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) { $onWin = $false } } catch { }
+    if ($onWin) { $spArgs.WindowStyle = 'Hidden' }
+    $panelProc = Start-Process @spArgs
     $base = "http://localhost:$panelPort"
     $up = $false
     for ($i = 0; $i -lt 25 -and -not $up; $i++) {
