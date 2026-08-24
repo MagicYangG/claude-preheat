@@ -365,6 +365,13 @@ try {
 Write-Host ''
 Write-Host '-- statusline tap --'
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+# PowerShell pipes re-encode bytes, so stdin/stdout redirection goes through the
+# native shell: cmd on Windows, sh elsewhere (the `"a" < "b" > "c"` syntax is shared).
+function Invoke-Redirected([string]$Line) {
+    $win = $true
+    try { if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) { $win = $false } } catch { }
+    if ($win) { & cmd /c $Line } else { & sh -c $Line }
+}
 Test-Case 'tap forwards stdin byte-identical and caches rate_limits beside itself' {
     if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return $true }
     $td = Join-Path $Tmp 'tap'
@@ -372,7 +379,7 @@ Test-Case 'tap forwards stdin byte-identical and caches rate_limits beside itsel
     Copy-Item (Join-Path $Repo 'statusline-tap.cjs') $td
     $sample = '{"model":{"display_name":"X"},"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":1786849200}}}'
     [System.IO.File]::WriteAllText((Join-Path $td 'in.json'), $sample)
-    & cmd /c ('"{0}" "{1}" < "{2}" > "{3}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'in.json'), (Join-Path $td 'out.bin'))
+    Invoke-Redirected ('"{0}" "{1}" < "{2}" > "{3}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'in.json'), (Join-Path $td 'out.bin'))
     $in  = [System.IO.File]::ReadAllBytes((Join-Path $td 'in.json'))
     $out = [System.IO.File]::ReadAllBytes((Join-Path $td 'out.bin'))
     $state = Join-Path $td 'state-ratelimits.json'
@@ -382,14 +389,14 @@ Test-Case 'tap forwards stdin byte-identical and caches rate_limits beside itsel
 Test-Case 'tap --solo renders a usage line for users with no statusline of their own' {
     if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return $true }
     $td = Join-Path $Tmp 'tap'
-    $line = & cmd /c ('"{0}" "{1}" --solo < "{2}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'in.json'))
+    $line = Invoke-Redirected ('"{0}" "{1}" --solo < "{2}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'in.json'))
     ($line -join '') -match '5h 12%'
 }
 Test-Case 'tap survives non-JSON stdin by forwarding it untouched' {
     if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return $true }
     $td = Join-Path $Tmp 'tap'
     [System.IO.File]::WriteAllText((Join-Path $td 'junk.txt'), 'not json at all')
-    & cmd /c ('"{0}" "{1}" < "{2}" > "{3}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'junk.txt'), (Join-Path $td 'junk.out'))
+    Invoke-Redirected ('"{0}" "{1}" < "{2}" > "{3}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'junk.txt'), (Join-Path $td 'junk.out'))
     (Get-Content (Join-Path $td 'junk.out') -Raw) -eq 'not json at all'
 }
 
