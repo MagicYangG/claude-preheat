@@ -4,6 +4,9 @@ on:
     branches: [main, macos-support]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test-windows:
     runs-on: windows-latest

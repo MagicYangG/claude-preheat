@@ -124,7 +124,7 @@ function Build-LaunchdPlist {
         <string>fire</string>
     </array>
     <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>$(& $e $PathEnv)</string></dict>
+    <dict><key>PATH</key><string>$(& $e $PathEnv)</string><key>CLAUDE_PREHEAT_SELF</key><string>$(& $e $Name)</string></dict>
 $cal
     <key>StandardErrorPath</key><string>$(& $e $LaunchdErrLog)</string>
 </dict>
@@ -162,7 +162,11 @@ function Register-PreheatJob {
         $uid = Get-MacUid
         & launchctl bootout "gui/$uid/$label" 2>$null | Out-Null      # idempotent re-register
         & launchctl bootstrap "gui/$uid" $plist 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "launchctl bootstrap failed for $label (exit $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0) {
+            # a plist launchd never accepted must not linger: status trusts plist files
+            Remove-Item $plist -Force -ErrorAction SilentlyContinue
+            throw "launchctl bootstrap failed for $label (exit $LASTEXITCODE)"
+        }
     } else {
         $trigger = if ($Days -and $Days.Count -gt 0) { New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Days -At $At }
                    else { New-ScheduledTaskTrigger -Once -At $At }
@@ -212,6 +216,10 @@ function Remove-StaleOnceJobs {
     # macOS the Month/Day calendar spec would come around AGAIN next year
     if ($OnMac) {
         foreach ($j in @(Get-PreheatJobs 'ClaudePreheat-Once*')) {
+            # never boot out the job whose fire is running right now: a fire that
+            # launchd delivers late (wake from sleep) is already past-due by its
+            # own name, and bootout would SIGTERM it before the ping
+            if ($env:CLAUDE_PREHEAT_SELF -and ($j.name -eq $env:CLAUDE_PREHEAT_SELF)) { continue }
             if ($j.next -and ($j.next -lt (Get-Date).AddMinutes(-3))) {
                 Remove-PreheatJobs $j.name
             }

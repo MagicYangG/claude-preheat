@@ -86,9 +86,9 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $s = @(Get-FireSpecs ([pscustomobject]@{ rules = @([pscustomobject]@{ days = @('Mon'); reset = '08:40' }) }))
         ($s[0].FireTime -eq [timespan]::Parse('03:40:00')) -and ($s[0].Days[0] -eq 'Monday')
     }
-    Test-Case 'reset 06:30 -> fire 01:30, same day' {
-        $s = @(Get-FireSpecs ([pscustomobject]@{ rules = @([pscustomobject]@{ days = @('Fri'); reset = '06:30' }) }))
-        ($s[0].FireTime -eq [timespan]::Parse('01:30:00')) -and ($s[0].Days[0] -eq 'Friday')
+    Test-Case 'reset 12:30 -> fire 07:30, same day' {
+        $s = @(Get-FireSpecs ([pscustomobject]@{ rules = @([pscustomobject]@{ days = @('Wed'); reset = '12:30' }) }))
+        ($s[0].FireTime -eq [timespan]::Parse('07:30:00')) -and ($s[0].Days[0] -eq 'Wednesday')
     }
     Test-Case 'reset 02:00 -> fire 21:00 and day shifts back (Mon -> Sunday)' {
         $s = @(Get-FireSpecs ([pscustomobject]@{ rules = @([pscustomobject]@{ days = @('Mon'); reset = '02:00' }) }))
@@ -236,9 +236,9 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         (ConvertFrom-LaunchdLabel (ConvertTo-LaunchdLabel 'ClaudePreheat-Wk-0400-MonTueWedThuFri')) -eq 'ClaudePreheat-Wk-0400-MonTueWedThuFri'
     }
     Test-Case 'weekly name -> next run: encoded weekday + time, always in the future' {
-        $n = Get-JobNextRun 'ClaudePreheat-Wk-0330-MonTueWedThu'
-        ($n -gt (Get-Date)) -and ($n.Hour -eq 3) -and ($n.Minute -eq 30) -and
-            (@('Monday', 'Tuesday', 'Wednesday', 'Thursday') -contains $n.DayOfWeek.ToString())
+        $n = Get-JobNextRun 'ClaudePreheat-Wk-0745-TueWedThu'
+        ($n -gt (Get-Date)) -and ($n.Hour -eq 7) -and ($n.Minute -eq 45) -and
+            (@('Tuesday', 'Wednesday', 'Thursday') -contains $n.DayOfWeek.ToString())
     }
     Test-Case 'once name -> next run: exact datetime parsed from the name' {
         (Get-JobNextRun 'ClaudePreheat-Once-20261231-1530') -eq ([datetime]::new(2026, 12, 31, 15, 30, 0))
@@ -256,6 +256,7 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
             ($xml -like '*<string>/usr/local/bin/pwsh</string>*') -and
             ($xml -like '*<string>/repo/preheat.ps1</string>*') -and
             ($xml -like '*<key>PATH</key><string>/usr/bin:/bin</string>*') -and
+            ($xml -like '*<key>CLAUDE_PREHEAT_SELF</key><string>ClaudePreheat-Wk-0400-SatSun</string>*') -and
             ($xml -like '*com.claude-preheat.Wk-0400-SatSun*')
     }
     Test-Case 'once plist: pins Month and Day (stale cleanup neutralizes the yearly repeat)' {
@@ -460,7 +461,7 @@ Test-Case 'every shipped script carries a UTF-8 BOM (5.1 decodes BOM-less as ANS
     # legacy codepage: on cp936 the middle-dot chars in comments/corpus turn
     # to mojibake, and a bare [] class once became an invalid regex
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'install.ps1', 'test.ps1')) {
+    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1')) {
         $b = [System.IO.File]::ReadAllBytes((Join-Path $Repo $f))
         if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) { $ok = $false }
     }
@@ -487,14 +488,14 @@ Test-Case 'statusline on/off consult BOTH settings files and the sidecar path' {
 }
 Test-Case 'every script parses' {
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'install.ps1', 'test.ps1')) {
+    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1')) {
         try { $null = [scriptblock]::Create((Get-Content (Join-Path $Repo $f) -Raw)) } catch { $ok = $false }
     }
     $ok
 }
 Test-Case 'no PowerShell 7-only syntax (project claims 5.1 support)' {
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'install.ps1')) {
+    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1')) {
         $c = Get-Content (Join-Path $Repo $f) -Raw
         if ($c -match '\?\?' -or $c -match '\)\s*\?\s*[^\s]+\s*:\s') { $ok = $false }
     }
@@ -515,7 +516,8 @@ Test-Case 'the panel surfaces the ratelimit cache bilingually' {
 }
 Test-Case 'personal state stays out of git' {
     $ignored = @('schedule.json', 'preheat-log.jsonl', '.claude',
-        'state-ratelimits.json', 'statusline-original.json')
+        'state-ratelimits.json', 'statusline-original.json',
+        'launchd-err.log', 'claude-ignite-promo')
     $ok = $true
     foreach ($p in $ignored) {
         git -C $Repo check-ignore $p 2>$null | Out-Null

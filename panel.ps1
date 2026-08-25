@@ -385,8 +385,11 @@ $Prefix = "http://localhost:$Port/"
 # Get-NetTCPConnection is Windows-only; macOS asks lsof the same question
 $portBusy = $false
 if ($OnMac) {
-    & lsof -nP -iTCP:$Port -sTCP:LISTEN 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { $portBusy = $true }
+    # no lsof -> treat the port as free; a real clash still fails loudly at the bind below
+    try {
+        & lsof -nP -iTCP:$Port -sTCP:LISTEN 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $portBusy = $true }
+    } catch { }
 } elseif (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
     $portBusy = $true
 }

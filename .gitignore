@@ -23,7 +23,10 @@ schedule.json
 .vscode/
 
 # local promo assets (videos live here, never ship)
-/claude-ignite-promo/
+# no trailing slash: dir-only patterns silently stop matching on a checkout
+# where the dir does not exist (same trap .claude hit)
+/claude-ignite-promo
 
-# macOS runtime logs
+# macOS runtime files
 launchd-err.log
+.DS_Store

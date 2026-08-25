@@ -115,10 +115,15 @@ if ($legacyJson.Count -gt 0) {
 if ($onMac) {
     $binDir = Join-Path $HOME '.local/bin'
     if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
-    $pwshBin = (Get-Process -Id $PID).Path
+    # Get-Command first: .Path (MainModule) is runtime-dependent on macOS and
+    # a null here would bake exec "" into the shim while still printing [ok]
+    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    $pwshBin = if ($pwshCmd) { $pwshCmd.Source } else { (Get-Process -Id $PID).Path }
+    if (-not $pwshBin) { throw 'cannot resolve the pwsh binary path for the shims' }
     foreach ($pair in @(@('preheat', 'preheat.ps1'), @('claude-panel', 'panel.ps1'))) {
         $shim = Join-Path $binDir $pair[0]
-        $body = "#!/bin/bash`nexec `"$pwshBin`" -NoProfile -File `"$(Join-Path $repoDir $pair[1])`" `"`$@`"`n"
+        # single quotes: bash must not re-expand $ or backticks inside the paths
+        $body = "#!/bin/bash`nexec '$pwshBin' -NoProfile -File '$(Join-Path $repoDir $pair[1])' `"`$@`"`n"
         [System.IO.File]::WriteAllText($shim, $body, (New-Object System.Text.UTF8Encoding($false)))
         & chmod +x $shim
         Write-Host "[ok] shim $shim"

@@ -622,7 +622,9 @@ function Invoke-StatusLineSetup {
         } else {
             $json.PSObject.Properties.Remove('statusLine')   # tap was solo: statusLine did not exist before
         }
-        ConvertTo-Json -InputObject $json -Depth 20 | Set-Content -Path $sFile -Encoding UTF8
+        # 5.1's Set-Content -Encoding UTF8 stamps a BOM; BOM-poisoned settings
+        # JSON breaks strict parsers, so write these files BOM-less explicitly
+        [System.IO.File]::WriteAllText($sFile, (ConvertTo-Json -InputObject $json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
         Remove-Item $sidecar -ErrorAction SilentlyContinue
         Write-Host ('statusline tap removed from {0} (backup written)' -f $sFile)
         return
@@ -669,7 +671,7 @@ function Invoke-StatusLineSetup {
     } else {
         $json | Add-Member -NotePropertyName statusLine -NotePropertyValue ([pscustomobject]@{ type = 'command'; command = $newCmd }) -Force
     }
-    ConvertTo-Json -InputObject $json -Depth 20 | Set-Content -Path $sFile -Encoding UTF8
+    [System.IO.File]::WriteAllText($sFile, (ConvertTo-Json -InputObject $json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
     Write-Host ('statusline tap installed in {0} (backup + sidecar written)' -f $sFile)
     Write-Host 'takes effect on the next statusline render; rate limits land in state-ratelimits.json'
     Write-Host 'undo anytime: preheat statusline off'

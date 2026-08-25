@@ -367,7 +367,7 @@ function setBusy(b){
 
 /* ---------- 1. scheduled preheats ---------- */
 function taskLabel(task){
-  // registered task names encode the FIRE time (ClaudePreheat-Wk-0130-FriSat);
+  // registered task names encode the FIRE time (ClaudePreheat-Wk-0400-MonTue);
   // the grid below speaks in RESET times - translate so the two blocks
   // visibly correspond (raw name stays in the row tooltip)
   var m = /^ClaudePreheat-Wk-(\d{2})(\d{2})-(.+)$/.exec(String(task.name || ''));
