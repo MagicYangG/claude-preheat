@@ -474,7 +474,13 @@ function Invoke-Learn {
     $stamps = Get-HistoryTimestamps 30
     if ($stamps.Count -eq 0) {
         if ($Json) { ConvertTo-Json -InputObject @{ days = @(); waste = $null } -Compress }
-        else { Write-Host 'no prompt history found (~\.claude\history.jsonl) - nothing to learn from' }
+        else {
+            # real path (platform separators), and say which of the two states it is:
+            # a missing file reads very differently from "nothing recent in it"
+            $h = Join-Path (Join-Path (Get-ClaudeHome) '.claude') 'history.jsonl'
+            if (Test-Path $h) { Write-Host ('no prompts in the last 30 days ({0}) - nothing to learn from yet' -f $h) }
+            else { Write-Host ('no prompt history found ({0}) - nothing to learn from' -f $h) }
+        }
         return
     }
     $rep = Get-LearnReport $stamps (Get-Date)

@@ -219,6 +219,21 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
             $st.Count -eq 2
         } finally { $env:USERPROFILE = $prev }
     }
+    Test-Case 'learn message distinguishes missing history from stale history' {
+        $prev = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = Join-Path $Tmp 'learn-home'
+            $hd = Join-Path $env:USERPROFILE '.claude'
+            New-Item -ItemType Directory -Path $hd -Force | Out-Null
+            $missing = @(Invoke-Learn 6>&1) -join ' '
+            $ms = [DateTimeOffset]::new((Get-Date).AddDays(-90)).ToUnixTimeMilliseconds()
+            ('{"timestamp":' + $ms + '}') | Set-Content -Path (Join-Path $hd 'history.jsonl') -Encoding UTF8
+            $stale = @(Invoke-Learn 6>&1) -join ' '
+            ($missing -like '*no prompt history found*') -and
+                ($stale -like '*no prompts in the last 30 days*') -and
+                ($missing -like ('*' + (Join-Path $hd 'history.jsonl') + '*'))
+        } finally { $env:USERPROFILE = $prev }
+    }
 
     Write-Host '-- preheat: journal rotation --'
     Test-Case 'a journal over 2MB is trimmed to the last 1000 lines + the new one' {

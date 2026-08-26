@@ -29,11 +29,13 @@ If `~/.local/bin` is not on your PATH the installer prints the one-liner to add 
 Then, in a new terminal:
 
 ```bash
-./test.ps1        # optional but recommended: 55 cases, all should pass
+./test.ps1        # optional but recommended: full self-test, all cases should pass
 preheat apply     # register the weekly preheats from schedule.json
 preheat status    # confirm what got registered
 claude-panel      # web panel at http://localhost:7878
 ```
+
+If a fire lands in `preheat-log.jsonl` as `ok:false` with an authentication error, run `claude` interactively once and complete the login — preheat rides your existing Claude CLI credential and cannot refresh an expired one by itself.
 
 ## How it schedules
 
