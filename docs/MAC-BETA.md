@@ -7,7 +7,7 @@ Everything user-facing is identical to Windows: same commands, same `schedule.js
 ## Requirements
 
 - macOS 13+ (Apple silicon or Intel)
-- [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos): `brew install --cask powershell`
+- [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-macos): `brew install powershell` (the `--cask powershell` form no longer exists — PowerShell moved to a homebrew-core formula)
 - [Claude Code CLI](https://code.claude.com/docs) installed and logged in, with a Claude subscription
 - No sudo, no admin rights — everything lives in your user account
 

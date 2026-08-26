@@ -115,10 +115,11 @@ if ($legacyJson.Count -gt 0) {
 if ($onMac) {
     $binDir = Join-Path $HOME '.local/bin'
     if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
-    # Get-Command first: .Path (MainModule) is runtime-dependent on macOS and
-    # a null here would bake exec "" into the shim while still printing [ok]
-    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
-    $pwshBin = if ($pwshCmd) { $pwshCmd.Source } else { (Get-Process -Id $PID).Path }
+    # same resolution the launchd plists use: a plain Get-Command would hand back
+    # the naked $PSHOME binary, which under Homebrew cannot find .NET (see
+    # Resolve-HostShell) and would bake a shim that dies on every call
+    . (Join-Path $repoDir 'platform.ps1')
+    $pwshBin = Resolve-HostShell
     if (-not $pwshBin) { throw 'cannot resolve the pwsh binary path for the shims' }
     foreach ($pair in @(@('preheat', 'preheat.ps1'), @('claude-panel', 'panel.ps1'))) {
         $shim = Join-Path $binDir $pair[0]
