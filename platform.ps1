@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
-platform.ps1 -- OS adapter for claude-preheat. Dot-sourced by preheat.ps1 and
-panel.ps1; never run directly.
+platform.ps1 -- OS adapter for claude-preheat. Dot-sourced by preheat.ps1,
+panel.ps1 and install.ps1; never run directly.
 
 One scheduling contract, two backends:
   Windows : Task Scheduler (Register-ScheduledTask; wake timers can wake the PC)
@@ -37,6 +37,19 @@ function Get-ClaudeHome {
 }
 
 function Resolve-HostShell {
+    if ($OnMac) {
+        # pwsh prepends $PSHOME to PATH, so a plain Get-Command inside pwsh finds
+        # the bare $PSHOME binary before the launcher on the user's own PATH.
+        # Under Homebrew's formula those are not interchangeable:
+        # /opt/homebrew/bin/pwsh is a wrapper that exports DOTNET_ROOT (the
+        # formula links the shared dotnet instead of bundling a runtime) and the
+        # bare binary exits with "You must install .NET". Baked into a plist or a
+        # shim that is a job that can never run - prefer a match outside $PSHOME,
+        # and fall through when there is none (self-contained pkg installs).
+        $outside = @(Get-Command pwsh -All -ErrorAction SilentlyContinue |
+            Where-Object { $_.Source -and (Split-Path $_.Source -Parent) -ne $PSHOME })
+        if ($outside.Count -gt 0) { return $outside[0].Source }
+    }
     $p = Get-Command pwsh -ErrorAction SilentlyContinue
     if ($p) { return $p.Source }
     # we ARE a PowerShell - the running host binary is always a valid fallback
