@@ -1,6 +1,6 @@
-# macOS support (beta)
+# macOS guide
 
-> Status: **beta** since `v0.4.0-beta.1`. The full mechanism — schedule → launchd fire → journal → clean removal — is verified end-to-end on GitHub Actions macOS runners (real launchd, real `pwsh`), plus the same 55-case self-test suite that gates Windows. What it has **not** had yet is long-lived use on a physical Mac: sleep/wake edge cases and weeks-long recurring agents. That is exactly what this beta is for — feedback checklist at the bottom.
+> macOS support shipped in `v0.4.0`, after end-to-end verification on GitHub Actions macOS runners (real launchd, real `pwsh`), the same self-test suite that gates Windows, and real-Mac beta testing (#1/#2). One caveat stays honest: long unattended sleep/wake soak time is still limited — if anything looks off around sleep, the feedback checklist at the bottom is exactly what we want.
 
 Everything user-facing is identical to Windows: same commands, same `schedule.json`, same web panel at `localhost:7878`, same journal. Only the scheduling backend differs — per-user launchd agents instead of Windows Task Scheduler.
 

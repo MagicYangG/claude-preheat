@@ -4,7 +4,7 @@
 
 ![claude-preheat demo](docs/demo.webp)
 
-For Claude subscribers who work in the Claude Code CLI on Windows. The 5-hour usage window is anchored by the first message sent while no window is active — a scheduled tiny ping anchors it at the time you choose, so your real session spans two 5-hour windows instead of being cut mid-flow. Two flavors:
+For Claude subscribers who work in the Claude Code CLI on Windows or macOS. The 5-hour usage window is anchored by the first message sent while no window is active — a scheduled tiny ping anchors it at the time you choose, so your real session spans two 5-hour windows instead of being cut mid-flow. Two flavors:
 
 1. Weekly recurring preheats
 2. One-shot preheats
@@ -19,7 +19,7 @@ Modules: live quota strip (5-hour + weekly, with exact reset times — run `preh
 
 ## Quick start
 
-**Requirements**: Windows 10/11; [Claude Code CLI](https://code.claude.com/docs) installed and logged in; a Claude subscription; PowerShell 7 (pwsh); no admin rights needed
+**Requirements**: Windows 10/11 or macOS 13+ (macOS setup: [macOS guide](docs/MAC-BETA.md)); [Claude Code CLI](https://code.claude.com/docs) installed and logged in; a Claude subscription; PowerShell 7 (pwsh); no admin rights needed
 
 **Recommended: paste this into Claude Code (or any AI coding tool) and let it install everything for you:**
 
@@ -41,7 +41,8 @@ When it's done, open `http://localhost:7878` in your browser and drive everythin
 
 1. **Claude Code CLI required**: a preheat is a tiny headless prompt executed through the CLI
 2. **Pinging an active window is a harmless no-op**: it costs one trivial message and moves nothing
-3. **Waking from sleep**: a scheduled fire can only wake the PC if wake timers are enabled in the active power plan — `preheat status` warns when they are off
+3. **Waking from sleep**: a scheduled fire can only wake the PC if wake timers are enabled in the active power plan — `preheat status` warns when they are off (Windows mechanism; launchd cannot wake a sleeping Mac — see the [macOS guide](docs/MAC-BETA.md))
+4. **The window is account-level**: claude.ai, Claude Desktop, and Claude Code draw from one shared usage pool, so a preheat anchors the window for every surface — the CLI is just the ignition needle
 
 ## Where did the relay go?
 

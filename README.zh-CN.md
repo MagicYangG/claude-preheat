@@ -4,7 +4,7 @@
 
 ![claude-preheat 演示](docs/demo.webp)
 
-针对在 Windows 上使用 Claude Code CLI 的 Claude 订阅用户，本工具提供可视化的窗口额度定时预热：5 小时额度窗口由额度空窗期的第一条消息锚定，定时发出一条极小的 ping 就能把窗口抢先锚在你规定的时刻，让你真正开展工作时可以横跨两个 5 小时额度窗口。具体包含：
+针对在 Windows 或 macOS 上使用 Claude Code CLI 的 Claude 订阅用户，本工具提供可视化的窗口额度定时预热：5 小时额度窗口由额度空窗期的第一条消息锚定，定时发出一条极小的 ping 就能把窗口抢先锚在你规定的时刻，让你真正开展工作时可以横跨两个 5 小时额度窗口。具体包含：
 
 1. 以周为维度，窗口额度定时预热
 2. 一次性窗口额度定时预热
@@ -19,7 +19,7 @@
 
 ## 快速开始
 
-**环境要求**：Windows 10/11；已安装并登录 [Claude Code CLI](https://code.claude.com/docs)；Claude 订阅用户；PowerShell 7（pwsh）；无需管理员权限
+**环境要求**：Windows 10/11 或 macOS 13+（macOS 安装见 [macOS 指南](docs/MAC-BETA.md)）；已安装并登录 [Claude Code CLI](https://code.claude.com/docs)；Claude 订阅用户；PowerShell 7（pwsh）；无需管理员权限
 
 **推荐安装方式：把下面这段直接粘给 Claude Code（或其它 AI 编程工具），让它替你装好：**
 
@@ -41,7 +41,8 @@
 
 1. **需要安装 Claude Code CLI**：预热就是通过 CLI 发出的一条极小 headless 提示词
 2. **ping 到已激活的窗口无副作用**：只花一条微不足道的消息，其余什么都不动
-3. **睡眠中唤醒**：定时任务要把电脑从睡眠中叫醒，须在当前电源计划里启用唤醒定时器——关着时 `preheat status` 会给出警告
+3. **睡眠中唤醒**：定时任务要把电脑从睡眠中叫醒，须在当前电源计划里启用唤醒定时器——关着时 `preheat status` 会给出警告（此为 Windows 机制；launchd 无法唤醒睡眠中的 Mac，详见 [macOS 指南](docs/MAC-BETA.md)）
+4. **额度窗口是账号级的**：claude.ai、Claude 桌面端与 Claude Code 的用量共享同一个池子，预热锚定的是整个账号的窗口——CLI 只是点火针
 
 ## 接续（relay）去哪了？
 

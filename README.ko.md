@@ -4,7 +4,7 @@
 
 ![claude-preheat 데모](docs/demo.webp)
 
-Windows에서 Claude Code CLI로 작업하는 Claude 구독 사용자를 위한 도구입니다. 5시간 사용량 윈도우는 활성 윈도우가 없을 때 보낸 첫 메시지에 앵커됩니다 — 예약된 아주 작은 핑으로 원하는 시각에 윈도우를 앵커해, 실제 작업이 5시간 윈도우 두 개에 걸쳐 이어지게 합니다. 제공 기능은 두 가지:
+Windows 또는 macOS에서 Claude Code CLI로 작업하는 Claude 구독 사용자를 위한 도구입니다. 5시간 사용량 윈도우는 활성 윈도우가 없을 때 보낸 첫 메시지에 앵커됩니다 — 예약된 아주 작은 핑으로 원하는 시각에 윈도우를 앵커해, 실제 작업이 5시간 윈도우 두 개에 걸쳐 이어지게 합니다. 제공 기능은 두 가지:
 
 1. 주 단위 정기 예열
 2. 일회성 예열
@@ -19,7 +19,7 @@ Windows에서 Claude Code CLI로 작업하는 Claude 구독 사용자를 위한 
 
 ## 빠른 시작
 
-**요구 사항**: Windows 10/11; [Claude Code CLI](https://code.claude.com/docs) 설치·로그인; Claude 구독; PowerShell 7 (pwsh); 관리자 권한 불필요
+**요구 사항**: Windows 10/11 또는 macOS 13+ ([macOS 가이드](docs/MAC-BETA.md) 참고); [Claude Code CLI](https://code.claude.com/docs) 설치·로그인; Claude 구독; PowerShell 7 (pwsh); 관리자 권한 불필요
 
 **추천: 아래 내용을 Claude Code(또는 다른 AI 코딩 도구)에 붙여 넣어 설치를 맡기세요:**
 
@@ -41,7 +41,8 @@ install.ps1 과 preheat apply 가 만드는 것 외에는 아무것도 등록하
 
 1. **Claude Code CLI 필요**: 예열은 CLI를 통해 실행되는 아주 작은 headless 프롬프트입니다
 2. **이미 활성인 윈도우에 핑을 보내도 무해합니다**: 사소한 메시지 하나를 쓸 뿐 아무것도 움직이지 않습니다
-3. **절전에서 깨우기**: 예약된 실행이 PC를 깨우려면 현재 전원 관리 옵션에서 절전 해제 타이머가 켜져 있어야 합니다 — 꺼져 있으면 `preheat status` 가 경고합니다
+3. **절전에서 깨우기**: 예약된 실행이 PC를 깨우려면 현재 전원 관리 옵션에서 절전 해제 타이머가 켜져 있어야 합니다 — 꺼져 있으면 `preheat status` 가 경고합니다 (Windows의 메커니즘입니다. launchd는 잠자기 중인 Mac을 깨울 수 없습니다 — [macOS 가이드](docs/MAC-BETA.md) 참고)
+4. **윈도우는 계정 단위입니다**: claude.ai, Claude 데스크톱, Claude Code의 사용량은 하나의 풀을 공유하므로, 예열은 모든 서피스의 윈도우에 적용됩니다 — CLI는 점화 바늘일 뿐입니다
 
 ## 릴레이(relay)는 어디로 갔나요?
 
