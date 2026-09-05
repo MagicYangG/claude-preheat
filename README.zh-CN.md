@@ -40,9 +40,11 @@
 ## 注意事项
 
 1. **需要安装 Claude Code CLI**：预热就是通过 CLI 发出的一条极小 headless 提示词
-2. **ping 到已激活的窗口无副作用**：只花一条微不足道的消息，其余什么都不动
+2. **一次 ping 的成本**：一条极短的 `haiku` 提示词——算上 Claude Code 自身的系统提示词，大约 4 万 input tokens（按 API 价格约 $0.04）。它会同时计入 5 小时窗口和周窗口，所以预热便宜但不是免费的。ping 到已激活的窗口是无害的 no-op：锚点不会移动。周窗口不由本工具管理。
 3. **睡眠中唤醒**：定时任务要把电脑从睡眠中叫醒，须在当前电源计划里启用唤醒定时器——关着时 `preheat status` 会给出警告（此为 Windows 机制；launchd 无法唤醒睡眠中的 Mac，详见 [macOS 指南](docs/MAC-BETA.md)）
 4. **额度窗口是账号级的**：claude.ai、Claude 桌面端与 Claude Code 的用量共享同一个池子，预热锚定的是整个账号的窗口——CLI 只是点火针
+5. **预热什么时候能点火、什么时候不能（Windows）**：任务只在你登录时运行（锁屏没问题；注销状态下会跳过这次点火）。现在也支持在电池供电下运行。如果你是在这次改动之前安装的，请再跑一遍 `preheat apply`，让已注册的任务应用新设置。
+6. **`preheat apply` 之后不要移动或重命名仓库目录**：计划任务、launchd plist 和配置文件里的函数都写死了绝对路径。如果确实挪动了，请重新运行 `install.ps1` 和 `preheat apply`——`preheat status` 会标出脚本路径已不存在的任务。
 
 ## 接续（relay）去哪了？
 
@@ -59,6 +61,7 @@ preheat reset 20:00     # 一次性：让窗口在 20:00 重置（自动 15:00 �
 preheat at 15:00        # 一次性：15:00 预热
 preheat +2h             # 一次性：2 小时后预热
 preheat learn           # 按最近 30 天作息给出排期建议 + 窗口利用率报告（learn auto 一键写入并生效）
+                         # （统计的是你自己发的消息节奏；preheat 的 ping 不计入其中）
 preheat statusline on   # 透传接入 statusline，让精确重置时刻喂入面板额度条（纯透传；off 还原）
 preheat off             # 移除全部预热任务
 claude-panel            # 打开本地可视化控制面板

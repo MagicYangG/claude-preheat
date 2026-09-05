@@ -159,6 +159,10 @@ select{
 .rlfill{height:100%;border-radius:3px;background:var(--acc)}
 .rlfill.hot{background:var(--bad)}
 .rlage{flex-basis:100%;font-size:11px;color:var(--dim);margin-top:2px}
+/* a sample older than 30 min describes a window that may already be gone -
+   drain the colour so nobody plans around it */
+.rl.stale .rlfill{background:var(--dim2)}
+.rl.stale .rlhead{color:var(--dim)}
 
 @media (max-width:560px){
   .wrap{padding:0 14px}
@@ -242,7 +246,10 @@ var I18N = {
     reset_word:'重置', once_task:'一次性预热', no_tasks:'还没排定预热。',
     th_scheduled:'排定', th_next:'下次预热',
     rl_5h:'5 小时窗口', rl_wk:'周额度', rl_reset:'重置 ', rl_src:'来自 statusline 缓存 · ',
-    learn_waste:'过去 7 天开了 {n} 个窗口，窗口时间利用率 {p}%（估算）· 终端跑 preheat learn 可按作息生成预热排期',
+    rl_hint:'额度条未启用 —— 在终端运行一次 preheat statusline on，5 小时 / 周额度就会显示在这里。',
+    rl_stale:'数据已过期 · ',
+    rl_expired:'上次采样以来两个窗口都已重置 —— 打开一次 Claude Code 就会刷新。',
+    learn_waste:'过去 7 天开了 {n} 个窗口，窗口时间利用率 {p}%（估算）· 终端跑 preheat learn 可按作息生成预热排期（只统计你自己的提示，预热 ping 不计入）',
     schednote_derived:'这张表由已注册任务反推（预热时刻 + 5 小时 = 重置时刻）。',
     stamp_updated:'更新于 ', stamp_lost:'连接中断，重试中…',
     chip_edit_title:'点击修改', chip_del_title:'删除', wadd_title:'加一个重置时刻',
@@ -265,7 +272,10 @@ var I18N = {
     reset_word:'reset', once_task:'One-shot preheat', no_tasks:'No preheats scheduled yet.',
     th_scheduled:'Scheduled', th_next:'Next fire',
     rl_5h:'5-hour window', rl_wk:'Weekly', rl_reset:'resets ', rl_src:'from statusline cache · ',
-    learn_waste:'Last 7 days: {n} windows opened, {p}% of window time engaged (estimate) · run preheat learn to derive a schedule from your rhythm',
+    rl_hint:'Quota strip is off - run preheat statusline on once in a terminal and the 5-hour / weekly usage will show here.',
+    rl_stale:'stale · ',
+    rl_expired:'Both windows have reset since the last sample - open Claude Code once to refresh.',
+    learn_waste:'Last 7 days: {n} windows opened, {p}% of window time engaged (estimate) · run preheat learn to derive a schedule from your rhythm (your own prompts only - preheat pings are not counted)',
     schednote_derived:'This table is inferred from registered tasks (fire time + 5h = reset time).',
     stamp_updated:'Updated ', stamp_lost:'Connection lost, retrying…',
     chip_edit_title:'Click to edit', chip_del_title:'Delete', wadd_title:'Add a reset time',
@@ -280,7 +290,7 @@ function t(k){ var d = I18N[LANG] || I18N.zh; return (k in d) ? d[k] : (I18N.zh[
 var DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 var DAYCN = {Mon:'一',Tue:'二',Wed:'三',Thu:'四',Fri:'五',Sat:'六',Sun:'日'};
 function dayShort(d){ return LANG === 'en' ? d : DAYCN[d]; }
-var state = { status:null, busy:false, stamp:null, schedLoaded:false, rl:null, learn:null };
+var state = { status:null, busy:false, stamp:null, schedLoaded:false, rl:null, learn:null, schedMtime:null };
 
 /* ---------- utils ---------- */
 function $(id){ return document.getElementById(id); }
@@ -331,10 +341,21 @@ function setOnline(on){ $('offline').className = on ? '' : 'on'; }
 
 /* ---------- transport ---------- */
 function getJSON(path){
-  return fetch(path, { cache:'no-store' }).then(function(r){
+  // the backend is a single-threaded listener: while it registers tasks a GET
+  // just queues. Without a cap a queued fetch can hang for the browser's own
+  // multi-minute timeout and the page looks frozen.
+  var ctl = null, timer = null;
+  var opt = { cache:'no-store' };
+  try { ctl = new AbortController(); opt.signal = ctl.signal; } catch (e) { ctl = null; }
+  if (ctl) timer = setTimeout(function(){ try { ctl.abort(); } catch (e) { } }, 45000);
+  function clear(){ if (timer) { clearTimeout(timer); timer = null; } }
+  return fetch(path, opt).then(function(r){
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
-  });
+  }).then(
+    function(j){ clear(); return j; },
+    function(e){ clear(); throw e; }
+  );
 }
 function postJSON(path, body){
   return fetch(path, {
@@ -345,18 +366,22 @@ function postJSON(path, body){
   });
 }
 function act(path, body, okMsg){
-  if (state.busy) return Promise.resolve(false);
+  // resolves with the parsed response so callers can react to a code (e.g.
+  // 'stale'), never rejects
+  if (state.busy) return Promise.resolve(null);
   state.busy = true; setBusy(true);
   return postJSON(path, body).then(function(res){
     var ok = !!(res && res.ok);
-    toast(ok, (res && res.message) ? res.message : (ok ? okMsg : t('op_failed')));
-    return refreshStatus().then(function(){ return ok; });
+    // on success the backend message is CLI chatter ("3 tasks registered"),
+    // not an answer to what the user clicked - only failures need it verbatim
+    toast(ok, ok ? okMsg : ((res && res.message) ? res.message : t('op_failed')));
+    return refreshStatus().then(function(){ return res || { ok:false }; });
   }).catch(function(e){
     setOnline(false); toast(false, t('no_backend') + e.message);
-    return false;
-  }).then(function(ok){
+    return { ok:false };
+  }).then(function(res){
     state.busy = false; setBusy(false);
-    return ok;
+    return res;
   });
 }
 function setBusy(b){
@@ -539,18 +564,22 @@ function seedScheduleFallback(){
   seedRules(rules);
   $('schedNote').textContent = rules.length ? t('schednote_derived') : '';
 }
-function seedSchedule(){
-  if (state.schedLoaded) return;
+function seedSchedule(force){
+  if (state.schedLoaded && !force) return Promise.resolve();
   state.schedLoaded = true;
-  getJSON('/api/schedule').then(function(sched){
+  return getJSON('/api/schedule').then(function(sched){
+    state.schedMtime = (sched && sched.mtime != null) ? sched.mtime : null;
     var rules = (sched && Array.isArray(sched.rules)) ? sched.rules : [];
+    // force = resync of a stale tab: seedRules MERGES, so the old working
+    // model has to go first or the times we just replaced come back
+    if (force) DAYS.forEach(function(d){ week[d] = []; });
     if (rules.length) {
       seedRules(rules);
     } else {
       seedScheduleFallback();
     }
   }).catch(function(){
-    seedScheduleFallback();
+    if (!force) seedScheduleFallback();
   });
 }
 
@@ -566,23 +595,39 @@ function rlDate(v){
 function renderRateLimits(){
   var box = $('rlbox');
   var r = state.rl;
-  if (!r || !r.rate_limits) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  function note(key){
+    // an empty strip used to just vanish, which reads as "you have no quota"
+    // rather than "nothing is feeding this yet"
+    box.className = 'rlage'; box.style.display = '';
+    box.textContent = t(key);
+  }
+  if (!r || !r.rate_limits) { note('rl_hint'); return; }
   var rl = r.rate_limits;
+  var now = Date.now();
+  var shown = 0, expired = 0;
   function item(key, o){
     if (!o) return '';
+    // a window whose reset time is already past says nothing about right now
+    var rd = o.resets_at ? parseDate(rlDate(o.resets_at)) : null;
+    if (rd && rd.getTime() <= now) { expired++; return ''; }
     var pct = (o.utilization != null) ? o.utilization : o.used_percentage;
     var pctTxt = (pct != null) ? Math.round(pct) + '%' : '?';
     var w = (pct != null) ? Math.max(0, Math.min(100, pct)) : 0;
     var reset = o.resets_at ? (t('rl_reset') + esc(fmtDT(rlDate(o.resets_at)))) : '';
+    shown++;
     return '<div class="rlitem">' +
       '<div class="rlhead"><span>' + t(key) + '</span><span>' + pctTxt + (reset ? ' · ' + reset : '') + '</span></div>' +
       '<div class="rltrack"><div class="rlfill' + (w >= 90 ? ' hot' : '') + '" style="width:' + w + '%"></div></div>' +
     '</div>';
   }
   var inner = item('rl_5h', rl.five_hour) + item('rl_wk', rl.seven_day);
-  if (!inner) { box.style.display = 'none'; box.innerHTML = ''; return; }
-  box.className = 'rl'; box.style.display = '';
-  box.innerHTML = inner + '<div class="rlage">' + t('rl_src') + (r.capturedAt ? ago(r.capturedAt) : '') + '</div>';
+  if (!shown) { note(expired ? 'rl_expired' : 'rl_hint'); return; }
+  var cap = parseDate(r.capturedAt);
+  var stale = !!(cap && (now - cap.getTime() > 30 * 60 * 1000));
+  box.className = stale ? 'rl stale' : 'rl';
+  box.style.display = '';
+  box.innerHTML = inner + '<div class="rlage">' + (stale ? esc(t('rl_stale')) : '') +
+    t('rl_src') + (r.capturedAt ? ago(r.capturedAt) : '') + '</div>';
 }
 function refreshRateLimits(){
   return getJSON('/api/ratelimits').then(function(r){
@@ -607,14 +652,22 @@ function refreshLearn(){
 }
 
 /* ---------- refresh loops ---------- */
+function applyStatus(s){
+  state.status = s; state.stamp = new Date(); setOnline(true);
+  renderTasks(); seedSchedule(); tickStamp();
+}
 function refreshStatus(){
   refreshRateLimits();
-  return getJSON('/api/status').then(function(s){
-    state.status = s; state.stamp = new Date(); setOnline(true);
-    renderTasks(); seedSchedule(); tickStamp();
-  }).catch(function(){
-    setOnline(false);
-    $('stamp').textContent = t('stamp_lost');
+  // one miss is not "offline": the single-threaded backend is unreachable for
+  // seconds while an apply registers tasks, and the banner flashing there
+  // trained the user to distrust it. Only a second failure counts.
+  return getJSON('/api/status').then(applyStatus).catch(function(){
+    return new Promise(function(done){ setTimeout(done, 4000); }).then(function(){
+      return getJSON('/api/status').then(applyStatus).catch(function(){
+        setOnline(false);
+        $('stamp').textContent = t('stamp_lost');
+      });
+    });
   });
 }
 function tickStamp(){
@@ -658,10 +711,36 @@ $('btnRefresh').addEventListener('click', function(){ refreshStatus(); });
 $('btnApply').addEventListener('click', function(){
   var rules = collectRules();
   if (!rules.length) { toast(false, t('no_times')); return; }
-  act('/api/preheat/apply', { rules: rules }, t('m_saved')).then(function(ok){
-    if (ok) savedKey = keyOf();
+  var body = { rules: rules };
+  // omit the lock token when we never got one - better to write than to 409 forever
+  if (state.schedMtime !== null) body.baseMtime = state.schedMtime;
+  act('/api/preheat/apply', body, t('m_saved')).then(function(res){
+    if (res && res.ok) {
+      savedKey = keyOf();
+      if (res.mtime != null) state.schedMtime = res.mtime;
+    } else if (res && res.code === 'stale') {
+      // reload what is on disk, then lay the user's unsaved times back on top:
+      // nothing they typed is lost and Save & apply stays enabled for the retry
+      var mine = collectRules();
+      seedSchedule(true).then(function(){
+        mine.forEach(function(r){
+          (r.days || []).forEach(function(d){ if (week[d] && week[d].indexOf(r.reset) < 0) week[d].push(r.reset); });
+        });
+        DAYS.forEach(function(d){ week[d].sort(); });
+        renderWeek();
+      });
+    }
     updateApplyState();
   });
+});
+document.addEventListener('visibilitychange', function(){
+  // a tab parked overnight shows a schedule the CLI may have rewritten since;
+  // resync on re-focus, but never throw away edits the user has not applied
+  if (document.hidden || keyOf() !== savedKey) return;
+  getJSON('/api/schedule').then(function(sched){
+    var m = (sched && sched.mtime != null) ? sched.mtime : null;
+    if (m !== state.schedMtime) seedSchedule(true);
+  }).catch(function(){ });
 });
 var onceBtns = document.querySelectorAll('[data-once]');
 for (var k = 0; k < onceBtns.length; k++) {

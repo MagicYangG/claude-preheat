@@ -40,9 +40,11 @@ When it's done, open `http://localhost:7878` in your browser and drive everythin
 ## Notes
 
 1. **Claude Code CLI required**: a preheat is a tiny headless prompt executed through the CLI
-2. **Pinging an active window is a harmless no-op**: it costs one trivial message and moves nothing
+2. **What a ping costs**: one short `haiku` prompt — roughly 40k input tokens once Claude Code's own system prompt is counted (about $0.04 at API prices). It counts toward both the 5-hour window and the weekly window, so a preheat is cheap but not free. Pinging while a window is already active is a harmless no-op: the anchor does not move. The weekly window is not managed by this tool.
 3. **Waking from sleep**: a scheduled fire can only wake the PC if wake timers are enabled in the active power plan — `preheat status` warns when they are off (Windows mechanism; launchd cannot wake a sleeping Mac — see the [macOS guide](docs/MAC-BETA.md))
 4. **The window is account-level**: claude.ai, Claude Desktop, and Claude Code draw from one shared usage pool, so a preheat anchors the window for every surface — the CLI is just the ignition needle
+5. **When the fire can and cannot run (Windows)**: the task runs only while you are signed in (a locked screen is fine; a signed-out PC skips that fire). It now also runs on battery. If you installed before this change, run `preheat apply` once more so the registered tasks pick up the new settings.
+6. **Do not move or rename the repo directory after `preheat apply`**: the scheduled tasks, the launchd plists and the profile functions all carry absolute paths. If you do move it, run `install.ps1` and `preheat apply` again — `preheat status` flags tasks whose script path no longer exists.
 
 ## Where did the relay go?
 
@@ -59,6 +61,7 @@ preheat reset 20:00     # one-shot: make the window reset at 20:00 (fires at 15:
 preheat at 15:00        # one-shot: fire at 15:00
 preheat +2h             # one-shot: fire 2 hours from now
 preheat learn           # schedule suggestions from your last 30 days + window-utilization report (learn auto applies)
+                         # (natural rhythm from your own prompts; preheat pings are not counted)
 preheat statusline on   # tap the statusline so exact reset times feed the panel quota strip (pure passthrough; off restores)
 preheat off             # remove all preheat tasks
 claude-panel            # open the local web panel

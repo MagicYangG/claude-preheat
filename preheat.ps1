@@ -40,6 +40,7 @@ $StatePath  = Join-Path $Root 'state.json'
 $LogPath    = Join-Path $Root 'preheat-log.jsonl'
 $FirePit    = Join-Path $Root 'firepit'
 $EmptyMcp   = Join-Path $Root 'mcp-empty.json'
+$FireLock   = Join-Path $Root '.fire.lock'
 $TaskWkPrefix   = 'ClaudePreheat-Wk'
 $TaskOncePrefix = 'ClaudePreheat-Once'
 $WindowHours = 5
@@ -66,14 +67,32 @@ function Write-State($obj) { $obj | ConvertTo-Json -Depth 5 | Set-Content -Path 
 
 function Write-Log($obj) {
     $obj.ts = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+    # rotation + append under one named mutex: overlapping fires (or a fire and
+    # the panel) could otherwise read 1000 lines, then each write their own
+    # truncated copy, losing the other's entries. Logging stays lossy telemetry
+    # though - nothing in here may throw, mutex or not.
+    $m = $null
+    try { $m = New-Object System.Threading.Mutex($false, 'claude-preheat-journal') } catch { }
+    $held = $false
     try {
-        # rotation: keep the journal bounded (runtime telemetry, lossy by design)
-        if ((Test-Path $LogPath) -and ((Get-Item $LogPath).Length -gt 2MB)) {
-            $keep = Get-Content $LogPath -Tail 1000 -Encoding UTF8
-            Set-Content -Path $LogPath -Value $keep -Encoding UTF8
+        if ($m) {
+            try { $held = $m.WaitOne(2000) }
+            catch [System.Threading.AbandonedMutexException] { $held = $true }
+            catch { $held = $false }
         }
-    } catch { }
-    ($obj | ConvertTo-Json -Compress -Depth 5) | Add-Content -Path $LogPath -Encoding UTF8
+        try {
+            if ((Test-Path $LogPath) -and ((Get-Item $LogPath).Length -gt 2MB)) {
+                $keep = Get-Content $LogPath -Tail 1000 -Encoding UTF8
+                Set-Content -Path $LogPath -Value $keep -Encoding UTF8
+            }
+        } catch { }
+        ($obj | ConvertTo-Json -Compress -Depth 5) | Add-Content -Path $LogPath -Encoding UTF8
+    } catch { } finally {
+        if ($m) {
+            if ($held) { try { $m.ReleaseMutex() } catch { } }
+            try { $m.Dispose() } catch { }
+        }
+    }
 }
 
 function Resolve-ClaudeExe {
@@ -118,7 +137,9 @@ function Get-FireSpecs($config) {
     # rule { days:[Mon..]; reset:'HH:mm' } -> @{ Days = full names (shifted if fire crosses midnight); FireTime = timespan; Reset }
     $specs = @()
     foreach ($rule in $config.rules) {
-        $reset = [datetime]::ParseExact($rule.reset, 'HH:mm', $null)
+        # InvariantCulture, not $null: $null means CurrentCulture, whose calendar
+        # (th-TH, ar-SA) and time separator can reject or misread a plain HH:mm
+        $reset = [datetime]::ParseExact($rule.reset, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
         $fire  = $reset.TimeOfDay - [timespan]::FromHours($WindowHours)
         $shift = 0
         if ($fire -lt [timespan]::Zero) { $fire = $fire + [timespan]::FromDays(1); $shift = -1 }
@@ -138,24 +159,83 @@ function Get-FireSpecs($config) {
 }
 
 function Invoke-Apply {
+    Wait-FireLock
     $config = Read-Config
-    $specs  = Get-FireSpecs $config
+    # @(): a single-rule schedule.json unrolls to a bare hashtable, whose .Count
+    # is the hashtable's key count, not 1
+    $specs  = @(Get-FireSpecs $config)
     # resolve claude path now, in an interactive shell where PATH is complete
     Write-State @{ claude = (Resolve-ClaudeExe); pwsh = (Resolve-HostShell); appliedAt = (Get-Date).ToString('s') }
-    Remove-PreheatJobs "$TaskWkPrefix*"
-    try { Remove-StaleOnceJobs } catch { }
+    # compute every task BEFORE deleting the old ones: a spec that throws here
+    # used to leave the machine with no weekly tasks at all and no way to know
+    $plan = @()
     foreach ($s in $specs) {
         # StartBoundary must be in the future, else the scheduler's week alignment
         # can skip the nearest occurrence (observed: Sat task jumping a full week)
         $at = (Get-Date).Date + $s.FireTime
         if ($at -le (Get-Date)) { $at = $at.AddDays(1) }
-        $dayTag  = ($s.Days | ForEach-Object { $_.Substring(0, 3) }) -join ''
-        $name    = '{0}-{1}-{2}' -f $TaskWkPrefix, $s.FireTime.ToString('hhmm'), $dayTag
-        Register-PreheatJob -Name $name -Days $s.Days -At $at
-        Write-Host ('registered  {0}  fire {1}  -> reset {2}  [{3}]' -f $name, $s.FireTime.ToString('hh\:mm'), $s.Reset, ($s.Days -join ','))
+        $dayTag = ($s.Days | ForEach-Object { $_.Substring(0, 3) }) -join ''
+        $plan += @{
+            Name     = '{0}-{1}-{2}' -f $TaskWkPrefix, $s.FireTime.ToString('hhmm'), $dayTag
+            Days     = $s.Days
+            At       = $at
+            FireTime = $s.FireTime
+            Reset    = $s.Reset
+        }
     }
-    Write-Log @{ ev = 'apply'; tasks = $specs.Count }
+    Remove-PreheatJobs "$TaskWkPrefix*"
+    try { Remove-StaleOnceJobs } catch { }
+    if ($OnMac) { Limit-LaunchdErrLog }
+    $failed = @()
+    foreach ($job in $plan) {
+        try {
+            Register-PreheatJob -Name $job.Name -Days $job.Days -At $job.At
+            Write-Host ('registered  {0}  fire {1}  -> reset {2}  [{3}]' -f $job.Name, $job.FireTime.ToString('hh\:mm'), $job.Reset, ($job.Days -join ','))
+        } catch {
+            # one rejected task must not abandon the rest half-applied
+            $failed += ('{0}: {1}' -f $job.Name, $_.Exception.Message)
+            Write-Host ('FAILED      {0}  {1}' -f $job.Name, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+    if ($failed.Count -gt 0) {
+        Write-Log @{ ev = 'apply'; tasks = $plan.Count; failed = $failed.Count }
+        throw ('apply registered {0} of {1} tasks - failed: {2}' -f ($plan.Count - $failed.Count), $plan.Count, ($failed -join '; '))
+    }
+    Write-Log @{ ev = 'apply'; tasks = $plan.Count }
     Test-WakeTimers
+}
+
+function Wait-FireLock([int]$MaxSec = 90) {
+    # apply/off rewrite or delete the very job a running fire lives inside - on
+    # macOS bootout SIGTERMs that fire mid-ping, on Windows the re-register
+    # races it. Wait the fire out instead of racing it.
+    if (-not (Test-Path $FireLock)) { return }
+    try {
+        # a fire cannot outlive 3 x 240s + 2 x 90s, so anything older is a
+        # leftover from a killed process, not a live ping
+        if ((Get-Item $FireLock).LastWriteTime -lt (Get-Date).AddMinutes(-20)) {
+            Remove-Item $FireLock -Force -ErrorAction SilentlyContinue
+            return
+        }
+    } catch { return }
+    $waited = 0
+    while ((Test-Path $FireLock) -and ($waited -lt $MaxSec)) {
+        Start-Sleep -Seconds 3
+        $waited += 3
+    }
+    if (Test-Path $FireLock) {
+        $job = '?'; $started = '?'
+        try {
+            $l = Get-Content $FireLock -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+            if ($l) {
+                if ($l.job) { $job = [string]$l.job }
+                # ConvertFrom-Json may hand the ISO string back as a [datetime];
+                # format it ourselves or the message follows the current culture
+                if ($l.startedAt) { $started = ([datetime]$l.startedAt).ToString('s') }
+            }
+        } catch { }
+        throw ('a preheat fire is running right now (job {0}, started {1}) - try again in a minute' -f $job, $started)
+    }
 }
 
 function Get-TranscriptActivity($file) {
@@ -195,8 +275,11 @@ function Get-LastLocalActivity {
     try {
         $proj = Join-Path (Join-Path (Get-ClaudeHome) '.claude') 'projects'
         if (-not (Test-Path $proj)) { return $null }
+        # 20 newest by mtime, not 8: a day of parallel sessions plus background
+        # agents easily writes more than 8 transcripts, and the one carrying the
+        # newest real turn can sit below the cut
         $files = @(Get-ChildItem -Path $proj -Filter '*.jsonl' -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 8)
+            Sort-Object LastWriteTime -Descending | Select-Object -First 20)
         $best = $null
         foreach ($f in $files) {
             $t = Get-TranscriptActivity $f.FullName
@@ -207,88 +290,169 @@ function Get-LastLocalActivity {
     } catch { return $null }
 }
 
+function Test-PingOutput([int]$ExitCode, [string]$StdOut, [string]$StdErr) {
+    # PURE, so one ping's verdict is testable without spending a token.
+    # `claude -p --output-format json` can exit 0 and still report the failure
+    # INSIDE the payload (is_error) - judging by exit code alone logged an
+    # expired login as a successful preheat, day after day.
+    # -> @{ ok; cost; err; kind = 'auth' | 'other' | $null }
+    $res = @{ ok = $false; cost = $null; err = $null; kind = $null }
+    # parse the payload FIRST, whatever the exit code: a usage-limit hit exits 1
+    # with the reason in `result` and nothing on stderr - and the head of that
+    # JSON is 400 bytes of zeroed usage counters, which is all the log kept of
+    # the one real failure it ever saw
+    $j = $null
+    if ($StdOut) { try { $j = $StdOut | ConvertFrom-Json } catch { } }
+    $payloadErr = $null
+    if ($j -and $j.PSObject.Properties['is_error'] -and $j.is_error) {
+        if ($j.PSObject.Properties['result'] -and $j.result) { $payloadErr = ([string]$j.result -split "`n")[0] }
+        if (-not $payloadErr) { $payloadErr = 'claude reported is_error' }
+    }
+    if (($ExitCode -ne 0) -or (-not $StdOut)) {
+        $e = $payloadErr
+        if (-not $e) { $e = $StdErr }
+        if (-not $e) { $e = 'exit={0} {1}' -f $ExitCode, $StdOut.Substring(0, [Math]::Min(400, $StdOut.Length)) }
+        $res.err = $e
+    } elseif ($payloadErr) {
+        $res.err = $payloadErr
+    } else {
+        $res.ok = $true
+        if ($j -and $j.PSObject.Properties['total_cost_usd']) { $res.cost = $j.total_cost_usd }
+    }
+    if (-not $res.ok) {
+        $res.err = $res.err.Substring(0, [Math]::Min(400, $res.err.Length))
+        # an expired login is the one failure the user can fix in ten seconds -
+        # worth telling them apart from a network blip; a usage limit is the one
+        # nothing fixes until the window resets, so it must not be retried
+        if ($res.err -match '(?i)not logged in|log ?in|authenticat|unauthori[sz]ed|expired|invalid api key|oauth') { $res.kind = 'auth' }
+        elseif ($res.err -match '(?i)usage limit|session limit|rate.?limit|limit reached|hit your limit') { $res.kind = 'limit' }
+        else { $res.kind = 'other' }
+    }
+    $res
+}
+
 function Invoke-Fire {
     # nothing before the ping may block the ping
     try { Remove-StaleOnceJobs } catch { }
-    $proxy = Get-Proxy
-    if ($proxy) { $env:HTTPS_PROXY = $proxy; $env:HTTP_PROXY = $proxy }
-    if (-not (Test-Path $FirePit)) {
-        # -Force + SilentlyContinue: two near-simultaneous fires must not die on check-then-create
-        New-Item -ItemType Directory -Path $FirePit -Force -ErrorAction SilentlyContinue | Out-Null
-    }
-
-    $claude = $null
-    try { $claude = Resolve-ClaudeExe } catch {
-        Write-Log @{ ev = 'fire'; ok = $false; err = 'claude CLI not found' }
-        Send-Toast $false
-        return
-    }
-
-    # local-activity snapshot BEFORE the ping (metadata read only): if no
-    # transcript changed in the 5h before fire time, no locally visible
-    # window was active, so a successful ping anchored a fresh one
-    $fireStart = Get-Date
-    $lastAct   = Get-LastLocalActivity
-
-    $pingArgs = '-p "hi" --model haiku --no-session-persistence --strict-mcp-config --mcp-config "{0}" --output-format json' -f $EmptyMcp
-    $ok = $false; $attempts = 0; $cost = $null; $ms = $null; $errText = $null
-
-    while (-not $ok -and $attempts -lt 3) {
-        $attempts++
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        # unique per invocation+attempt: overlapping fires must not share redirect files
-        $outFile = Join-Path $Root ('.fire-out-{0}-{1}.tmp' -f $PID, $attempts)
-        $errFile = Join-Path $Root ('.fire-err-{0}-{1}.tmp' -f $PID, $attempts)
-        try {
-            $p = Start-Process -FilePath $claude -ArgumentList $pingArgs -WorkingDirectory $FirePit `
-                -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
-            $null = $p.Handle   # PS 5.1: without touching Handle first, ExitCode reads null forever
-            if (-not $p.WaitForExit(240000)) {
-                try { $p.Kill() } catch { }
-                throw 'timeout after 240s'
-            }
-            $sw.Stop(); $ms = $sw.ElapsedMilliseconds
-            $stdout = ''
-            if (Test-Path $outFile) { $stdout = Get-Content $outFile -Raw }
-            if ($p.ExitCode -eq 0 -and $stdout) {
-                try { $j = $stdout | ConvertFrom-Json; $cost = $j.total_cost_usd } catch { }
-                $ok = $true
-            } else {
-                $errText = ''
-                if (Test-Path $errFile) { $errText = Get-Content $errFile -Raw }
-                if (-not $errText) { $errText = "exit=$($p.ExitCode) $stdout" }
-                $errText = $errText.Substring(0, [Math]::Min(400, $errText.Length))
-            }
-        } catch {
-            $sw.Stop(); $errText = $_.Exception.Message
-        } finally {
-            Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
-        }
-        if (-not $ok -and $attempts -eq 1) {
-            # self-heal: cached claude path may exist but be broken (e.g. after a CLI reinstall)
+    # claim this moment so apply/off wait instead of unregistering the job we
+    # are running inside. Best effort in both directions: a lock we cannot
+    # write, and a lock we cannot delete, must never cost the ping.
+    $ownLock = $false
+    try {
+        # a fresh lock held by another LIVE fire is theirs: leave it, and let
+        # the finally below skip the delete - a manual fire that finishes in
+        # 8s must not unlock a scheduled fire still on its retries
+        $other = $null
+        if (Test-Path $FireLock) {
             try {
-                $fresh = Resolve-ClaudeExe -NoCache
-                if ($fresh -and ($fresh -ne $claude)) { $claude = $fresh; $refreshed = $true }
+                $prev = Get-Content $FireLock -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+                if ($prev -and $prev.pid -and ((Get-Item $FireLock).LastWriteTime -gt (Get-Date).AddMinutes(-20)) -and
+                    (Get-Process -Id ([int]$prev.pid) -ErrorAction SilentlyContinue)) { $other = $prev }
             } catch { }
         }
-        if (-not $ok -and $attempts -lt 3) { Start-Sleep -Seconds 90 }
-    }
+        if (-not $other) {
+            @{ pid = $PID; job = $env:CLAUDE_PREHEAT_SELF; startedAt = (Get-Date).ToString('s') } |
+                ConvertTo-Json -Compress | Set-Content -Path $FireLock -Encoding UTF8
+            $ownLock = $true
+        }
+    } catch { }
+    try {
+        $proxy = Get-Proxy
+        if ($proxy) { $env:HTTPS_PROXY = $proxy; $env:HTTP_PROXY = $proxy }
+        if (-not (Test-Path $FirePit)) {
+            # -Force + SilentlyContinue: two near-simultaneous fires must not die on check-then-create
+            New-Item -ItemType Directory -Path $FirePit -Force -ErrorAction SilentlyContinue | Out-Null
+        }
 
-    if ($ok -and $refreshed) {
-        try {
-            $st = Read-State
-            if ($st) { $st.claude = $claude; Write-State $st } else { Write-State @{ claude = $claude } }
-        } catch { }
-    }
+        $claude = $null
+        try { $claude = Resolve-ClaudeExe } catch {
+            Write-Log @{ ev = 'fire'; ok = $false; err = 'claude CLI not found'; kind = 'other' }
+            Send-Toast $false $null 'other'
+            return
+        }
 
-    $entry = @{ ev = 'fire'; ok = $ok; attempts = $attempts; ms = $ms; cost = $cost }
-    if (-not $ok) { $entry.err = $errText }
-    if ($ok) {
-        $entry.anchored = (-not $lastAct) -or (($fireStart - $lastAct).TotalHours -ge $WindowHours)
-        if ($lastAct) { $entry.last_local_activity = $lastAct.ToString('yyyy-MM-dd HH:mm') }
+        # local-activity snapshot BEFORE the ping (metadata read only): if no
+        # transcript changed in the 5h before fire time, no locally visible
+        # window was active, so a successful ping anchored a fresh one
+        $fireStart = Get-Date
+        $lastAct   = Get-LastLocalActivity
+
+        $pingArgs = '-p "hi" --model haiku --no-session-persistence --strict-mcp-config --mcp-config "{0}" --output-format json' -f $EmptyMcp
+        $ok = $false; $attempts = 0; $cost = $null; $ms = $null; $errText = $null; $kind = $null
+
+        while (-not $ok -and $attempts -lt 3) {
+            $attempts++
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            # unique per invocation+attempt: overlapping fires must not share redirect files
+            $outFile = Join-Path $Root ('.fire-out-{0}-{1}.tmp' -f $PID, $attempts)
+            $errFile = Join-Path $Root ('.fire-err-{0}-{1}.tmp' -f $PID, $attempts)
+            try {
+                $p = Start-Process -FilePath $claude -ArgumentList $pingArgs -WorkingDirectory $FirePit `
+                    -RedirectStandardOutput $outFile -RedirectStandardError $errFile -PassThru -NoNewWindow
+                $null = $p.Handle   # PS 5.1: without touching Handle first, ExitCode reads null forever
+                if (-not $p.WaitForExit(240000)) {
+                    try { $p.Kill() } catch { }
+                    throw 'timeout after 240s'
+                }
+                $sw.Stop(); $ms = $sw.ElapsedMilliseconds
+                $stdout = ''
+                if (Test-Path $outFile) { $stdout = Get-Content $outFile -Raw }
+                $stderrText = ''
+                if (Test-Path $errFile) { $stderrText = Get-Content $errFile -Raw }
+                $verdict = Test-PingOutput $p.ExitCode $stdout $stderrText
+                if ($verdict.ok) { $ok = $true; $cost = $verdict.cost }
+                else { $errText = $verdict.err; $kind = $verdict.kind }
+            } catch {
+                $sw.Stop()
+                $v = Test-PingOutput 1 '' $_.Exception.Message
+                $errText = $v.err; $kind = $v.kind
+            } finally {
+                Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+            }
+            # neither an expired login nor a usage limit heals in 90s: two more
+            # attempts only spend three minutes and log the same line thrice
+            if (-not $ok -and ($kind -eq 'auth' -or $kind -eq 'limit')) { break }
+            if (-not $ok -and $attempts -eq 1) {
+                # self-heal: cached claude path may exist but be broken (e.g. after a CLI reinstall)
+                try {
+                    $fresh = Resolve-ClaudeExe -NoCache
+                    if ($fresh -and ($fresh -ne $claude)) { $claude = $fresh; $refreshed = $true }
+                } catch { }
+            }
+            if (-not $ok -and $attempts -lt 3) { Start-Sleep -Seconds 90 }
+        }
+
+        if ($ok -and $refreshed) {
+            try {
+                $st = Read-State
+                if ($st) { $st.claude = $claude; Write-State $st } else { Write-State @{ claude = $claude } }
+            } catch { }
+        }
+
+        $entry = @{ ev = 'fire'; ok = $ok; attempts = $attempts; ms = $ms; cost = $cost }
+        if (-not $ok) { $entry.err = $errText; $entry.kind = $kind }
+        if ($ok) {
+            $entry.anchored = (-not $lastAct) -or (($fireStart - $lastAct).TotalHours -ge $WindowHours)
+            if ($lastAct) { $entry.last_local_activity = $lastAct.ToString('yyyy-MM-dd HH:mm') }
+        }
+        Write-Log $entry
+        $anch = $null
+        if ($entry.ContainsKey('anchored')) { $anch = $entry.anchored }
+        Send-Toast $ok $anch $kind
+
+        if ($OnMac -and $env:CLAUDE_PREHEAT_SELF -and ($env:CLAUDE_PREHEAT_SELF -like ($TaskOncePrefix + '-*'))) {
+            # a spent one-shot must not survive to fire again next year. Delete
+            # only the plist here: bootout of our own label would SIGTERM this
+            # very process. Remove-StaleOnceJobs boots the orphaned label out at
+            # the next fire/apply.
+            try {
+                Remove-Item (Join-Path $LaunchAgentDir ((ConvertTo-LaunchdLabel $env:CLAUDE_PREHEAT_SELF) + '.plist')) `
+                    -Force -ErrorAction SilentlyContinue
+            } catch { }
+        }
+    } finally {
+        if ($ownLock) { Remove-Item $FireLock -Force -ErrorAction SilentlyContinue }
     }
-    Write-Log $entry
-    Send-Toast $ok
 }
 
 function Invoke-Once($fireAt, $label) {
@@ -300,7 +464,7 @@ function Invoke-Once($fireAt, $label) {
 }
 
 function Get-NextOccurrence([string]$hhmm) {
-    $t    = [datetime]::ParseExact($hhmm, 'HH:mm', $null)
+    $t    = [datetime]::ParseExact($hhmm, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
     $cand = (Get-Date).Date + $t.TimeOfDay
     if ($cand -le (Get-Date)) { $cand = $cand.AddDays(1) }
     $cand
@@ -327,6 +491,16 @@ function Invoke-Status {
         foreach ($t in $tasks) {
             Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $t.next)
         }
+        # a moved or renamed repo leaves the jobs registered and still showing a
+        # next run, while every fire is a silent no-op - the one failure mode
+        # status could not see before
+        $broken = @($tasks | Where-Object { $_.script -and (-not (Test-Path $_.script)) })
+        if ($broken.Count -gt 0) {
+            foreach ($b in $broken) {
+                Write-Host ('! {0} points at {1} which no longer exists (repo moved or renamed?)' -f $b.name, $b.script) -ForegroundColor Red
+            }
+            Write-Host 'fix: run install.ps1 again, then preheat apply' -ForegroundColor Red
+        }
     } else {
         Write-Host '(none - run: preheat apply)'
     }
@@ -341,6 +515,11 @@ function Invoke-Status {
                     $anch = ''
                     if ($e.PSObject.Properties['anchored']) {
                         $anch = if ($e.anchored) { 'anchored NEW window' } else { 'local activity <5h before fire - likely landed in existing window' }
+                    }
+                    if (-not $e.ok -and $e.PSObject.Properties['err'] -and $e.err) {
+                        # a FAIL line that does not say why sends the user to the raw jsonl
+                        $k = if ($e.PSObject.Properties['kind'] -and $e.kind) { [string]$e.kind } else { 'error' }
+                        $anch = '{0}: {1}' -f $k, ([string]$e.err).Substring(0, [Math]::Min(100, ([string]$e.err).Length))
                     }
                     Write-Host ('[{0}] fire {1} attempts={2} {3}ms  {4}' -f $e.ts, $flag, $e.attempts, $e.ms, $anch)
                 } else {
@@ -362,12 +541,14 @@ function Invoke-StatusJson {
     $lastIso = $null
     if ($last) { $lastIso = $last.ToString('yyyy-MM-ddTHH:mm:ss') }
     $tasks = @()
+    $broken = @()
     foreach ($t in @(Get-PreheatJobs)) {
         $next = $null
         if ($t.next) { $next = $t.next.ToString('yyyy-MM-ddTHH:mm:ss') }
         $tasks += @{ name = $t.name; next = $next }
+        if ($t.script -and (-not (Test-Path $t.script))) { $broken += $t.name }
     }
-    $out = @{ lastActivity = $lastIso; tasks = $tasks }
+    $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken) }
     ConvertTo-Json -InputObject $out -Compress -Depth 6
 }
 
@@ -499,6 +680,9 @@ function Invoke-Learn {
         Write-Host ''
         Write-Host ('last 7 days: {0} window(s) opened, ~{1}h engaged of {2}h window time ({3}% used, estimate)' -f `
             $w.windows, $w.engagedH, $w.totalH, $w.usedPct)
+        # say whose numbers these are: history.jsonl records prompts YOU typed,
+        # so a preheat ping never appears here and never inflates the report
+        Write-Host '  (estimate from your own prompts - preheat pings are not in this history)'
     }
     $groups = [ordered]@{}
     foreach ($d in $rep.days) {
@@ -523,11 +707,14 @@ function Invoke-Learn {
     # auto: write + apply, preserving the proxy; days without a suggestion get
     # no rule (no observed rhythm -> nothing worth pre-warming)
     $proxy = ''
+    $bak   = $null
     try {
         if (Test-Path $ConfigPath) {
             $probe = Get-Content $ConfigPath -Raw -Encoding UTF8
             if ($probe) {
-                Copy-Item $ConfigPath ($ConfigPath + '.bak') -Force
+                # timestamped, not a fixed .bak: the second learn auto used to
+                # overwrite the only copy of the schedule the user hand-wrote
+                $bak = Backup-File $ConfigPath
                 $c0 = $probe | ConvertFrom-Json
                 if ($c0.PSObject.Properties['proxy']) { $proxy = $c0.proxy }
             }
@@ -540,13 +727,15 @@ function Invoke-Learn {
         proxy   = $proxy
         rules   = $rulesOut
     }
-    (ConvertTo-Json -InputObject $newConfig -Depth 6) | Set-Content -Path $ConfigPath -Encoding UTF8
+    Write-Utf8NoBom $ConfigPath (ConvertTo-Json -InputObject $newConfig -Depth 6)
     Write-Host ''
-    Write-Host 'schedule.json written (previous copy saved as schedule.json.bak) - applying:'
+    if ($bak) { Write-Host ('schedule.json written (previous copy saved as {0}) - applying:' -f (Split-Path $bak -Leaf)) }
+    else { Write-Host 'schedule.json written - applying:' }
     Invoke-Apply
 }
 
 function Invoke-Off {
+    Wait-FireLock
     Remove-PreheatJobs 'ClaudePreheat*'
     Write-Log @{ ev = 'off' }
     Write-Host 'all preheat tasks removed'
@@ -620,17 +809,21 @@ function Invoke-StatusLineSetup {
         if (Test-Path $sidecar) {
             try { $restore = Get-Content $sidecar -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
         }
-        if (Test-Path $sFile) { Copy-Item $sFile ($sFile + '.bak-' + (Get-Date).ToString('yyyyMMdd-HHmmss')) -Force }
+        # decide FIRST, touch the file only once a restore is certain: the old
+        # third branch dropped the whole statusLine key, so a hand-edited
+        # command cost the user the statusline they had written themselves
+        $newCmd = $null
         if ($restore -and $restore.PSObject.Properties['command'] -and $restore.command) {
-            $json.statusLine.command = [string]$restore.command
+            $newCmd = [string]$restore.command
         } elseif ($oldCmd -match '^"[^"]+" "[^"]*statusline-tap\.cjs" \| \( (.*) \)$') {
-            $json.statusLine.command = $Matches[1]   # sidecar lost: unwrap
+            $newCmd = $Matches[1]   # sidecar lost: unwrap
         } else {
-            $json.PSObject.Properties.Remove('statusLine')   # tap was solo: statusLine did not exist before
+            Write-Host ('cannot restore automatically: the sidecar is gone and the statusLine command in {0} was edited by hand - remove the statusline-tap.cjs part yourself (a timestamped backup is written on every change); nothing was changed' -f $sFile)
+            return
         }
-        # 5.1's Set-Content -Encoding UTF8 stamps a BOM; BOM-poisoned settings
-        # JSON breaks strict parsers, so write these files BOM-less explicitly
-        [System.IO.File]::WriteAllText($sFile, (ConvertTo-Json -InputObject $json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+        $null = Backup-File $sFile
+        $json.statusLine.command = $newCmd
+        Write-Utf8NoBom $sFile (ConvertTo-Json -InputObject $json -Depth 20)
         Remove-Item $sidecar -ErrorAction SilentlyContinue
         Write-Host ('statusline tap removed from {0} (backup written)' -f $sFile)
         return
@@ -658,16 +851,19 @@ function Invoke-StatusLineSetup {
     $node = 'node'
     if ($oldCmd -and ($oldCmd -match '"([^"]*node(\.exe)?)"')) { $node = $Matches[1] }
     elseif (Get-Command node -ErrorAction SilentlyContinue) { $node = ConvertTo-BashPath (Get-Command node).Source }
+    if ($node -eq 'node') {
+        # writing a bare "node" only works if the statusline shell happens to
+        # have it on PATH - it usually does not, and the breakage is silent
+        Write-Host 'node was not found on PATH and your current statusline does not name one - install Node.js (or add it to PATH) and re-run; nothing was changed'
+        return
+    }
     $tapBash = ConvertTo-BashPath $tap
     if ($oldCmd) {
         $newCmd = ('"{0}" "{1}" | ( {2} )' -f $node, $tapBash, $oldCmd)
     } else {
         $newCmd = ('"{0}" "{1}" --solo' -f $node, $tapBash)
     }
-    if (Test-Path $sFile) {
-        $probe = Get-Content $sFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-        if ($probe) { Copy-Item $sFile ($sFile + '.bak-' + (Get-Date).ToString('yyyyMMdd-HHmmss')) -Force }
-    }
+    $null = Backup-File $sFile
     @{ file = $sFile; command = $oldCmd } | ConvertTo-Json | Set-Content -Path $sidecar -Encoding UTF8
     if ($json.PSObject.Properties['statusLine'] -and $json.statusLine) {
         $json.statusLine | Add-Member -NotePropertyName command -NotePropertyValue $newCmd -Force
@@ -677,7 +873,9 @@ function Invoke-StatusLineSetup {
     } else {
         $json | Add-Member -NotePropertyName statusLine -NotePropertyValue ([pscustomobject]@{ type = 'command'; command = $newCmd }) -Force
     }
-    [System.IO.File]::WriteAllText($sFile, (ConvertTo-Json -InputObject $json -Depth 20), (New-Object System.Text.UTF8Encoding($false)))
+    # BOM-less: 5.1's Set-Content -Encoding UTF8 would stamp one, and BOM-poisoned
+    # settings JSON breaks strict parsers
+    Write-Utf8NoBom $sFile (ConvertTo-Json -InputObject $json -Depth 20)
     Write-Host ('statusline tap installed in {0} (backup + sidecar written)' -f $sFile)
     Write-Host 'takes effect on the next statusline render; rate limits land in state-ratelimits.json'
     Write-Host 'undo anytime: preheat statusline off'

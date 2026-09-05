@@ -4,6 +4,11 @@
 ' This wscript shim stays in the interactive session, so BurntToast
 ' notifications still display - unlike an S4U principal, which would also
 ' hide the window but silences toasts.
+' It WAITS for the child (bWaitOnReturn = True) and passes its exit code on.
+' Fire-and-forget made every task look like it finished in milliseconds:
+' ExecutionTimeLimit and MultipleInstances then applied to the shim rather than
+' to the real pwsh, and a session woken from sleep could be judged idle and put
+' back to sleep before the retry chain (up to 3 x 240s + 2 x 90s) was done.
 Option Explicit
 Dim sh, cmd, i
 Set sh = CreateObject("WScript.Shell")
@@ -12,4 +17,4 @@ For i = 0 To WScript.Arguments.Count - 1
     If i > 0 Then cmd = cmd & " "
     cmd = cmd & """" & WScript.Arguments(i) & """"
 Next
-sh.Run cmd, 0, False
+WScript.Quit sh.Run(cmd, 0, True)

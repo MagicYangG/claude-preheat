@@ -29,7 +29,7 @@ If `~/.local/bin` is not on your PATH the installer prints the one-liner to add 
 Then, in a new terminal:
 
 ```bash
-./test.ps1        # optional but recommended: full self-test, all cases should pass
+pwsh -NoProfile -File ./test.ps1   # optional but recommended: full self-test, all cases should pass
 preheat apply     # register the weekly preheats from schedule.json
 preheat status    # confirm what got registered
 claude-panel      # web panel at http://localhost:7878
@@ -59,11 +59,13 @@ Mitigations, in order of preference:
 2. Keep it on AC power with sleep disabled (`System Settings → Displays → Advanced → Prevent automatic sleeping on power adapter`, or `sudo pmset -c sleep 0`).
 3. `preheat status` warns when system sleep is enabled so you at least know the gap applies to you.
 
+LaunchAgents likewise run only while you are logged in (a locked screen is fine).
+
 Notifications about fires use standard macOS notifications (osascript) — no extra install.
 
 ## Feedback checklist
 
-If you run the beta, an issue with the following (success reports are just as useful as failures) makes the difference for v0.4.0 final:
+If you run the beta, an issue with the following (success reports are just as useful as failures) makes the difference for the next release:
 
 1. macOS version + chip (e.g. `14.5 / M2`), `pwsh -v`
 2. `preheat status -Json` output

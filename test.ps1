@@ -29,7 +29,9 @@ New-Item -ItemType Directory -Path $Tmp -Force | Out-Null
 
 $script:Pass = 0
 $script:Fail = 0
+$script:Skip = 0
 $script:Failures = @()
+$script:Skipped = @()
 
 function Test-Case([string]$name, [scriptblock]$body) {
     try {
@@ -37,6 +39,19 @@ function Test-Case([string]$name, [scriptblock]$body) {
         if ($result -eq $true) {
             $script:Pass++
             Write-Verbose ("PASS  " + $name)
+        } elseif (($result -is [string]) -and ($result -eq 'SKIP')) {
+            # a case that cannot run here (no node, no registered job) used to
+            # `return $true` and the summary said ALL PASS over cases nobody ran.
+            # PREHEAT_STRICT=1 turns that back into a failure where it can run.
+            if ($env:PREHEAT_STRICT -eq '1') {
+                $script:Fail++
+                $script:Failures += ('{0}   (skipped, but PREHEAT_STRICT=1)' -f $name)
+                Write-Host ("FAIL  " + $name + "  [skipped under PREHEAT_STRICT]") -ForegroundColor Red
+            } else {
+                $script:Skip++
+                $script:Skipped += $name
+                Write-Host ("SKIP  " + $name) -ForegroundColor DarkYellow
+            }
         } else {
             $script:Fail++
             $script:Failures += ('{0}   (returned: {1})' -f $name, $result)
@@ -122,6 +137,74 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
     Test-Case 'a time already past resolves to tomorrow (never the past)' {
         $past = (Get-Date).AddHours(-2).ToString('HH:mm')
         (Get-NextOccurrence $past) -gt (Get-Date)
+    }
+    Test-Case 'a culture whose time separator is not ":" still reads HH:mm' {
+        # ParseExact with the CURRENT culture reads ':' as "that culture's time
+        # separator" - fi-FI uses '.', so on a Finnish desktop every reset in
+        # schedule.json threw and no task was ever registered
+        $th = [System.Threading.Thread]::CurrentThread
+        $c0 = $th.CurrentCulture
+        $u0 = $th.CurrentUICulture
+        try {
+            $fi = [System.Globalization.CultureInfo]::GetCultureInfo('fi-FI')
+            $th.CurrentCulture = $fi
+            $th.CurrentUICulture = $fi
+            $n = Get-NextOccurrence '08:40'
+            $s = @(Get-FireSpecs ([pscustomobject]@{ rules = @([pscustomobject]@{ days = @('Mon'); reset = '08:40' }) }))
+            ($n.Hour -eq 8) -and ($n.Minute -eq 40) -and ($s[0].FireTime -eq [timespan]::new(3, 40, 0))
+        } finally {
+            $th.CurrentCulture = $c0
+            $th.CurrentUICulture = $u0
+        }
+    }
+
+    Write-Host '-- preheat: ping verdict (pure, costs nothing) --'
+    Test-Case 'exit 0 with an is_error payload is a FAILURE, and an auth one' {
+        # judging a ping by its exit code alone logged an expired login as a
+        # good preheat, day after day, while no window was ever anchored
+        $r = Test-PingOutput 0 '{"is_error":true,"result":"Not logged in - run /login"}' ''
+        (-not $r.ok) -and ($r.kind -eq 'auth')
+    }
+    Test-Case 'a clean result is a success and carries the cost through' {
+        $r = Test-PingOutput 0 '{"total_cost_usd":0.0123,"is_error":false}' ''
+        $r.ok -and ([math]::Abs([double]$r.cost - 0.0123) -lt 0.000001) -and ($null -eq $r.kind)
+    }
+    Test-Case 'a non-zero exit with no output is a plain (non-auth) failure' {
+        $r = Test-PingOutput 1 '' ''
+        (-not $r.ok) -and ($r.kind -eq 'other')
+    }
+    Test-Case 'unparseable stdout still counts as success (pre-JSON behaviour)' {
+        (Test-PingOutput 0 'hello from claude' '').ok
+    }
+    Test-Case 'exit 1 with an is_error payload logs the reason, not the JSON head' {
+        # the shape of a real fire on a limit-hit account: exit 1, empty stderr,
+        # and a payload whose first 400 bytes are zeroed usage counters - the
+        # log used to keep those and lose the one line that said why
+        $pad = '"usage":{' + ((1..60 | ForEach-Object { '"f{0}":0' -f $_ }) -join ',') + '}'
+        $r = Test-PingOutput 1 ('{"type":"result","duration_api_ms":0,' + $pad + ',"is_error":true,"result":"Claude AI usage limit reached|1757062200"}') ''
+        (-not $r.ok) -and ($r.err -like 'Claude AI usage limit reached*') -and ($r.kind -eq 'limit')
+    }
+    Test-Case 'a usage-limit or auth failure is not retried (nothing heals in 90s)' {
+        (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match [regex]::Escape("kind -eq 'limit')) { break }")
+    }
+
+    Write-Host '-- preheat: fire lock --'
+    Test-Case 'a fresh fire lock makes apply/off refuse instead of racing the ping' {
+        # apply/off rewrite the very job a running fire lives inside; on macOS
+        # bootout SIGTERMs the ping mid-flight
+        $FireLock = Join-Path $Tmp 'fire.lock'   # shadows the real lock in this scope
+        '{"pid":1,"job":"ClaudePreheat-Once-20260101-0000","startedAt":"2026-01-01T00:00:00"}' |
+            Set-Content -Path $FireLock -Encoding UTF8
+        $msg = ''
+        try { Wait-FireLock -MaxSec 1 } catch { $msg = $_.Exception.Message }
+        ($msg -like '*running right now*') -and (Test-Path $FireLock)
+    }
+    Test-Case 'a fire lock older than 20 minutes is a corpse: deleted, not waited on' {
+        $FireLock = Join-Path $Tmp 'fire.lock'
+        Set-Content -Path $FireLock -Value '{}' -Encoding UTF8
+        (Get-Item $FireLock).LastWriteTime = (Get-Date).AddMinutes(-30)
+        Wait-FireLock -MaxSec 1
+        -not (Test-Path $FireLock)
     }
 
     Write-Host '-- preheat: activity detection --'
@@ -261,6 +344,15 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
     Test-Case 'unrecognized job name -> null next run' {
         $null -eq (Get-JobNextRun 'SomethingElse')
     }
+    Test-Case 'a listed job reports the preheat.ps1 path baked into it' {
+        # read-only: a moved or renamed repo leaves jobs that still show a next
+        # run while every fire is a silent no-op, so status needs the path back
+        $jobs = @(Get-PreheatJobs)
+        if ($jobs.Count -eq 0) { Write-Host '    (no preheat jobs registered here - skipped)'; return 'SKIP' }
+        $ok = $true
+        foreach ($j in $jobs) { if (-not $j.ContainsKey('script')) { $ok = $false } }
+        $ok
+    }
     Test-Case 'weekly plist: one Weekday dict per day, hour/minute, paths, PATH snapshot' {
         $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Wk-0400-SatSun' -Days @('Saturday', 'Sunday') `
             -At ([datetime]::new(2026, 1, 1, 4, 0, 0)) -HostShell '/usr/local/bin/pwsh' -ScriptPath '/repo/preheat.ps1' -PathEnv '/usr/bin:/bin'
@@ -295,8 +387,13 @@ Write-Host '-- panel: HTTP surface (spare port 7879) --'
 $panelPort = 7879
 $panelProc = $null
 try {
-    $shell = 'pwsh'
-    if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) { $shell = 'powershell' }
+    # CI runs this suite twice on Windows; PREHEAT_TEST_SHELL pins which engine
+    # hosts the panel so the 5.1 job really exercises the panel under 5.1
+    $shell = $env:PREHEAT_TEST_SHELL
+    if ($shell -ne 'powershell' -and $shell -ne 'pwsh') {
+        $shell = 'pwsh'
+        if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) { $shell = 'powershell' }
+    }
     $spArgs = @{
         FilePath = $shell; PassThru = $true
         ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Repo 'panel.ps1'),
@@ -326,9 +423,12 @@ try {
         $s = (Invoke-WebRequest -Uri "$base/api/status" -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json
         ($null -ne $s.preheat) -and ($s.preheat.PSObject.Properties['tasks'])
     }
-    Test-Case 'GET /api/schedule returns the parsed config' {
+    Test-Case 'GET /api/schedule returns the rules, an mtime, and no proxy' {
+        # mtime is the optimistic lock the apply button hands back; the proxy
+        # never reaches the page, so the page can never round-trip it away
         $s = (Invoke-WebRequest -Uri "$base/api/schedule" -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json
-        $null -ne $s.PSObject.Properties['rules']
+        ($null -ne $s.PSObject.Properties['rules']) -and ($null -ne $s.PSObject.Properties['mtime']) -and
+            ($null -eq $s.PSObject.Properties['proxy'])
     }
     Test-Case 'unknown path -> 404' {
         try { $null = Invoke-WebRequest -Uri "$base/nope" -UseBasicParsing -TimeoutSec 15; $false }
@@ -359,7 +459,7 @@ try {
         $raw = (Invoke-WebRequest -Uri "$base/api/ratelimits" -UseBasicParsing -TimeoutSec 15).Content
         $raw.TrimStart().StartsWith('{')
     }
-    Test-Case 'GET /api/learn answers the rhythm report (shell-out, cached)' {
+    Test-Case 'GET /api/learn answers the rhythm report (in-process, cached)' {
         $s = (Invoke-WebRequest -Uri "$base/api/learn" -UseBasicParsing -TimeoutSec 60).Content | ConvertFrom-Json
         $null -ne $s.PSObject.Properties['days']
     }
@@ -372,6 +472,35 @@ try {
         $r1 = Invoke-PanelPost '/api/preheat/once' $bad @{ Origin = "http://localhost:$panelPort" } 'application/json'
         $r2 = Invoke-PanelPost '/api/preheat/once' '{"kind":"at","value":"9am; rm x"}' @{ Origin = "http://localhost:$panelPort" } 'application/json'
         ($r1.Code -eq 400) -and ($r2.Code -eq 400)
+    }
+    Test-Case 'POST /api/preheat/once rejects a well-formed but impossible clock time -> 400' {
+        # 25:00 matched the HH:mm shape and went straight to the backend
+        (Invoke-PanelPost '/api/preheat/once' '{"kind":"at","value":"25:00"}' @{ Origin = "http://localhost:$panelPort" } 'application/json').Code -eq 400
+    }
+    Test-Case 'an IPv6 loopback origin is not a foreign origin' {
+        # a panel opened on http://[::1]:PORT sends that Origin back; the
+        # allowlist only knew localhost/127.0.0.1, so every button 403'd
+        $r = Invoke-PanelPost '/api/preheat/once' '{}' @{ Origin = "http://[::1]:$panelPort" } 'application/json'
+        ($r.Code -ne 403) -and ($r.Code -gt 0)
+    }
+    Test-Case 'POST /api/preheat/apply rejects an unusable rule set -> 400' {
+        $o = @{ Origin = "http://localhost:$panelPort" }
+        $empty = Invoke-PanelPost '/api/preheat/apply' '{"rules":[]}' $o 'application/json'
+        $noDay = Invoke-PanelPost '/api/preheat/apply' '{"rules":[{"days":[],"reset":"09:00"}]}' $o 'application/json'
+        $badHr = Invoke-PanelPost '/api/preheat/apply' '{"rules":[{"days":["Mon"],"reset":"25:00"}]}' $o 'application/json'
+        ($empty.Code -eq 400) -and ($noDay.Code -eq 400) -and ($badHr.Code -eq 400)
+    }
+    Test-Case 'POST /api/preheat/apply refuses a stale baseMtime -> 409' {
+        # THE only rule-valid apply this suite may send: the optimistic lock has
+        # to stop it BEFORE schedule.json is rewritten and the tasks re-registered.
+        # If it ever answers anything else, stop the suite rather than find out
+        # what it did to the machine's real schedule.
+        $body = '{"rules":[{"days":["Mon"],"reset":"09:00"}],"baseMtime":"1"}'
+        $r = Invoke-PanelPost '/api/preheat/apply' $body @{ Origin = "http://localhost:$panelPort" } 'application/json'
+        if ($r.Code -ne 409) {
+            throw ('apply with a stale baseMtime answered {0}, not 409 - schedule.json and the registered tasks may have been rewritten' -f $r.Code)
+        }
+        $true
     }
 } finally {
     if ($panelProc) { try { Stop-Process -Id $panelProc.Id -Force -ErrorAction SilentlyContinue } catch { } }
@@ -389,7 +518,7 @@ function Invoke-Redirected([string]$Line) {
     if ($win) { & cmd /c $Line } else { & sh -c $Line }
 }
 Test-Case 'tap forwards stdin byte-identical and caches rate_limits beside itself' {
-    if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return $true }
+    if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return 'SKIP' }
     $td = Join-Path $Tmp 'tap'
     New-Item -ItemType Directory -Path $td -Force | Out-Null
     Copy-Item (Join-Path $Repo 'statusline-tap.cjs') $td
@@ -403,13 +532,13 @@ Test-Case 'tap forwards stdin byte-identical and caches rate_limits beside itsel
         ((Get-Content $state -Raw -Encoding UTF8 | ConvertFrom-Json).rate_limits.five_hour.used_percentage -eq 12)
 }
 Test-Case 'tap --solo renders a usage line for users with no statusline of their own' {
-    if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return $true }
+    if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return 'SKIP' }
     $td = Join-Path $Tmp 'tap'
     $line = Invoke-Redirected ('"{0}" "{1}" --solo < "{2}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'in.json'))
     ($line -join '') -match '5h 12%'
 }
 Test-Case 'tap survives non-JSON stdin by forwarding it untouched' {
-    if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return $true }
+    if (-not $nodeCmd) { Write-Host '    (node not on PATH - skipped)'; return 'SKIP' }
     $td = Join-Path $Tmp 'tap'
     [System.IO.File]::WriteAllText((Join-Path $td 'junk.txt'), 'not json at all')
     Invoke-Redirected ('"{0}" "{1}" < "{2}" > "{3}"' -f $nodeCmd.Source, (Join-Path $td 'statusline-tap.cjs'), (Join-Path $td 'junk.txt'), (Join-Path $td 'junk.out'))
@@ -447,6 +576,65 @@ Test-Case 'panel page ships bilingual: string table, language toggle, persisted 
 }
 Test-Case 'the scheduled-task registrar keeps -WakeToRun (sleep must not eat a fire)' {
     (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8) -match '-WakeToRun'
+}
+Test-Case 'the registrar also survives a laptop running on battery' {
+    # the Task Scheduler default is "only on AC, stop when unplugged": every
+    # fire on an unplugged laptop was silently skipped
+    $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+    ($p -match '-AllowStartIfOnBatteries') -and ($p -match '-DontStopIfGoingOnBatteries')
+}
+Test-Case 'apply forces the fire specs into an array before planning' {
+    # a one-rule schedule.json unrolls to a bare hashtable whose .Count is its
+    # key count, so the plan built from it registered the wrong thing
+    (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match '\$specs\s*=\s*@\(Get-FireSpecs'
+}
+Test-Case 'every clock parse pins InvariantCulture, not the desktop culture' {
+    # a bare ParseExact reads 'HH:mm' with the CURRENT culture's time separator
+    # and calendar. The runtime happens to accept ':' anyway today, so the
+    # culture case above cannot see this slip - only the source can.
+    $ok = $true
+    foreach ($f in @('preheat.ps1', 'platform.ps1')) {
+        $c = Get-Content (Join-Path $Repo $f) -Raw -Encoding UTF8
+        $all = ([regex]::Matches($c, 'ParseExact')).Count
+        $pinned = ([regex]::Matches($c, 'ParseExact\([^\r\n]*InvariantCulture')).Count
+        if (($all -lt 1) -or ($all -ne $pinned)) { $ok = $false }
+    }
+    $ok
+}
+Test-Case 'journal appends are serialized by a named mutex' {
+    # two providers firing at the same minute rotated the 2MB journal
+    # read-modify-write and lost each other's records
+    (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match 'claude-preheat-journal'
+}
+Test-Case 'stale once-labels are swept by name pattern, not by what is on disk' {
+    # launchd keeps holding a Once label whose plist is already gone
+    (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8).Contains('Once-\d{8}-\d{4}')
+}
+Test-Case 'run-hidden.vbs propagates the exit code of what it launched' {
+    # it used to swallow every failure: the scheduled task always looked green
+    (Get-Content (Join-Path $Repo 'run-hidden.vbs') -Raw).Contains('WScript.Quit sh.Run(cmd, 0, True)')
+}
+Test-Case 'one platform probe for the whole project, and Linux is refused up front' {
+    $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+    $i = Get-Content (Join-Path $Repo 'install.ps1') -Raw -Encoding UTF8
+    ($p -match '\$OnLinux') -and ($i -notmatch '\$onMac\s*=\s*\$false')
+}
+Test-Case 'the ratelimit card explains an empty cache and dims a stale one' {
+    $h = Get-Content (Join-Path $Repo 'web\index.html') -Raw -Encoding UTF8
+    (([regex]::Matches($h, 'rl_hint:')).Count -eq 2) -and
+        (([regex]::Matches($h, 'rl_stale:')).Count -eq 2) -and
+        (([regex]::Matches($h, 'rl_expired:')).Count -eq 2) -and
+        ($h -match '\.rl\.stale')
+}
+Test-Case 'the tap fsyncs the cache before renaming it into place' {
+    # a crash between write and rename left a truncated cache the panel parsed as empty
+    (Get-Content (Join-Path $Repo 'statusline-tap.cjs') -Raw) -match 'fsyncSync'
+}
+Test-Case 'the panel computes the rhythm report in-process, not by shelling out' {
+    # both directions: the in-process call must exist AND the learn shell-out
+    # must not come back (it blocked the single-threaded listener for seconds)
+    $pan = Get-Content (Join-Path $Repo 'panel.ps1') -Raw -Encoding UTF8
+    ($pan -match 'Get-LearnReport') -and ($pan -notmatch "CmdArgs\s+@\('learn'")
 }
 Test-Case 'Quote-Arg doubles backslash runs before quotes (argv-splice guard)' {
     # Windows argv parsing treats  \"  as an escaped quote: quoting that only
@@ -532,7 +720,7 @@ Test-Case 'the panel surfaces the ratelimit cache bilingually' {
 Test-Case 'personal state stays out of git' {
     $ignored = @('schedule.json', 'preheat-log.jsonl', '.claude',
         'state-ratelimits.json', 'statusline-original.json',
-        'launchd-err.log', 'claude-ignite-promo')
+        'launchd-err.log', 'claude-ignite-promo', '.fire.lock')
     $ok = $true
     foreach ($p in $ignored) {
         git -C $Repo check-ignore $p 2>$null | Out-Null
@@ -546,9 +734,13 @@ Remove-Item $Tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''
 if ($script:Fail -eq 0) {
-    Write-Host ('ALL PASS  {0}/{0}' -f $script:Pass) -ForegroundColor Green
+    $line = 'ALL PASS  {0}/{0}' -f $script:Pass
+    if ($script:Skip -gt 0) { $line += (' ({0} skipped)' -f $script:Skip) }
+    Write-Host $line -ForegroundColor Green
+    foreach ($s in $script:Skipped) { Write-Host ('  ~ skipped: ' + $s) -ForegroundColor DarkYellow }
     exit 0
 }
-Write-Host ('{0} passed, {1} FAILED' -f $script:Pass, $script:Fail) -ForegroundColor Red
+Write-Host ('{0} passed, {1} FAILED, {2} skipped' -f $script:Pass, $script:Fail, $script:Skip) -ForegroundColor Red
 foreach ($f in $script:Failures) { Write-Host ('  - ' + $f) -ForegroundColor Red }
+foreach ($s in $script:Skipped) { Write-Host ('  ~ skipped: ' + $s) -ForegroundColor DarkYellow }
 exit 1

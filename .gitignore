@@ -5,6 +5,7 @@ state.json
 state-ratelimits.json
 statusline-original.json
 firepit/
+.fire.lock
 *.tmp
 *.bak*
 

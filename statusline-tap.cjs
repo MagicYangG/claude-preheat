@@ -29,10 +29,19 @@ process.stdin.on('end', function () {
     const dest = path.join(__dirname, 'state-ratelimits.json');
     const tmp = dest + '.tmp-' + process.pid;
     try {
-      fs.writeFileSync(tmp, JSON.stringify({
-        capturedAt: new Date().toISOString(),
-        rate_limits: payload.rate_limits
-      }));
+      // rename is atomic, but the CONTENT is not durable until it is fsynced:
+      // a crash/power loss between the two left a zero-length cache behind the
+      // atomic name, and the panel then rendered an empty quota strip
+      const fd = fs.openSync(tmp, 'w');
+      try {
+        fs.writeSync(fd, JSON.stringify({
+          capturedAt: new Date().toISOString(),
+          rate_limits: payload.rate_limits
+        }));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
       fs.renameSync(tmp, dest);
     } catch (e) {
       try { fs.unlinkSync(tmp); } catch (e2) { /* never break the statusline */ }

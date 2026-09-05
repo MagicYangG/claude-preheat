@@ -22,6 +22,12 @@ Test-WakeTimers prints the platform-appropriate warning.
 $OnMac = $false
 try { if ($IsMacOS) { $OnMac = $true } } catch { }
 # $IsMacOS does not exist on Windows PowerShell 5.1 - the try keeps 5.1 quiet
+$OnLinux = $false
+try { if ($IsLinux) { $OnLinux = $true } } catch { }
+# three states, not two: everything below assumes "mac or Windows". On Linux
+# the Windows branch would run and fail deep inside Task Scheduler cmdlets with
+# an unrelated message - say it here instead.
+if ($OnLinux) { throw 'claude-preheat supports Windows and macOS only - there is no scheduler backend for Linux' }
 
 $PlatformRoot       = $PSScriptRoot
 $JobNamePrefix      = 'ClaudePreheat-'
@@ -36,6 +42,32 @@ function Get-ClaudeHome {
     $HOME
 }
 
+function Backup-File([string]$Path) {
+    # timestamped copy taken just before an in-place rewrite; returns the backup
+    # path, or $null when there was nothing worth copying. Never throws: a
+    # failed backup must not abort the operation it was only guarding.
+    try {
+        if ((Test-Path $Path) -and ((Get-Item $Path).Length -gt 0)) {
+            $bak = $Path + '.bak-' + (Get-Date).ToString('yyyyMMdd-HHmmss')
+            Copy-Item $Path $bak -Force
+            # keep the five newest: the panel's Save & apply would otherwise
+            # leave a fresh .bak-* behind on every click, forever (they are
+            # gitignored, so nobody would notice the pile)
+            Get-ChildItem -Path (Split-Path $Path -Parent) -Filter ((Split-Path $Path -Leaf) + '.bak-*') -File -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | Select-Object -Skip 5 |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            return $bak
+        }
+    } catch { }
+    $null
+}
+
+function Write-Utf8NoBom([string]$Path, [string]$Text) {
+    # 5.1's Set-Content -Encoding UTF8 stamps a BOM, and a BOM-poisoned JSON
+    # file breaks strict parsers (Claude Code's settings reader among them)
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function Resolve-HostShell {
     if ($OnMac) {
         # pwsh prepends $PSHOME to PATH, so a plain Get-Command inside pwsh finds
@@ -44,11 +76,31 @@ function Resolve-HostShell {
         # /opt/homebrew/bin/pwsh is a wrapper that exports DOTNET_ROOT (the
         # formula links the shared dotnet instead of bundling a runtime) and the
         # bare binary exits with "You must install .NET". Baked into a plist or a
-        # shim that is a job that can never run - prefer a match outside $PSHOME,
-        # and fall through when there is none (self-contained pkg installs).
-        $outside = @(Get-Command pwsh -All -ErrorAction SilentlyContinue |
-            Where-Object { $_.Source -and (Split-Path $_.Source -Parent) -ne $PSHOME })
-        if ($outside.Count -gt 0) { return $outside[0].Source }
+        # shim that is a job that can never run - so do not just prefer a path
+        # outside $PSHOME, PROVE it launches before baking it in.
+        if ($script:HostShellCache) { return $script:HostShellCache }
+        $cands = @()
+        foreach ($c in @(Get-Command pwsh -All -ErrorAction SilentlyContinue)) {
+            if ($c.Source) { $cands += $c.Source }
+        }
+        $cands += @('/opt/homebrew/bin/pwsh', '/usr/local/bin/pwsh', '/usr/local/microsoft/powershell/7/pwsh')
+        $seen = @{}
+        foreach ($cand in $cands) {
+            if (-not $cand) { continue }
+            if ($seen[$cand]) { continue }
+            $seen[$cand] = $true
+            if ((Split-Path $cand -Parent) -eq $PSHOME) { continue }
+            if (-not (Test-Path $cand)) { continue }
+            try {
+                # do NOT pre-seed $LASTEXITCODE here: assigning it makes a LOCAL
+                # copy that the engine never updates, so the check below would
+                # read the seed forever and no candidate could ever pass
+                & $cand -NoProfile -NonInteractive -Command '1' 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $script:HostShellCache = $cand; return $cand }
+            } catch { }
+        }
+        # every candidate outside $PSHOME is broken or absent (self-contained pkg
+        # installs have none) - fall through to the bare binary below
     }
     $p = Get-Command pwsh -ErrorAction SilentlyContinue
     if ($p) { return $p.Source }
@@ -74,7 +126,9 @@ function ConvertFrom-LaunchdLabel([string]$label) { $JobNamePrefix + $label.Subs
 function Get-JobNextRun([string]$name) {
     # the job name carries its whole schedule - see the header note
     if ($name -match '^ClaudePreheat-Once-(\d{8})-(\d{4})$') {
-        try { return [datetime]::ParseExact($Matches[1] + $Matches[2], 'yyyyMMddHHmm', $null) } catch { return $null }
+        # InvariantCulture, not $null: $null means CurrentCulture, and a non-
+        # Gregorian calendar (th-TH, ar-SA) parses these digits into a wrong year
+        try { return [datetime]::ParseExact($Matches[1] + $Matches[2], 'yyyyMMddHHmm', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
     }
     if ($name -match '^ClaudePreheat-Wk-(\d{2})(\d{2})-([A-Za-z]+)$') {
         $tod  = New-Object timespan ([int]$Matches[1]), ([int]$Matches[2]), 0
@@ -155,7 +209,15 @@ function New-PreheatAction {
 }
 
 function New-PreheatSettings {
-    New-ScheduledTaskSettingsSet -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
+    # -AllowStartIfOnBatteries / -DontStopIfGoingOnBatteries: the default is to
+    # skip (or kill) the task on battery, and one haiku ping is not worth losing
+    # the whole day's anchor over an unplugged laptop.
+    # -StartWhenAvailable is deliberately NOT set: a missed fire replayed at
+    # logon would anchor the 5h window at that moment, which is worse than
+    # skipping it. The task runs as an Interactive logon type, so it only fires
+    # while the user is logged in (a locked screen is fine).
+    New-ScheduledTaskSettingsSet -WakeToRun -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
 }
 
 # ---------- the scheduling contract ----------
@@ -174,8 +236,16 @@ function Register-PreheatJob {
         [System.IO.File]::WriteAllText($plist, $xml, (New-Object System.Text.UTF8Encoding($false)))
         $uid = Get-MacUid
         & launchctl bootout "gui/$uid/$label" 2>$null | Out-Null      # idempotent re-register
-        & launchctl bootstrap "gui/$uid" $plist 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) {
+        # bootout is asynchronous: the label can still be tearing down when the
+        # bootstrap right behind it arrives, and launchd answers with a
+        # transient "service already loaded"/busy error. Retry before giving up.
+        $booted = $false
+        for ($i = 1; $i -le 3 -and -not $booted; $i++) {
+            & launchctl bootstrap "gui/$uid" $plist 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $booted = $true }
+            elseif ($i -lt 3) { Start-Sleep -Seconds 1 }
+        }
+        if (-not $booted) {
             # a plist launchd never accepted must not linger: status trusts plist files
             Remove-Item $plist -Force -ErrorAction SilentlyContinue
             throw "launchctl bootstrap failed for $label (exit $LASTEXITCODE)"
@@ -188,7 +258,10 @@ function Register-PreheatJob {
 }
 
 function Get-PreheatJobs {
-    # -> array of @{ name = <string>; next = <datetime or $null> }
+    # -> array of @{ name = <string>; next = <datetime or $null>; script = <string or $null> }
+    # `script` is the preheat.ps1 path BAKED INTO the job. Moving or renaming the
+    # repo leaves the job registered and still showing a next run while every
+    # fire is a silent no-op - status compares this against the filesystem.
     param([string]$Pattern = 'ClaudePreheat*')
     $jobs = @()
     if ($OnMac) {
@@ -196,7 +269,12 @@ function Get-PreheatJobs {
             foreach ($f in @(Get-ChildItem -Path $LaunchAgentDir -Filter ($LaunchdLabelPrefix + '*.plist') -ErrorAction SilentlyContinue)) {
                 $name = ConvertFrom-LaunchdLabel ([System.IO.Path]::GetFileNameWithoutExtension($f.Name))
                 if ($name -notlike $Pattern) { continue }
-                $jobs += @{ name = $name; next = (Get-JobNextRun $name) }
+                $scriptPath = $null
+                try {
+                    $plistText = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
+                    if ($plistText -and ($plistText -match '<string>([^<]*preheat\.ps1)</string>')) { $scriptPath = $Matches[1] }
+                } catch { }
+                $jobs += @{ name = $name; next = (Get-JobNextRun $name); script = $scriptPath }
             }
         }
     } else {
@@ -204,7 +282,12 @@ function Get-PreheatJobs {
             $info = $t | Get-ScheduledTaskInfo
             $next = $null
             if ($info.NextRunTime) { $next = $info.NextRunTime }
-            $jobs += @{ name = $t.TaskName; next = $next }
+            $scriptPath = $null
+            try {
+                $argStr = [string]$t.Actions[0].Arguments
+                if ($argStr -match '"-File"\s+"([^"]+)"') { $scriptPath = $Matches[1] }
+            } catch { }
+            $jobs += @{ name = $t.TaskName; next = $next; script = $scriptPath }
         }
     }
     $jobs
@@ -237,14 +320,47 @@ function Remove-StaleOnceJobs {
                 Remove-PreheatJobs $j.name
             }
         }
+        # a fire deletes its OWN plist but cannot boot itself out (that would
+        # SIGTERM the ping), so launchd keeps holding those labels. They have no
+        # plist left, so the loop above never sees them - sweep launchd directly.
+        try {
+            $uid = Get-MacUid
+            $printed = (& launchctl print "gui/$uid" 2>$null) -join "`n"
+            $selfLabel = $null
+            if ($env:CLAUDE_PREHEAT_SELF) { $selfLabel = ConvertTo-LaunchdLabel $env:CLAUDE_PREHEAT_SELF }
+            $done = @{}
+            foreach ($m in [regex]::Matches($printed, 'com\.claude-preheat\.Once-\d{8}-\d{4}')) {
+                $label = $m.Value
+                if ($done[$label]) { continue }
+                $done[$label] = $true
+                if ($selfLabel -and ($label -eq $selfLabel)) { continue }
+                if (Test-Path (Join-Path $LaunchAgentDir ($label + '.plist'))) { continue }
+                & launchctl bootout "gui/$uid/$label" 2>$null | Out-Null
+            }
+        } catch { }
     } else {
         Get-ScheduledTask -TaskName 'ClaudePreheat-Once*' -ErrorAction SilentlyContinue | ForEach-Object {
+            # never unregister a task whose instance is running: the vbs shim
+            # now waits for the fire, so that instance may be THIS very process,
+            # and deleting a running task can tear its process tree down
+            if ($_.State -eq 'Running') { return }
             $info = $_ | Get-ScheduledTaskInfo
             if (-not $info.NextRunTime -or $info.NextRunTime -lt (Get-Date).AddMinutes(-3)) {
                 $_ | Unregister-ScheduledTask -Confirm:$false
             }
         }
     }
+}
+
+function Limit-LaunchdErrLog {
+    # launchd appends every fire's stderr here forever - unlike the journal
+    # nothing else bounds it, so trim it whenever apply runs
+    try {
+        if ((Test-Path $LaunchdErrLog) -and ((Get-Item $LaunchdErrLog).Length -gt 1MB)) {
+            $keep = Get-Content $LaunchdErrLog -Tail 200
+            Set-Content -Path $LaunchdErrLog -Value $keep
+        }
+    } catch { }
 }
 
 # ---------- platform warnings + notifications ----------
@@ -279,8 +395,21 @@ function Test-WakeTimers {
     } catch { }
 }
 
-function Send-Toast($ok) {
-    $msg = if ($ok) { 'window preheated' } else { 'preheat FAILED - check preheat-log.jsonl' }
+function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '') {
+    # $Anchored: $true = this ping opened a fresh window, $false = it landed in
+    # a window that was already running (harmless, but the toast should not
+    # claim credit), $null = unknown. $Kind names the failure so an expired
+    # login gets the one message that tells the user what to actually do.
+    $msg = 'preheat FAILED - check preheat-log.jsonl'
+    if ($Ok) {
+        if ($null -eq $Anchored)   { $msg = 'window preheated' }
+        elseif ($Anchored -eq $true) { $msg = 'window preheated - new 5h window anchored' }
+        else                       { $msg = 'ping landed in a running window - anchor unchanged' }
+    } elseif ($Kind -eq 'auth') {
+        $msg = 'preheat FAILED - Claude login expired? run: claude'
+    } elseif ($Kind -eq 'limit') {
+        $msg = 'preheat skipped - usage limit already hit, nothing to preheat until it resets'
+    }
     try {
         if ($OnMac) {
             & osascript -e ('display notification "{0}" with title "claude-preheat"' -f $msg) 2>$null | Out-Null

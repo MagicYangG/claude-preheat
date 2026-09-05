@@ -2,7 +2,7 @@
 
 Plain words, no legalese.
 
-Nothing in v0.3 ever runs Claude unattended on your code — the v0.2
+Nothing in v0.3+ ever runs Claude unattended on your code — the v0.2
 relay feature and its `--dangerously-skip-permissions` flag are gone.
 
 ## the panel binds localhost only
@@ -32,13 +32,15 @@ services.
 
 Tool **data** (`schedule.json`, logs, `state.json`,
 `state-ratelimits.json`) lives inside the repo directory, and nothing is
-uploaded anywhere. Two things are written outside the repo, both by
-design and both removed by the uninstall steps in the README:
+uploaded anywhere. Three things are written outside the repo, all by
+design and all removed by the uninstall steps in the README:
 
 - a function block in your PowerShell profile (`preheat` /
   `claude-panel`), added by `install.ps1` with a timestamped backup,
 - per-user scheduled tasks (`ClaudePreheat-*`), registered without
-  elevation and running as you.
+  elevation and running as you,
+- on macOS, two one-line shims in `~/.local/bin` (`preheat`,
+  `claude-panel`) added by `install.ps1`.
 
 ## single-user assumption
 

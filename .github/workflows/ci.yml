@@ -14,15 +14,28 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: self-test (48+ cases)
+      - name: self-test (pwsh)
         shell: pwsh
+        run: ./test.ps1
+  # the project claims Windows PowerShell 5.1 support, so one job must actually
+  # be 5.1 - static regexes catch 7-only syntax, not 5.1-only runtime behaviour
+  test-windows-ps51:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: self-test (Windows PowerShell 5.1)
+        shell: powershell
+        env:
+          # pwsh exists on the runner, so pin the panel's host engine too
+          PREHEAT_TEST_SHELL: powershell
         run: ./test.ps1
   test-macos:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: self-test (48+ cases)
+      - name: self-test (pwsh)
         shell: pwsh
         run: ./test.ps1
       - name: launchd end-to-end (stubbed claude)
