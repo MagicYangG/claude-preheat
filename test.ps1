@@ -379,6 +379,31 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
             -At ([datetime]::new(2026, 1, 1, 0, 0, 0)) -HostShell '/a&b/pwsh' -ScriptPath '/s' -PathEnv '/x&y'
         ($xml -like '*/a&amp;b/pwsh*') -and ($xml -like '*/x&amp;y*') -and ($xml -notlike '*<string>/a&b/pwsh</string>*')
     }
+
+    Write-Host '-- platform: host shell resolution (Store pwsh alias) --'
+    Test-Case 'a versioned Store pwsh path is only swapped for its alias when the alias is proven to launch' {
+        $store = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $msi   = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $alias = 'C:\Users\u\AppData\Local\Microsoft\WindowsApps\Microsoft.PowerShell_8wekyb3d8bbwe\pwsh.exe'
+        $emptyRoot = Join-Path $Tmp 'no-aliases'
+        New-Item -ItemType Directory -Path $emptyRoot -Force | Out-Null
+        # no alias present -> the input comes back untouched, never a made-up path;
+        # a non-Store path and the alias itself are never touched at all
+        ((Resolve-StoreShellAlias $store -AliasRoot $emptyRoot) -eq $store) -and
+            ((Resolve-StoreShellAlias $msi -AliasRoot $emptyRoot) -eq $msi) -and
+            ((Resolve-StoreShellAlias $alias -AliasRoot $emptyRoot) -eq $alias)
+    }
+    Test-Case 'the host shell that gets baked into jobs exists, and on a Store pwsh it is the update-proof alias' {
+        $r = Resolve-HostShell
+        if (-not $r -or -not (Test-Path $r)) { return "resolved to a path that does not exist: $r" }
+        $p = Get-Command pwsh -ErrorAction SilentlyContinue
+        # MSI / Homebrew / self-contained installs have no versioned Store folder:
+        # nothing to swap, the existence check above is the whole assertion.
+        # A versioned folder carries the double underscore before the publisher
+        # id (..._7.6.6.0_x64__8wekyb3d8bbwe); the alias folder does not.
+        if (-not $p -or ($p.Source -notmatch '\\WindowsApps\\Microsoft\.PowerShell_[^\\]*__')) { return $true }
+        $r -notmatch '\\WindowsApps\\Microsoft\.PowerShell_[^\\]*__'
+    }
 }
 
 # ------------------------------------------------------------------ panel.ps1
@@ -613,6 +638,17 @@ Test-Case 'stale once-labels are swept by name pattern, not by what is on disk' 
 Test-Case 'run-hidden.vbs propagates the exit code of what it launched' {
     # it used to swallow every failure: the scheduled task always looked green
     (Get-Content (Join-Path $Repo 'run-hidden.vbs') -Raw).Contains('WScript.Quit sh.Run(cmd, 0, True)')
+}
+Test-Case 'run-hidden.vbs fails loudly when the host binary it was given is gone' {
+    # a Store pwsh update deleted the versioned folder baked into every task and
+    # the shim still exited 0 - two fires and the panel silently lost (2026-09-10)
+    $v = Get-Content (Join-Path $Repo 'run-hidden.vbs') -Raw
+    $v.Contains('fso.FileExists(WScript.Arguments(0))') -and $v.Contains('WScript.Quit 127')
+}
+Test-Case 'status flags a job whose baked host shell no longer exists' {
+    $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+    $s = Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8
+    ($p -match 'shell = \$shellPath') -and ($s -match 'PowerShell updated\?') -and ($s -match '\$t\.shell')
 }
 Test-Case 'one platform probe for the whole project, and Linux is refused up front' {
     $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8

@@ -501,6 +501,16 @@ function Invoke-Status {
             }
             Write-Host 'fix: run install.ps1 again, then preheat apply' -ForegroundColor Red
         }
+        # the other silent no-op: the host shell baked into the job is gone (a
+        # Store pwsh update replaced its versioned folder). The vbs shim now
+        # exits non-zero for it, but Task Scheduler's own view still says Ready.
+        $noShell = @($tasks | Where-Object { $_.shell -and (-not (Test-Path $_.shell)) })
+        if ($noShell.Count -gt 0) {
+            foreach ($b in $noShell) {
+                Write-Host ('! {0} runs {1} which no longer exists (PowerShell updated?)' -f $b.name, $b.shell) -ForegroundColor Red
+            }
+            Write-Host 'fix: preheat apply (re-registers the jobs with the current shell)' -ForegroundColor Red
+        }
     } else {
         Write-Host '(none - run: preheat apply)'
     }
@@ -546,7 +556,7 @@ function Invoke-StatusJson {
         $next = $null
         if ($t.next) { $next = $t.next.ToString('yyyy-MM-ddTHH:mm:ss') }
         $tasks += @{ name = $t.name; next = $next }
-        if ($t.script -and (-not (Test-Path $t.script))) { $broken += $t.name }
+        if (($t.script -and (-not (Test-Path $t.script))) -or ($t.shell -and (-not (Test-Path $t.shell)))) { $broken += $t.name }
     }
     $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken) }
     ConvertTo-Json -InputObject $out -Compress -Depth 6

@@ -10,8 +10,18 @@
 ' to the real pwsh, and a session woken from sleep could be judged idle and put
 ' back to sleep before the retry chain (up to 3 x 240s + 2 x 90s) was done.
 Option Explicit
-Dim sh, cmd, i
+Dim sh, fso, cmd, i
 Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+' A missing host binary used to come back as exit 0: sh.Run raises, //B swallows
+' the error, and Task Scheduler showed every fire green while nothing ran
+' (a Store pwsh update had deleted the versioned folder baked into the tasks).
+' Fail loudly instead - only for real paths, a bare command name still goes
+' through PATH resolution below.
+If WScript.Arguments.Count = 0 Then WScript.Quit 2
+If InStr(WScript.Arguments(0), "\") > 0 Then
+    If Not fso.FileExists(WScript.Arguments(0)) Then WScript.Quit 127
+End If
 cmd = ""
 For i = 0 To WScript.Arguments.Count - 1
     If i > 0 Then cmd = cmd & " "

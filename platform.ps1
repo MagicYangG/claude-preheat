@@ -102,8 +102,12 @@ function Resolve-HostShell {
         # every candidate outside $PSHOME is broken or absent (self-contained pkg
         # installs have none) - fall through to the bare binary below
     }
+    if ($script:HostShellCache) { return $script:HostShellCache }
     $p = Get-Command pwsh -ErrorAction SilentlyContinue
-    if ($p) { return $p.Source }
+    if ($p) {
+        $script:HostShellCache = Resolve-StoreShellAlias $p.Source
+        return $script:HostShellCache
+    }
     # we ARE a PowerShell - the running host binary is always a valid fallback
     # (matters on macOS where 'powershell' does not exist)
     try {
@@ -111,6 +115,36 @@ function Resolve-HostShell {
         if ($self) { return $self }
     } catch { }
     (Get-Command powershell).Source
+}
+
+function Resolve-StoreShellAlias {
+    # Windows twin of the Homebrew trap above. A Store-installed pwsh resolves to
+    # its VERSIONED package folder
+    #   C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.4.0_x64__8wekyb3d8bbwe\pwsh.exe
+    # and every Store update replaces that folder. A path baked into a scheduled
+    # task then dies at the next update - silently, because run-hidden.vbs used
+    # to exit 0 on a missing exe (observed 2026-09-10: 7.6.4 -> 7.6.6, two fires
+    # and the panel gone, every task still green). The App Execution Alias under
+    # %LOCALAPPDATA%\Microsoft\WindowsApps survives updates, so bake THAT - but
+    # PROVE it launches first: aliases can be switched off in Settings > Apps.
+    # Anything that is not a versioned Store path comes back untouched.
+    param([string]$Path, [string]$AliasRoot = $null)
+    if (-not $Path) { return $Path }
+    if ($Path -match '\\WindowsApps\\(Microsoft\.PowerShell)_\d[^\\]*__([^\\_]+)\\pwsh\.exe$') {
+        $pkg = $Matches[1]; $publisher = $Matches[2]
+        if (-not $AliasRoot) { $AliasRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps' }
+        $cands = @((Join-Path $AliasRoot ($pkg + '_' + $publisher + '\pwsh.exe')),   # per-package alias
+                   (Join-Path $AliasRoot 'pwsh.exe'))                                # generic alias
+        foreach ($cand in $cands) {
+            if (-not (Test-Path $cand)) { continue }
+            try {
+                # same rule as the mac branch: never pre-seed $LASTEXITCODE
+                & $cand -NoProfile -NonInteractive -Command '1' 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { return $cand }
+            } catch { }
+        }
+    }
+    $Path
 }
 
 function Get-MacUid {
@@ -258,10 +292,12 @@ function Register-PreheatJob {
 }
 
 function Get-PreheatJobs {
-    # -> array of @{ name = <string>; next = <datetime or $null>; script = <string or $null> }
+    # -> array of @{ name = <string>; next = <datetime or $null>; script = <string or $null>; shell = <string or $null> }
     # `script` is the preheat.ps1 path BAKED INTO the job. Moving or renaming the
     # repo leaves the job registered and still showing a next run while every
     # fire is a silent no-op - status compares this against the filesystem.
+    # `shell` is the host binary baked next to it - it disappears when a Store
+    # pwsh update replaces its versioned folder (see Resolve-StoreShellAlias).
     param([string]$Pattern = 'ClaudePreheat*')
     $jobs = @()
     if ($OnMac) {
@@ -270,11 +306,14 @@ function Get-PreheatJobs {
                 $name = ConvertFrom-LaunchdLabel ([System.IO.Path]::GetFileNameWithoutExtension($f.Name))
                 if ($name -notlike $Pattern) { continue }
                 $scriptPath = $null
+                $shellPath  = $null
                 try {
                     $plistText = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
                     if ($plistText -and ($plistText -match '<string>([^<]*preheat\.ps1)</string>')) { $scriptPath = $Matches[1] }
+                    # first ProgramArguments entry is the host shell
+                    if ($plistText -and ($plistText -match '<key>ProgramArguments</key>\s*<array>\s*<string>([^<]+)</string>')) { $shellPath = $Matches[1] }
                 } catch { }
-                $jobs += @{ name = $name; next = (Get-JobNextRun $name); script = $scriptPath }
+                $jobs += @{ name = $name; next = (Get-JobNextRun $name); script = $scriptPath; shell = $shellPath }
             }
         }
     } else {
@@ -283,11 +322,14 @@ function Get-PreheatJobs {
             $next = $null
             if ($info.NextRunTime) { $next = $info.NextRunTime }
             $scriptPath = $null
+            $shellPath  = $null
             try {
                 $argStr = [string]$t.Actions[0].Arguments
                 if ($argStr -match '"-File"\s+"([^"]+)"') { $scriptPath = $Matches[1] }
+                # the argument right after the vbs shim is the host shell
+                if ($argStr -match 'run-hidden\.vbs"\s+"([^"]+)"') { $shellPath = $Matches[1] }
             } catch { }
-            $jobs += @{ name = $t.TaskName; next = $next; script = $scriptPath }
+            $jobs += @{ name = $t.TaskName; next = $next; script = $scriptPath; shell = $shellPath }
         }
     }
     $jobs
