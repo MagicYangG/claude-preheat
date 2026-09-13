@@ -289,6 +289,15 @@ function Handle-ApiLearn($context) {
     Send-Json $context 200 $obj
 }
 
+function Handle-ApiEvents($context) {
+    # the journal's fire records for the page's fire-history list (newest
+    # first, capped; the page filters by age and count). [] until the first
+    # fire has been logged. Get-FireEvents comes from the dot-sourced preheat.ps1.
+    $ev = @()
+    try { $ev = @(Get-FireEvents $LogPath 60) } catch { $ev = @() }
+    Send-Json $context 200 @{ events = $ev }
+}
+
 function Get-ConfigMtime {
     # optimistic-lock token for schedule.json: a page that loaded rules hours
     # ago must not silently overwrite what the CLI wrote since. '' = no file.
@@ -450,6 +459,7 @@ function Handle-Request($context) {
     if ($method -eq 'GET' -and $path -eq '/api/schedule') { Handle-ApiSchedule $context; return }
     if ($method -eq 'GET' -and $path -eq '/api/ratelimits') { Handle-ApiRateLimits $context; return }
     if ($method -eq 'GET' -and $path -eq '/api/learn')      { Handle-ApiLearn $context; return }
+    if ($method -eq 'GET' -and $path -eq '/api/events')     { Handle-ApiEvents $context; return }
 
     if ($method -eq 'POST' -and -not (Test-PostSecurity $context)) { return }
 

@@ -140,6 +140,30 @@ select{
 }
 .lbl{font-size:13px;color:var(--dim)}
 
+/* ---- fire history: collapsed under the scheduled preheats; the latest verdict rides the summary line ---- */
+.evbox{margin:10px 0 2px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
+.evbox summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:10px;padding:9px 14px;font-size:13px;color:var(--dim)}
+.evbox summary::-webkit-details-marker{display:none}
+.evbox summary::before{content:'\25B8';font-size:11px;color:var(--dim2);transition:transform .12s}
+.evbox[open] summary::before{transform:rotate(90deg)}
+.evbox summary:hover{color:var(--fg2)}
+.evlast{margin-left:auto;display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;color:var(--fg2)}
+.evctl{display:flex;align-items:center;gap:6px;padding:2px 14px 10px;font-size:12.5px;color:var(--dim)}
+.evctl input[type=number]{width:54px;padding:3px 6px;font-size:12.5px}
+.evctl select{padding:3px 6px;font-size:12.5px}
+.evlist{padding:0 14px 10px}
+.evrow{display:grid;grid-template-columns:92px auto 1fr;gap:10px;align-items:baseline;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px}
+.evrow:first-child{border-top:0}
+.evts{font-family:var(--mono);color:var(--dim)}
+.evtxt{color:var(--fg2);line-height:1.45;word-break:break-word}
+.evretry{color:var(--dim);font-size:11.5px;margin-left:6px}
+.evtag{font-size:11.5px;padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap;line-height:1.5;justify-self:start}
+.evtag.ok{color:var(--ok2);border-color:var(--ok-b);background:var(--ok-bg)}
+.evtag.noeff{color:var(--accfg);border-color:var(--acc-b);background:var(--acc-bg)}
+.evtag.bad{color:var(--bad);border-color:var(--bad-b);background:var(--bad-bg)}
+.evempty{padding:4px 0 2px;font-size:12.5px;color:var(--dim)}
+@media (max-width:560px){.evrow{grid-template-columns:92px 1fr}.evrow .evtxt{grid-column:1 / -1}}
+
 /* ---- toast ---- */
 #toasts{position:fixed;right:20px;bottom:20px;z-index:50;display:flex;flex-direction:column;gap:10px;max-width:min(420px,calc(100vw - 40px))}
 .toast{
@@ -196,6 +220,22 @@ select{
   <div id="learnbox" class="rlage" style="display:none;margin:-4px 0 14px"></div>
   <div class="rowhead"><div class="t" data-i18n="sched_scheduled"></div></div>
   <div id="tasks"></div>
+  <details class="evbox" id="evbox">
+    <summary><span data-i18n="ev_h"></span><span class="evlast" id="evlast"></span></summary>
+    <div class="evctl">
+      <span data-i18n="ev_days_pre"></span><input type="number" id="evDays" min="1" max="30" value="7"><span data-i18n="ev_days_post"></span>
+      <span>&middot;</span>
+      <span data-i18n="ev_max_pre"></span><input type="number" id="evMax" min="1" max="30" value="10"><span data-i18n="ev_max_post"></span>
+      <span>&middot;</span>
+      <select id="evKind">
+        <option value="all" data-i18n="ev_kind_all"></option>
+        <option value="ok" data-i18n="ev_ok"></option>
+        <option value="noeff" data-i18n="ev_noeff"></option>
+        <option value="bad" data-i18n="ev_fail"></option>
+      </select>
+    </div>
+    <div class="evlist" id="events"></div>
+  </details>
   <hr class="hr">
   <div class="rowhead"><div class="t" data-i18n="sched_weekly"></div><span class="hint" style="margin:0" data-i18n="sched_weekly_hint"></span></div>
   <div id="wkgrid" class="wgrid"></div>
@@ -256,6 +296,12 @@ var I18N = {
     m_saved:'已保存并生效', m_scheduled:'已排定',
     op_failed:'操作失败', not_json:'后端返回的不是 JSON', no_backend:'没连上后端：',
     no_times:'一个时刻都没有；想全部清掉请用命令行 preheat off',
+    ev_h:'点火历史', ev_last:'上次 ', ev_kind_all:'全部', ev_days_pre:'近', ev_days_post:'天', ev_max_pre:'最多', ev_max_post:'条',
+    ev_ok:'窗口预热成功', ev_noeff:'窗口预热无效', ev_fail:'窗口预热失败',
+    ev_ok_line:'于 {a} 预热成功，将于 {b} 重置', ev_ok_line_na:'于 {a} 预热成功（当时未记录窗口状态）',
+    ev_noeff_line:'探查到 {a} 有使用，预热窗口时，原 5 小时额度未结束', ev_noeff_line_na:'预热窗口时，原 5 小时额度未结束',
+    ev_fail_limit:'用量已达限额', ev_fail_auth:'登录已过期', ev_fail_other:'其他错误：{e}', ev_fail_unknown:'原因未记录',
+    ev_retry:'重试 {n} 次', ev_none:'近 {d} 天没有点火记录', ev_none_kind:'近 {d} 天没有「{k}」的记录', ev_none_all:'还没有点火记录',
     bad_hours:'小时数填个 1 以上的整数', bad_time:'时刻格式要是 HH:mm', langBtn:'EN'
   },
   en: {
@@ -282,6 +328,12 @@ var I18N = {
     m_saved:'Saved & applied', m_scheduled:'Scheduled',
     op_failed:'Operation failed', not_json:'Backend did not return JSON', no_backend:'Backend not reachable: ',
     no_times:'No times set; to clear everything use preheat off on the command line',
+    ev_h:'Fire history', ev_last:'last ', ev_kind_all:'all', ev_days_pre:'last', ev_days_post:'days', ev_max_pre:'up to', ev_max_post:'entries',
+    ev_ok:'Preheat succeeded', ev_noeff:'Preheat had no effect', ev_fail:'Preheat failed',
+    ev_ok_line:'fired at {a}, resets at {b}', ev_ok_line_na:'fired at {a} (window state was not recorded back then)',
+    ev_noeff_line:'activity seen at {a}, the previous 5-hour window was still running', ev_noeff_line_na:'the previous 5-hour window was still running',
+    ev_fail_limit:'usage limit reached', ev_fail_auth:'login expired', ev_fail_other:'other error: {e}', ev_fail_unknown:'no reason recorded',
+    ev_retry:'retried {n}\u00d7', ev_none:'No fires in the last {d} days', ev_none_kind:'No \u201c{k}\u201d in the last {d} days', ev_none_all:'No fires yet',
     bad_hours:'Enter a whole number of hours ≥ 1', bad_time:'Time must be HH:mm', langBtn:'中文'
   }
 };
@@ -290,7 +342,7 @@ function t(k){ var d = I18N[LANG] || I18N.zh; return (k in d) ? d[k] : (I18N.zh[
 var DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 var DAYCN = {Mon:'一',Tue:'二',Wed:'三',Thu:'四',Fri:'五',Sat:'六',Sun:'日'};
 function dayShort(d){ return LANG === 'en' ? d : DAYCN[d]; }
-var state = { status:null, busy:false, stamp:null, schedLoaded:false, rl:null, learn:null, schedMtime:null };
+var state = { status:null, busy:false, stamp:null, schedLoaded:false, rl:null, learn:null, schedMtime:null, events:null };
 
 /* ---------- utils ---------- */
 function $(id){ return document.getElementById(id); }
@@ -651,6 +703,76 @@ function refreshLearn(){
   }).catch(function(){ /* optional */ });
 }
 
+/* ---------- fire history (the journal's fire records, newest first) ---------- */
+// one row per fire with a verdict in the user's own words: succeeded (a new
+// window opened), had no effect (the account was still inside a window - the
+// ping rode it), failed (limit / login / other). Age and count filters are
+// the reader's, remembered like the language choice.
+var EV_KEYS = { days:'clr_ev_days', max:'clr_ev_max' };
+function evPref(which, def){
+  var v = 0;
+  try { v = parseInt(localStorage.getItem(EV_KEYS[which]), 10); } catch (e) { }
+  return (v >= 1 && v <= 30) ? v : def;
+}
+function evInputs(){
+  var d = parseInt($('evDays').value, 10), m = parseInt($('evMax').value, 10);
+  if (!(d >= 1 && d <= 30)) { d = 7; $('evDays').value = d; }
+  if (!(m >= 1 && m <= 30)) { m = 10; $('evMax').value = m; }
+  return { days:d, max:m };
+}
+function hm(d){ return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+function evVerdict(e){ return !e.ok ? 'bad' : (e.anchored === false ? 'noeff' : 'ok'); }
+function evTag(v){
+  return '<span class="evtag ' + v + '">' + t(v === 'ok' ? 'ev_ok' : (v === 'noeff' ? 'ev_noeff' : 'ev_fail')) + '</span>';
+}
+function evLine(e, v, d){
+  if (v === 'ok') {
+    // records older than the anchored flag cannot say whether a window opened
+    if (e.anchored !== true) return t('ev_ok_line_na').replace('{a}', hm(d));
+    var r = new Date(d.getTime() + 5 * 3600 * 1000);
+    return t('ev_ok_line').replace('{a}', hm(d)).replace('{b}', hm(r));
+  }
+  if (v === 'noeff') {
+    var la = e.last_local_activity ? parseDate(e.last_local_activity) : null;
+    if (!la) return t('ev_noeff_line_na');
+    var sameDay = la.getFullYear() === d.getFullYear() && la.getMonth() === d.getMonth() && la.getDate() === d.getDate();
+    return t('ev_noeff_line').replace('{a}', sameDay ? hm(la) : fmtDT(la));
+  }
+  if (e.kind === 'limit') return t('ev_fail_limit');
+  if (e.kind === 'auth') return t('ev_fail_auth');
+  if (!e.err) return t('ev_fail_unknown');
+  // function replacer: a literal '$&' inside the error text must not expand
+  return t('ev_fail_other').replace('{e}', function(){ return esc(e.err); });
+}
+function renderEvents(){
+  var all = state.events || [];
+  var p = evInputs();
+  var kind = $('evKind').value || 'all';
+  var cut = Date.now() - p.days * 86400 * 1000;
+  var rows = [];
+  for (var i = 0; i < all.length && rows.length < p.max; i++) {
+    var e = all[i], d = parseDate(e.ts);
+    if (!d) continue;
+    if (d.getTime() < cut) break;   // newest first: everything after is older still
+    var v = evVerdict(e);
+    if (kind !== 'all' && v !== kind) continue;
+    var retry = (e.attempts > 1) ? ' <span class="evretry">' + t('ev_retry').replace('{n}', e.attempts) + '</span>' : '';
+    rows.push('<div class="evrow"><span class="evts">' + esc(fmtDT(d)) + '</span>' + evTag(v) +
+      '<span class="evtxt">' + evLine(e, v, d) + retry + '</span></div>');
+  }
+  var none = all.length ? t('ev_none').replace('{d}', p.days) : t('ev_none_all');
+  if (all.length && kind !== 'all') none = t('ev_none_kind').replace('{k}', t(kind === 'ok' ? 'ev_ok' : (kind === 'noeff' ? 'ev_noeff' : 'ev_fail'))).replace('{d}', p.days);
+  $('events').innerHTML = rows.length ? rows.join('') : ('<div class="evempty">' + none + '</div>');
+  var last = all.length ? all[0] : null, ld = last ? parseDate(last.ts) : null;
+  $('evlast').innerHTML = (last && ld) ? (esc(t('ev_last') + fmtDT(ld)) + ' ' + evTag(evVerdict(last))) : '';
+}
+function refreshEvents(){
+  return getJSON('/api/events').then(function(r){
+    state.events = (r && r.events) ? r.events : [];
+    renderEvents();
+  }).catch(function(){ /* the list just keeps what it had */ });
+}
+
 /* ---------- refresh loops ---------- */
 function applyStatus(s){
   state.status = s; state.stamp = new Date(); setOnline(true);
@@ -658,6 +780,7 @@ function applyStatus(s){
 }
 function refreshStatus(){
   refreshRateLimits();
+  refreshEvents();
   // one miss is not "offline": the single-threaded backend is unreachable for
   // seconds while an apply registers tasks, and the banner flashing there
   // trained the user to distrust it. Only a second failure counts.
@@ -690,7 +813,7 @@ function applyStatic(){
 }
 function rerenderDynamic(){
   renderWeek();
-  renderTasks(); renderRateLimits(); renderLearn();
+  renderTasks(); renderRateLimits(); renderLearn(); renderEvents();
   if (state.status && state.status.preheat) {
     var ig = state.status.preheat;
     var rules = rulesFromTasks(ig.tasks);
@@ -758,6 +881,17 @@ for (var k = 0; k < onceBtns.length; k++) {
     act('/api/preheat/once', { kind: kind, value: value }, t('m_scheduled'));
   });
 }
+
+$('evDays').value = evPref('days', 7);
+$('evMax').value = evPref('max', 10);
+$('evKind').addEventListener('change', renderEvents);
+['evDays', 'evMax'].forEach(function(id){
+  $(id).addEventListener('change', function(){
+    var p = evInputs();
+    try { localStorage.setItem(EV_KEYS.days, p.days); localStorage.setItem(EV_KEYS.max, p.max); } catch (e) { }
+    renderEvents();
+  });
+});
 
 /* ---------- boot ---------- */
 applyStatic();

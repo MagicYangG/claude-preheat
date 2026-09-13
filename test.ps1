@@ -188,6 +188,34 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match [regex]::Escape("kind -eq 'limit')) { break }")
     }
 
+    Write-Host '-- preheat: fire history (journal reader, pure) --'
+    Test-Case 'Get-FireEvents: newest first, fires only, bad lines skipped, err trimmed, max honoured' {
+        # the panel's fire-history list reads the journal through this; a
+        # synthetic journal exercises every record shape without a single ping
+        $j = Join-Path $Tmp 'events.jsonl'
+        @(
+            '{"ev":"apply","tasks":5,"ts":"2026-09-11T07:10:08-07:00"}',
+            '{"ev":"fire","ok":true,"anchored":true,"attempts":1,"ms":10072,"cost":0.028,"last_local_activity":"2026-09-11 09:59","ts":"2026-09-12T04:00:12-07:00"}',
+            '{"ev":"fire","ok":true,"anchored":false,"attempts":1,"ms":11126,"cost":0.027,"last_local_activity":"2026-09-12 11:49","ts":"2026-09-12T12:15:13-07:00"}',
+            'this line is not json {',
+            ('{"ev":"fire","ok":false,"kind":"limit","attempts":1,"ms":3868,"cost":null,"err":"' + ('x' * 300) + '","ts":"2026-09-12T19:45:09-07:00"}'),
+            '{"ev":"schedule-once","ts":"2026-09-12T20:05:00-07:00"}'
+        ) | Set-Content -Path $j -Encoding UTF8
+        $all = @(Get-FireEvents $j 60)
+        $two = @(Get-FireEvents $j 2)
+        ($all.Count -eq 3) -and ($two.Count -eq 2) -and
+            ($all[0].kind -eq 'limit') -and (-not $all[0].ok) -and ($all[0].err.Length -eq 120) -and
+            ($all[1].ok) -and ($all[1].anchored -eq $false) -and ($all[1].last_local_activity -eq '2026-09-12 11:49') -and
+            ($all[2].anchored -eq $true) -and ($null -eq $all[2].kind)
+    }
+    Test-Case 'Get-FireEvents on a missing journal is an empty list, not an error' {
+        @(Get-FireEvents (Join-Path $Tmp 'no-such-journal.jsonl') 60).Count -eq 0
+    }
+    Test-Case 'status names the time of the local activity that kept the window open' {
+        # "landed in existing window" without a time sent the user to the raw jsonl
+        (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match 'window was still open'
+    }
+
     Write-Host '-- preheat: fire lock --'
     Test-Case 'a fresh fire lock makes apply/off refuse instead of racing the ping' {
         # apply/off rewrite the very job a running fire lives inside; on macOS
@@ -460,6 +488,11 @@ try {
         catch { $_.Exception.Response.StatusCode.value__ -eq 404 }
     }
 
+    Test-Case 'GET /api/events shapes {events:[...]} even before the first fire' {
+        $s = (Invoke-WebRequest -Uri "$base/api/events" -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json
+        $null -ne $s.PSObject.Properties['events']
+    }
+
     function Invoke-PanelPost([string]$path, [string]$body, [hashtable]$headers, [string]$contentType) {
         $args = @{ Uri = "$base$path"; Method = 'POST'; Body = $body; UseBasicParsing = $true; TimeoutSec = 30 }
         if ($contentType) { $args.ContentType = $contentType }
@@ -598,6 +631,19 @@ Test-Case 'panel page ships bilingual: string table, language toggle, persisted 
     ($h -match 'var I18N') -and ($h -match "id=`"btnLang`"") -and
         ($h -match 'clr_lang') -and ($h -match 'data-i18n=') -and
         ($h -match 'function t\(')
+}
+Test-Case 'panel page ships the fire-history block and its strings in both languages' {
+    # the collapsed list under the scheduled preheats: a verdict per fire, in
+    # the user's words, in both tables, fed by /api/events
+    $h = Get-Content (Join-Path $Repo 'web\index.html') -Raw -Encoding UTF8
+    $cut = $h.IndexOf('  en: {')
+    if ($cut -lt 0) { return $false }
+    $zh = $h.Substring(0, $cut); $en = $h.Substring($cut)
+    $ok = ($h -match 'id="evbox"') -and ($h -match '/api/events') -and ($h -match 'id="evDays"') -and ($h -match 'id="evMax"') -and ($h -match 'id="evKind"')
+    foreach ($k in @('ev_h:', 'ev_ok:', 'ev_noeff:', 'ev_fail:', 'ev_ok_line:', 'ev_noeff_line:', 'ev_fail_limit:', 'ev_fail_auth:', 'ev_kind_all:')) {
+        if (-not $zh.Contains($k) -or -not $en.Contains($k)) { $ok = $false }
+    }
+    $ok
 }
 Test-Case 'the scheduled-task registrar keeps -WakeToRun (sleep must not eat a fire)' {
     (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8) -match '-WakeToRun'

@@ -95,6 +95,40 @@ function Write-Log($obj) {
     }
 }
 
+function Get-FireEvents([string]$path, [int]$max = 60) {
+    # the journal's fire records, newest first, trimmed to what a reader shows
+    # (the panel's fire-history list). Pure in $path so a synthetic journal
+    # exercises every record shape without spending a token. Never throws:
+    # a half-rotated or hand-edited journal just yields fewer records.
+    $out = New-Object System.Collections.Generic.List[object]
+    if ($path -and (Test-Path $path)) {
+        $lines = @()
+        try { $lines = @(Get-Content $path -Tail 400 -Encoding UTF8) } catch { $lines = @() }
+        for ($i = $lines.Count - 1; ($i -ge 0) -and ($out.Count -lt $max); $i--) {
+            $e = $null
+            try { $e = $lines[$i] | ConvertFrom-Json } catch { continue }
+            if ((-not $e) -or ($e.ev -ne 'fire')) { continue }
+            # pwsh 7 turns an ISO string into a DateTime on parse and [string] would
+            # then hand back the desktop culture's format - keep the journal's own text
+            $ts = [string]$e.ts
+            if ($lines[$i] -match '"ts"\s*:\s*"([^"]+)"') { $ts = $Matches[1] }
+            $rec = [ordered]@{ ts = $ts; ok = [bool]$e.ok; anchored = $null; kind = $null; attempts = $null; last_local_activity = $null; err = $null }
+            if ($e.PSObject.Properties['anchored'] -and ($null -ne $e.anchored)) { $rec.anchored = [bool]$e.anchored }
+            if ($e.PSObject.Properties['kind'] -and $e.kind) { $rec.kind = [string]$e.kind }
+            if ($e.PSObject.Properties['attempts'] -and ($null -ne $e.attempts)) { $rec.attempts = [int]$e.attempts }
+            if ($e.PSObject.Properties['last_local_activity'] -and $e.last_local_activity) { $rec.last_local_activity = [string]$e.last_local_activity }
+            if ($e.PSObject.Properties['err'] -and $e.err) {
+                $s = [string]$e.err
+                $rec.err = $s.Substring(0, [Math]::Min(120, $s.Length))
+            }
+            [void]$out.Add($rec)
+        }
+    }
+    # plain output (callers wrap in @()): a `,`-wrapped return survives a bare
+    # assignment but @(...) at the call site then nests the whole list as one item
+    $out.ToArray()
+}
+
 function Resolve-ClaudeExe {
     param([switch]$NoCache)
     if (-not $NoCache) {
@@ -524,7 +558,11 @@ function Invoke-Status {
                     $flag = if ($e.ok) { 'OK  ' } else { 'FAIL' }
                     $anch = ''
                     if ($e.PSObject.Properties['anchored']) {
-                        $anch = if ($e.anchored) { 'anchored NEW window' } else { 'local activity <5h before fire - likely landed in existing window' }
+                        $anch = if ($e.anchored) { 'anchored NEW window' } else {
+                            # say WHEN the account was last busy: that is the whole explanation
+                            $at = if ($e.PSObject.Properties['last_local_activity'] -and $e.last_local_activity) { ' at ' + [string]$e.last_local_activity } else { ' <5h before fire' }
+                            'local activity' + $at + ' - window was still open, ping landed in it (no new window)'
+                        }
                     }
                     if (-not $e.ok -and $e.PSObject.Properties['err'] -and $e.err) {
                         # a FAIL line that does not say why sends the user to the raw jsonl
