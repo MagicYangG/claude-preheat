@@ -40,7 +40,19 @@ if ($already) {
 $stubDir = Join-Path ([System.IO.Path]::GetTempPath()) 'clr-e2e-stub'
 New-Item -ItemType Directory -Path $stubDir -Force | Out-Null
 $stub = Join-Path $stubDir 'claude'
-"#!/bin/bash`necho '{`"type`":`"result`",`"total_cost_usd`":0.0001}'`n" | Set-Content -Path $stub -NoNewline
+# the stub answers like claude only when called the way preheat.ps1 calls it
+# (-p ... --output-format json): a fire whose argv drifted must FAIL here, not
+# pass on a stub that says yes to anything
+$stubBody = @(
+    '#!/bin/bash',
+    'args=" $* "',
+    'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format json "; do',
+    '  case "$args" in *"$f"*) ;; *) echo "stub claude: missing$f in argv: $*" >&2; exit 2 ;; esac',
+    'done',
+    'echo ''{"type":"result","total_cost_usd":0.0001}''',
+    ''
+) -join "`n"
+[System.IO.File]::WriteAllText($stub, $stubBody, (New-Object System.Text.UTF8Encoding($false)))
 & chmod +x $stub
 $env:PATH = "$stubDir" + ':' + $env:PATH
 

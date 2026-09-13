@@ -21,6 +21,9 @@ traffic it causes is:
   `firepit/`, an empty scratch directory inside the repo, so the ping
   never sees your code — subject to whatever proxy/network config your
   `claude` CLI already uses (see `schedule.json`'s `proxy` field),
+- the follow-up ping a scheduled preheat books for itself when it landed in
+  a window that was already running (same command, at most one per window;
+  `"chase": false` in `schedule.json` turns it off),
 - your browser loading `localhost:7878` for the panel.
 
 Optional BurntToast notifications are local toasts on your own machine,

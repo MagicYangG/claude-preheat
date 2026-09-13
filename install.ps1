@@ -171,7 +171,17 @@ if ($OnMac) {
         & chmod +x $shim
         Write-Host "[ok] shim $shim"
     }
-    if (($env:PATH -split ':') -notcontains $binDir) {
+    # the same dir can sit on PATH as ~/.local/bin, as $HOME/.local/bin (the
+    # shell already expanded it) or with a trailing slash - normalize before
+    # deciding to nag
+    $onPath = $false
+    foreach ($p in @($env:PATH -split ':')) {
+        $q = [string]$p
+        if ($q -eq '~') { $q = $HOME } elseif ($q.StartsWith('~/', [System.StringComparison]::Ordinal)) { $q = $HOME + $q.Substring(1) }
+        if ($q.Length -gt 1) { $q = $q.TrimEnd('/') }
+        if ($q -ceq $binDir.TrimEnd('/')) { $onPath = $true; break }
+    }
+    if (-not $onPath) {
         Write-Warning "$binDir is not on PATH - add to ~/.zshrc:  export PATH=`"`$HOME/.local/bin:`$PATH`""
     }
 }

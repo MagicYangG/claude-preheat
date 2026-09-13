@@ -46,7 +46,7 @@ Each preheat becomes a per-user LaunchAgent:
 ```
 
 - `preheat apply` rewrites the weekly agents; `preheat off` removes every agent and plist — `ls ~/Library/LaunchAgents | grep claude-preheat` should then come back empty.
-- One-shot preheats (`preheat at`, `preheat +2h`, `preheat reset`) register a one-time agent; spent ones are swept on the next `apply` or fire (never the one currently firing).
+- One-shot preheats (`preheat at`, `preheat +2h`, `preheat reset`) register a one-time agent; spent ones are swept on the next `apply` or fire (never the one currently firing). A scheduled fire that lands in a running window books one follow-up one-time agent for that window's expiry (`Once-<date>-<time>`, label `chase` in the journal), swept the same way.
 - The fire itself is the same tiny headless `claude` prompt as on Windows; results land in `preheat-log.jsonl` in the repo directory (`launchd-err.log` next to it captures anything launchd sees on stderr).
 
 ## Known gap: sleep

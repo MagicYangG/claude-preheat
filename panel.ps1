@@ -40,7 +40,9 @@ $Root         = $PSScriptRoot
 $WebDir       = Join-Path $Root 'web'
 $IndexPath    = Join-Path $WebDir 'index.html'
 $PreheatScript = Join-Path $Root 'preheat.ps1'
-$PanelLog     = Join-Path $Root 'panel-log.txt'
+# PREHEAT_PANEL_LOG: the self-test points this at its temp dir, so a test run
+# never appends to the real panel log inside the repo
+$PanelLog     = if ($env:PREHEAT_PANEL_LOG) { $env:PREHEAT_PANEL_LOG } else { Join-Path $Root 'panel-log.txt' }
 $ConfigPath   = Join-Path $Root 'schedule.json'
 
 # OS adapter: job listing (Task Scheduler / launchd), host-shell resolution
@@ -409,9 +411,12 @@ function Handle-PreheatApply($context) {
     try { if (Test-Path $ConfigPath) { $existing = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json } } catch { }
     $proxy = ''
     if ($existing -and $existing.PSObject.Properties['proxy']) { $proxy = $existing.proxy }
+    # the chase (follow-up preheat) opt-out lives in the same file: keep it
+    $chase = $null
+    if ($existing -and $existing.PSObject.Properties['chase']) { $chase = $existing.chase }
     # always write the canonical hint: preserving the old value once kept a
     # stale command name alive in personal configs long after a rename
-    $readme = 'days: Mon..Sun | reset = HH:mm target reset time (previous 5h window expiry); fire time auto = reset - 5h | edit then run: preheat apply'
+    $readme = 'days: Mon..Sun | reset = HH:mm target reset time (previous 5h window expiry); fire time auto = reset - 5h | edit then run: preheat apply | chase: false = no follow-up ping when a scheduled preheat lands in a running window'
 
     $rulesOut = @()
     foreach ($r in @($data.rules)) {
@@ -425,6 +430,7 @@ function Handle-PreheatApply($context) {
         $rulesOut += [ordered]@{ days = $days; reset = [string]$r.reset }
     }
     $newConfig = [ordered]@{ _readme = $readme; proxy = $proxy; rules = $rulesOut }
+    if ($null -ne $chase) { $newConfig.chase = [bool]$chase }
 
     try {
         $null = Backup-File $ConfigPath

@@ -66,7 +66,10 @@ function Read-State {
 function Write-State($obj) { $obj | ConvertTo-Json -Depth 5 | Set-Content -Path $StatePath -Encoding UTF8 }
 
 function Write-Log($obj) {
-    $obj.ts = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+    # InvariantCulture: the chase gate parses this stamp back (ConvertTo-LocalTime).
+    # A Buddhist/Hijri calendar or a non-':' time separator would round-trip to
+    # nothing and the gate would fail open.
+    $obj.ts = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture)
     # rotation + append under one named mutex: overlapping fires (or a fire and
     # the panel) could otherwise read 1000 lines, then each write their own
     # truncated copy, losing the other's entries. Logging stays lossy telemetry
@@ -104,15 +107,30 @@ function Get-FireEvents([string]$path, [int]$max = 60) {
     if ($path -and (Test-Path $path)) {
         $lines = @()
         try { $lines = @(Get-Content $path -Tail 400 -Encoding UTF8) } catch { $lines = @() }
+        $pendingChase = $null
         for ($i = $lines.Count - 1; ($i -ge 0) -and ($out.Count -lt $max); $i--) {
             $e = $null
             try { $e = $lines[$i] | ConvertFrom-Json } catch { continue }
-            if ((-not $e) -or ($e.ev -ne 'fire')) { continue }
+            if ((-not $e) -or ($e.ev -ne 'fire')) {
+                # a chase booking is written right after the fire that booked it
+                # (so it is the NEWER line): remember it for that fire's record
+                if ($e -and ($e.ev -eq 'schedule-once') -and $e.PSObject.Properties['label'] -and ([string]$e.label -like 'chase*')) {
+                    $pendingChase = @{ ts = (ConvertTo-LocalTime $e.ts); at = (ConvertTo-LocalTime $e.fireAt) }
+                }
+                continue
+            }
             # pwsh 7 turns an ISO string into a DateTime on parse and [string] would
             # then hand back the desktop culture's format - keep the journal's own text
             $ts = [string]$e.ts
             if ($lines[$i] -match '"ts"\s*:\s*"([^"]+)"') { $ts = $Matches[1] }
-            $rec = [ordered]@{ ts = $ts; ok = [bool]$e.ok; anchored = $null; kind = $null; attempts = $null; last_local_activity = $null; err = $null }
+            $rec = [ordered]@{ ts = $ts; ok = [bool]$e.ok; anchored = $null; kind = $null; attempts = $null; last_local_activity = $null; err = $null; chase_at = $null }
+            if ($pendingChase) {
+                $fts = ConvertTo-LocalTime $e.ts
+                if ($fts -and $pendingChase.ts -and $pendingChase.at -and ($pendingChase.ts -ge $fts) -and (($pendingChase.ts - $fts).TotalMinutes -le 5)) {
+                    $rec.chase_at = $pendingChase.at.ToString('yyyy-MM-dd HH:mm')
+                }
+                $pendingChase = $null
+            }
             if ($e.PSObject.Properties['anchored'] -and ($null -ne $e.anchored)) { $rec.anchored = [bool]$e.anchored }
             if ($e.PSObject.Properties['kind'] -and $e.kind) { $rec.kind = [string]$e.kind }
             if ($e.PSObject.Properties['attempts'] -and ($null -ne $e.attempts)) { $rec.attempts = [int]$e.attempts }
@@ -324,6 +342,177 @@ function Get-LastLocalActivity {
     } catch { return $null }
 }
 
+function Get-KnownWindowEnd([string]$path = $null) {
+    # the exact end of the 5h window the statusline tap last saw. Transcript
+    # activity only says WHEN the account was busy; state-ratelimits.json
+    # (written on every statusline render) says when that window expires.
+    # $null when the tap is not installed or the file is unreadable.
+    try {
+        if (-not $path) { $path = Join-Path $Root 'state-ratelimits.json' }
+        if (-not (Test-Path $path)) { return $null }
+        $o = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $r = $o.rate_limits.five_hour.resets_at
+        if (-not $r) { return $null }
+        return [DateTimeOffset]::FromUnixTimeSeconds([long]$r).LocalDateTime
+    } catch { return $null }
+}
+
+function Test-FreshAnchor([datetime]$FireStart, $LastAct, $KnownEnd, $LastPreheatAnchor = $null) {
+    # did this ping open a NEW window? No when a preheat ping of our own opened
+    # one inside the last 5h: the ping runs in firepit/ and leaves no transcript,
+    # so only the journal knows - and a chase-opened window is exactly where the
+    # next weekly fire lands. Otherwise yes when nothing local ran in the 5h
+    # before it, or when the tap saw the running window END before the fire and
+    # nobody used the account after that end (a later turn would have opened a
+    # window whose end we do not know). Blind to phone/web use, like every
+    # local observation. UTC arithmetic: a local-time gap that straddles a DST
+    # switch is off by an hour.
+    if ($LastPreheatAnchor -and (($FireStart.ToUniversalTime() - $LastPreheatAnchor.ToUniversalTime()).TotalHours -lt $WindowHours)) { return $false }
+    if (-not $LastAct) { return $true }
+    if (($FireStart.ToUniversalTime() - $LastAct.ToUniversalTime()).TotalHours -ge $WindowHours) { return $true }
+    if ($KnownEnd -and ($KnownEnd -le $FireStart) -and ($LastAct -le $KnownEnd)) { return $true }
+    $false
+}
+
+function ConvertTo-LocalTime($v) {
+    # journal timestamps: a string on 5.1, already a DateTime on pwsh 7
+    if ($null -eq $v) { return $null }
+    if ($v -is [datetime]) { return $v }
+    if ($v -is [datetimeoffset]) { return $v.LocalDateTime }
+    try { return ([datetimeoffset]::Parse([string]$v, [System.Globalization.CultureInfo]::InvariantCulture)).LocalDateTime } catch { return $null }
+}
+
+function Get-JournalEvents([string]$path, [int]$max = 200) {
+    # every journal record, newest first; bad lines skipped; ts as local
+    # DateTime (or $null). Never throws.
+    $out = New-Object System.Collections.Generic.List[object]
+    if ($path -and (Test-Path $path)) {
+        $lines = @()
+        try { $lines = @(Get-Content $path -Tail 400 -Encoding UTF8) } catch { $lines = @() }
+        for ($i = $lines.Count - 1; ($i -ge 0) -and ($out.Count -lt $max); $i--) {
+            $e = $null
+            try { $e = $lines[$i] | ConvertFrom-Json } catch { continue }
+            if (-not $e) { continue }
+            $t = $null
+            if ($e.PSObject.Properties['ts']) { $t = ConvertTo-LocalTime $e.ts }
+            [void]$out.Add(@{ ev = [string]$e.ev; ts = $t; rec = $e })
+        }
+    }
+    $out.ToArray()
+}
+
+function Get-LastPreheatAnchor([string]$path = $null) {
+    # when did a preheat ping of our own last open a window? (newest journal
+    # fire with ok + anchored). $null when none in the journal tail.
+    if (-not $path) { $path = $LogPath }
+    foreach ($j in @(Get-JournalEvents $path 200)) {
+        $e = $j.rec
+        if (($j.ev -eq 'fire') -and $j.ts -and $e.ok -and $e.PSObject.Properties['anchored'] -and ($e.anchored -eq $true)) { return $j.ts }
+    }
+    $null
+}
+
+function Test-RecentPreheatAnchor([datetime]$Before, [string]$path = $null) {
+    # true when a preheat ping opened the window that is running now (an
+    # anchored fire inside the last 5h), or a chase for this very gap is
+    # already on the books. This is what stops chase chains: a chase anchors
+    # a window, the next weekly fire lands inside it, and that fire must NOT
+    # chase again - or the tool would re-anchor every 5h forever.
+    if (-not $path) { $path = $LogPath }
+    $from = $Before.AddHours(-$WindowHours)
+    foreach ($j in @(Get-JournalEvents $path 200)) {
+        $e = $j.rec
+        if ($j.ev -eq 'fire') {
+            if ($j.ts -and ($j.ts -gt $from) -and ($j.ts -le $Before) -and $e.ok -and
+                $e.PSObject.Properties['anchored'] -and ($e.anchored -eq $true)) { return $true }
+        } elseif ($j.ev -eq 'schedule-once') {
+            $lbl = ''
+            if ($e.PSObject.Properties['label']) { $lbl = [string]$e.label }
+            if ($lbl -like 'chase*') {
+                $at = $null
+                if ($e.PSObject.Properties['fireAt']) { $at = ConvertTo-LocalTime $e.fireAt }
+                # only a chase still PENDING counts; one that came due is judged by
+                # the fire record it produced (a missed one-shot is never replayed,
+                # so it must not block the next fire's chase for 5h)
+                if ($at -and ($at -gt $Before) -and ($at -le $Before.AddHours($WindowHours).AddMinutes(5))) { return $true }
+            }
+        }
+    }
+    $false
+}
+
+function Get-NextWeeklyFire([datetime]$After) {
+    # the next weekly fire time after $After, from schedule.json (not from the
+    # scheduler: the answer must not depend on which backend is registered).
+    # $null when there is no usable schedule.
+    $best = $null
+    try {
+        foreach ($s in @(Get-FireSpecs (Read-Config))) {
+            foreach ($d in $s.Days) {
+                $cand = $After.Date + $s.FireTime
+                $guard = 0
+                while ((($cand.DayOfWeek.ToString() -ne $d) -or ($cand -le $After)) -and ($guard -lt 9)) { $cand = $cand.AddDays(1); $guard++ }
+                if ((-not $best) -or ($cand -lt $best)) { $best = $cand }
+            }
+        }
+    } catch { return $null }
+    $best
+}
+
+function Get-ChasePlan {
+    # A scheduled ping that lands in a running window did not do its job: the
+    # schedule wanted a fresh window anchored at fire time, so that the reset
+    # lands 5h later - inside the user's session. Chase = ping again one
+    # minute after the running window expires, the earliest moment the
+    # intended anchor can still happen. Pure: every input is a parameter so
+    # the self-test can walk the edges without a clock or a scheduler.
+    # -> @{ at; source; end }  or  @{ skip = reason }
+    param([datetime]$FireStart, $LastAct, $KnownEnd, $NextWeekly, [bool]$RecentAnchor, [datetime]$Now)
+    if ($RecentAnchor) { return @{ skip = 'a preheat anchored the running window (no chase chains)' } }
+    if (-not $LastAct) { return @{ skip = 'no local activity to chase' } }
+    # upper bound: the running window opened no later than the last local
+    # turn, so it ends no later than 5h after it
+    $end = $LastAct.ToUniversalTime().AddHours($WindowHours).ToLocalTime(); $src = 'estimate'
+    # exact when the tap saw the running window (its end still ahead of the fire)
+    if ($KnownEnd -and ($KnownEnd -gt $FireStart)) { $end = $KnownEnd; $src = 'ratelimits' }
+    # two whole minutes, not 60s: resets_at is truncated to the minute, so a
+    # +60s chase could still land a second inside the old window
+    $at = $end.AddMinutes(2)
+    if ($at -lt $Now.AddMinutes(2)) { $at = $Now.AddMinutes(2) }
+    if ($NextWeekly -and ($at -ge $NextWeekly.AddMinutes(-5))) {
+        return @{ skip = ('next scheduled preheat ' + $NextWeekly.ToString('MM-dd HH:mm') + ' comes first') }
+    }
+    @{ at = $at; source = $src; end = $end }
+}
+
+function Invoke-Chase([datetime]$FireStart, $LastAct, $KnownEnd) {
+    # "chase": false in schedule.json turns follow-ups off (default on)
+    $cfg = $null
+    try { $cfg = Read-Config } catch { }
+    if ($cfg -and $cfg.PSObject.Properties['chase'] -and ($cfg.chase -eq $false)) {
+        Write-Log @{ ev = 'chase-skip'; reason = 'chase disabled in schedule.json' }
+        return @{ skip = 'disabled' }
+    }
+    $now  = Get-Date
+    $plan = Get-ChasePlan -FireStart $FireStart -LastAct $LastAct -KnownEnd $KnownEnd `
+        -NextWeekly (Get-NextWeeklyFire $now) -RecentAnchor (Test-RecentPreheatAnchor $FireStart) -Now $now
+    if ($plan.skip) { Write-Log @{ ev = 'chase-skip'; reason = $plan.skip }; return $plan }
+    # -NoWake: a follow-up is best effort - it must never wake a sleeping PC at
+    # a minute the user did not choose (the weekly fires keep their wake timers)
+    Invoke-Once $plan.at ('chase ' + $plan.source) -NoWake
+    $plan
+}
+
+function Test-SpentOnce($job, [datetime]$Now) {
+    # a one-shot whose time has passed: on Windows its trigger is spent, on
+    # macOS the name still decodes to that past time until the next fire or
+    # apply sweeps it (Remove-StaleOnceJobs) - say so instead of listing a
+    # "next" run that is behind us
+    # Windows reports NO next run for a spent one-time trigger; macOS decodes
+    # the past time from the name - both mean spent
+    ($job.name -like ($TaskOncePrefix + '-*')) -and ((-not $job.next) -or ($job.next -lt $Now.AddMinutes(-3)))
+}
+
 function Test-PingOutput([int]$ExitCode, [string]$StdOut, [string]$StdErr) {
     # PURE, so one ping's verdict is testable without spending a token.
     # `claude -p --output-format json` can exit 0 and still report the failure
@@ -410,6 +599,8 @@ function Invoke-Fire {
         # window was active, so a successful ping anchored a fresh one
         $fireStart = Get-Date
         $lastAct   = Get-LastLocalActivity
+        $knownEnd  = Get-KnownWindowEnd
+        $ownAnchor = Get-LastPreheatAnchor
 
         $pingArgs = '-p "hi" --model haiku --no-session-persistence --strict-mcp-config --mcp-config "{0}" --output-format json' -f $EmptyMcp
         $ok = $false; $attempts = 0; $cost = $null; $ms = $null; $errText = $null; $kind = $null
@@ -466,13 +657,22 @@ function Invoke-Fire {
         $entry = @{ ev = 'fire'; ok = $ok; attempts = $attempts; ms = $ms; cost = $cost }
         if (-not $ok) { $entry.err = $errText; $entry.kind = $kind }
         if ($ok) {
-            $entry.anchored = (-not $lastAct) -or (($fireStart - $lastAct).TotalHours -ge $WindowHours)
+            $entry.anchored = Test-FreshAnchor $fireStart $lastAct $knownEnd $ownAnchor
             if ($lastAct) { $entry.last_local_activity = $lastAct.ToString('yyyy-MM-dd HH:mm') }
         }
         Write-Log $entry
         $anch = $null
         if ($entry.ContainsKey('anchored')) { $anch = $entry.anchored }
-        Send-Toast $ok $anch $kind
+        $chase = $null
+        if ($ok -and ($anch -eq $false)) {
+            # the schedule wanted an anchor now and the account was busy: try
+            # again the minute that window expires (Get-ChasePlan)
+            try { $chase = Invoke-Chase $fireStart $lastAct $knownEnd }
+            catch { Write-Log @{ ev = 'chase-skip'; reason = ('error: ' + $_.Exception.Message) } }
+        }
+        $extra = ''
+        if ($chase -and $chase.at) { $extra = ' - follow-up preheat at ' + $chase.at.ToString('HH:mm') }
+        Send-Toast $ok $anch $kind $extra
 
         if ($OnMac -and $env:CLAUDE_PREHEAT_SELF -and ($env:CLAUDE_PREHEAT_SELF -like ($TaskOncePrefix + '-*'))) {
             # a spent one-shot must not survive to fire again next year. Delete
@@ -489,10 +689,12 @@ function Invoke-Fire {
     }
 }
 
-function Invoke-Once($fireAt, $label) {
+function Invoke-Once($fireAt, $label, [switch]$NoWake) {
     if ($fireAt -le (Get-Date)) { throw "fire time $fireAt is in the past" }
-    $name = '{0}-{1}' -f $TaskOncePrefix, $fireAt.ToString('yyyyMMdd-HHmm')
-    Register-PreheatJob -Name $name -At $fireAt
+    # InvariantCulture: on macOS the name IS the schedule (Get-JobNextRun decodes
+    # it with the invariant calendar), so a Buddhist year here would decode wrong
+    $name = '{0}-{1}' -f $TaskOncePrefix, $fireAt.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)
+    Register-PreheatJob -Name $name -At $fireAt -NoWake:$NoWake
     Write-Log @{ ev = 'schedule-once'; fireAt = $fireAt.ToString('s'); label = $label }
     Write-Host ('one-shot registered: fire at {0}  ({1})' -f $fireAt.ToString('yyyy-MM-dd HH:mm'), $label)
 }
@@ -523,7 +725,9 @@ function Invoke-Status {
     $tasks = @(Get-PreheatJobs)
     if ($tasks.Count -gt 0) {
         foreach ($t in $tasks) {
-            Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $t.next)
+            $nextTxt = '{0}' -f $t.next
+            if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
+            Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
         }
         # a moved or renamed repo leaves the jobs registered and still showing a
         # next run, while every fire is a silent no-op - the one failure mode
@@ -570,6 +774,22 @@ function Invoke-Status {
                         $anch = '{0}: {1}' -f $k, ([string]$e.err).Substring(0, [Math]::Min(100, ([string]$e.err).Length))
                     }
                     Write-Host ('[{0}] fire {1} attempts={2} {3}ms  {4}' -f $e.ts, $flag, $e.attempts, $e.ms, $anch)
+                } elseif ($e.ev -eq 'schedule-once') {
+                    $lbl = ''
+                    if ($e.PSObject.Properties['label'] -and $e.label) {
+                        # journal vocabulary -> what the user sees
+                        $lbl = switch -Regex ([string]$e.label) {
+                            '^chase ratelimits' { ' (follow-up preheat, exact reset from statusline)'; break }
+                            '^chase estimate'   { ' (follow-up preheat, estimated reset)'; break }
+                            default             { ' (' + [string]$e.label + ')' }
+                        }
+                    }
+                    # format here: pwsh 7 hands fireAt back as a DateTime, 5.1 as the string
+                    $fa = ConvertTo-LocalTime $e.fireAt
+                    $faTxt = if ($fa) { $fa.ToString('MM-dd HH:mm') } else { [string]$e.fireAt }
+                    Write-Host ('[{0}] one-shot scheduled for {1}{2}' -f $e.ts, $faTxt, $lbl)
+                } elseif ($e.ev -eq 'chase-skip') {
+                    Write-Host ('[{0}] chase skipped: {1}' -f $e.ts, $e.reason)
                 } else {
                     Write-Host ('[{0}] {1}' -f $e.ts, $e.ev)
                 }
@@ -593,7 +813,7 @@ function Invoke-StatusJson {
     foreach ($t in @(Get-PreheatJobs)) {
         $next = $null
         if ($t.next) { $next = $t.next.ToString('yyyy-MM-ddTHH:mm:ss') }
-        $tasks += @{ name = $t.name; next = $next }
+        $tasks += @{ name = $t.name; next = $next; spent = [bool](Test-SpentOnce $t (Get-Date)) }
         if (($t.script -and (-not (Test-Path $t.script))) -or ($t.shell -and (-not (Test-Path $t.shell)))) { $broken += $t.name }
     }
     $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken) }

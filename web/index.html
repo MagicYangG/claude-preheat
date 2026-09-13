@@ -283,7 +283,7 @@ var I18N = {
     hours:'小时', schedule_btn:'排定',
     ago_now:'刚刚', ago_min:'{n} 分钟前', ago_hr:'{n} 小时前', ago_day:'{n} 天前',
     toast_done:'已完成', toast_err:'出错了',
-    reset_word:'重置', once_task:'一次性预热', no_tasks:'还没排定预热。',
+    reset_word:'重置', once_task:'一次性预热', spent_task:'已触发', no_tasks:'还没排定预热。',
     th_scheduled:'排定', th_next:'下次预热',
     rl_5h:'5 小时窗口', rl_wk:'周额度', rl_reset:'重置 ', rl_src:'来自 statusline 缓存 · ',
     rl_hint:'额度条未启用 —— 在终端运行一次 preheat statusline on，5 小时 / 周额度就会显示在这里。',
@@ -299,7 +299,7 @@ var I18N = {
     ev_h:'点火历史', ev_last:'上次 ', ev_kind_all:'全部', ev_days_pre:'近', ev_days_post:'天', ev_max_pre:'最多', ev_max_post:'条',
     ev_ok:'窗口预热成功', ev_noeff:'窗口预热无效', ev_fail:'窗口预热失败',
     ev_ok_line:'于 {a} 预热成功，将于 {b} 重置', ev_ok_line_na:'于 {a} 预热成功（当时未记录窗口状态）',
-    ev_noeff_line:'探查到 {a} 有使用，预热窗口时，原 5 小时额度未结束', ev_noeff_line_na:'预热窗口时，原 5 小时额度未结束',
+    ev_noeff_line:'探查到 {a} 有使用，预热窗口时，原 5 小时额度未结束', ev_noeff_line_na:'预热窗口时，原 5 小时额度未结束', ev_noeff_chase:'，已补排 {b} 的跟进预热',
     ev_fail_limit:'用量已达限额', ev_fail_auth:'登录已过期', ev_fail_other:'其他错误：{e}', ev_fail_unknown:'原因未记录',
     ev_retry:'重试 {n} 次', ev_none:'近 {d} 天没有点火记录', ev_none_kind:'近 {d} 天没有「{k}」的记录', ev_none_all:'还没有点火记录',
     bad_hours:'小时数填个 1 以上的整数', bad_time:'时刻格式要是 HH:mm', langBtn:'EN'
@@ -315,7 +315,7 @@ var I18N = {
     hours:'hours', schedule_btn:'Schedule',
     ago_now:'just now', ago_min:'{n} min ago', ago_hr:'{n} h ago', ago_day:'{n} d ago',
     toast_done:'Done', toast_err:'Something went wrong',
-    reset_word:'reset', once_task:'One-shot preheat', no_tasks:'No preheats scheduled yet.',
+    reset_word:'reset', once_task:'One-shot preheat', spent_task:'spent', no_tasks:'No preheats scheduled yet.',
     th_scheduled:'Scheduled', th_next:'Next fire',
     rl_5h:'5-hour window', rl_wk:'Weekly', rl_reset:'resets ', rl_src:'from statusline cache · ',
     rl_hint:'Quota strip is off - run preheat statusline on once in a terminal and the 5-hour / weekly usage will show here.',
@@ -331,7 +331,7 @@ var I18N = {
     ev_h:'Fire history', ev_last:'last ', ev_kind_all:'all', ev_days_pre:'last', ev_days_post:'days', ev_max_pre:'up to', ev_max_post:'entries',
     ev_ok:'Preheat succeeded', ev_noeff:'Preheat had no effect', ev_fail:'Preheat failed',
     ev_ok_line:'fired at {a}, resets at {b}', ev_ok_line_na:'fired at {a} (window state was not recorded back then)',
-    ev_noeff_line:'activity seen at {a}, the previous 5-hour window was still running', ev_noeff_line_na:'the previous 5-hour window was still running',
+    ev_noeff_line:'activity seen at {a}, the previous 5-hour window was still running', ev_noeff_line_na:'the previous 5-hour window was still running', ev_noeff_chase:' - follow-up preheat booked for {b}',
     ev_fail_limit:'usage limit reached', ev_fail_auth:'login expired', ev_fail_other:'other error: {e}', ev_fail_unknown:'no reason recorded',
     ev_retry:'retried {n}\u00d7', ev_none:'No fires in the last {d} days', ev_none_kind:'No \u201c{k}\u201d in the last {d} days', ev_none_all:'No fires yet',
     bad_hours:'Enter a whole number of hours ≥ 1', bad_time:'Time must be HH:mm', langBtn:'中文'
@@ -473,7 +473,7 @@ function renderTasks(){
     $('tasks').innerHTML = '<div class="empty">' + t('no_tasks') + '</div>';
   } else {
     var rows = tasks.map(function(tk){
-      return '<tr title="' + esc(tk.name) + '"><td class="tlabel">' + taskLabel(tk) + '</td><td class="tnext">' + esc(fmtDT(tk.next)) + '</td></tr>';
+      return '<tr title="' + esc(tk.name) + '"><td class="tlabel">' + taskLabel(tk) + '</td><td class="tnext">' + esc(fmtDT(tk.next)) + (tk.spent ? ' (' + t('spent_task') + ')' : '') + '</td></tr>';
     }).join('');
     $('tasks').innerHTML = '<table><thead><tr><th>' + t('th_scheduled') + '</th><th style="width:130px">' + t('th_next') + '</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
@@ -733,10 +733,13 @@ function evLine(e, v, d){
     return t('ev_ok_line').replace('{a}', hm(d)).replace('{b}', hm(r));
   }
   if (v === 'noeff') {
+    // a white fire that booked a follow-up says so - the toast did
+    var ca = e.chase_at ? parseDate(e.chase_at) : null;
+    var tail = ca ? t('ev_noeff_chase').replace('{b}', hm(ca)) : '';
     var la = e.last_local_activity ? parseDate(e.last_local_activity) : null;
-    if (!la) return t('ev_noeff_line_na');
+    if (!la) return t('ev_noeff_line_na') + tail;
     var sameDay = la.getFullYear() === d.getFullYear() && la.getMonth() === d.getMonth() && la.getDate() === d.getDate();
-    return t('ev_noeff_line').replace('{a}', sameDay ? hm(la) : fmtDT(la));
+    return t('ev_noeff_line').replace('{a}', sameDay ? hm(la) : fmtDT(la)) + tail;
   }
   if (e.kind === 'limit') return t('ev_fail_limit');
   if (e.kind === 'auth') return t('ev_fail_auth');

@@ -242,7 +242,7 @@ function New-PreheatAction {
             (Join-Path $PlatformRoot 'run-hidden.vbs'), (Resolve-HostShell), (Join-Path $PlatformRoot 'preheat.ps1'))
 }
 
-function New-PreheatSettings {
+function New-PreheatSettings([switch]$NoWake) {
     # -AllowStartIfOnBatteries / -DontStopIfGoingOnBatteries: the default is to
     # skip (or kill) the task on battery, and one haiku ping is not worth losing
     # the whole day's anchor over an unplugged laptop.
@@ -250,8 +250,11 @@ function New-PreheatSettings {
     # logon would anchor the 5h window at that moment, which is worse than
     # skipping it. The task runs as an Interactive logon type, so it only fires
     # while the user is logged in (a locked screen is fine).
-    New-ScheduledTaskSettingsSet -WakeToRun -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -MultipleInstances IgnoreNew
+    $p = @{ AllowStartIfOnBatteries = $true; DontStopIfGoingOnBatteries = $true
+            ExecutionTimeLimit = (New-TimeSpan -Minutes 30); MultipleInstances = 'IgnoreNew' }
+    # a chase (follow-up preheat) is best effort: it never wakes a sleeping PC
+    if (-not $NoWake) { $p.WakeToRun = $true }
+    New-ScheduledTaskSettingsSet @p
 }
 
 # ---------- the scheduling contract ----------
@@ -259,7 +262,7 @@ function New-PreheatSettings {
 function Register-PreheatJob {
     # $Days present -> weekly at $At's time-of-day on those days
     # $Days absent  -> one-shot at $At
-    param([string]$Name, [string[]]$Days, [datetime]$At)
+    param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake)
     if ($OnMac) {
         if (-not (Test-Path $LaunchAgentDir)) { New-Item -ItemType Directory -Path $LaunchAgentDir -Force | Out-Null }
         $label = ConvertTo-LaunchdLabel $Name
@@ -287,7 +290,7 @@ function Register-PreheatJob {
     } else {
         $trigger = if ($Days -and $Days.Count -gt 0) { New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Days -At $At }
                    else { New-ScheduledTaskTrigger -Once -At $At }
-        Register-ScheduledTask -TaskName $Name -Action (New-PreheatAction) -Trigger $trigger -Settings (New-PreheatSettings) -Force | Out-Null
+        Register-ScheduledTask -TaskName $Name -Action (New-PreheatAction) -Trigger $trigger -Settings (New-PreheatSettings -NoWake:$NoWake) -Force | Out-Null
     }
 }
 
@@ -437,7 +440,7 @@ function Test-WakeTimers {
     } catch { }
 }
 
-function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '') {
+function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '', [string]$Extra = '') {
     # $Anchored: $true = this ping opened a fresh window, $false = it landed in
     # a window that was already running (harmless, but the toast should not
     # claim credit), $null = unknown. $Kind names the failure so an expired
@@ -447,6 +450,9 @@ function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '') {
         if ($null -eq $Anchored)   { $msg = 'window preheated' }
         elseif ($Anchored -eq $true) { $msg = 'window preheated - new 5h window anchored' }
         else                       { $msg = 'ping landed in a running window - anchor unchanged' }
+        # e.g. " - chase at 16:38": the fire already booked the retry
+        # the new part first, and short: a truncated banner drops the tail
+        if ($Extra) { $msg = 'window busy' + $Extra }
     } elseif ($Kind -eq 'auth') {
         $msg = 'preheat FAILED - Claude login expired? run: claude'
     } elseif ($Kind -eq 'limit') {

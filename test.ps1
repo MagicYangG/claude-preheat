@@ -211,6 +211,110 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
     Test-Case 'Get-FireEvents on a missing journal is an empty list, not an error' {
         @(Get-FireEvents (Join-Path $Tmp 'no-such-journal.jsonl') 60).Count -eq 0
     }
+    Write-Host '-- preheat: anchor inference + chase --'
+    $D = { param($s) [datetime]::ParseExact($s, 'yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
+    Test-Case 'fresh anchor: quiet 5h+, or the tap saw the window end before the fire with no turn after it; never inside a window our own ping opened' {
+        $fire = & $D '2026-09-13 15:00'
+        (Test-FreshAnchor $fire $null $null) -and
+        (Test-FreshAnchor $fire (& $D '2026-09-13 09:59') $null) -and
+        (-not (Test-FreshAnchor $fire (& $D '2026-09-13 13:49') $null)) -and
+        (Test-FreshAnchor $fire (& $D '2026-09-13 13:49') (& $D '2026-09-13 14:00')) -and
+        (-not (Test-FreshAnchor $fire (& $D '2026-09-13 14:30') (& $D '2026-09-13 14:00'))) -and
+        (-not (Test-FreshAnchor $fire (& $D '2026-09-13 13:49') (& $D '2026-09-13 17:00'))) -and
+        (-not (Test-FreshAnchor $fire (& $D '2026-09-13 09:00') $null (& $D '2026-09-13 12:00'))) -and
+        (Test-FreshAnchor $fire (& $D '2026-09-13 09:00') $null (& $D '2026-09-13 09:30'))
+    }
+    Test-Case 'chase plan: exact end from the tap wins, else last turn + 5h; always 2 minutes after the end' {
+        $fire = & $D '2026-09-13 15:00'; $last = & $D '2026-09-13 13:49'; $wk = & $D '2026-09-13 20:30'
+        $exact = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd (& $D '2026-09-13 16:37') -NextWeekly $wk -RecentAnchor $false -Now $fire
+        $est   = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly $wk -RecentAnchor $false -Now $fire
+        ($exact.source -eq 'ratelimits') -and ($exact.at -eq (& $D '2026-09-13 16:39')) -and
+        ($est.source -eq 'estimate') -and ($est.at -eq (& $D '2026-09-13 18:51'))
+    }
+    Test-Case 'chase plan: a stale tap reading (that window already over) falls back to the estimate' {
+        $fire = & $D '2026-09-13 15:00'
+        $p = Get-ChasePlan -FireStart $fire -LastAct (& $D '2026-09-13 14:30') -KnownEnd (& $D '2026-09-13 14:00') -NextWeekly $null -RecentAnchor $false -Now $fire
+        ($p.source -eq 'estimate') -and ($p.at -eq (& $D '2026-09-13 19:32'))
+    }
+    Test-Case 'chase plan: skipped when a preheat anchored the running window (no chains), when nothing local ran, or when the next weekly fire comes first' {
+        $fire = & $D '2026-09-13 15:00'; $last = & $D '2026-09-13 13:49'
+        $a = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly $null -RecentAnchor $true -Now $fire
+        $b = Get-ChasePlan -FireStart $fire -LastAct $null -KnownEnd $null -NextWeekly $null -RecentAnchor $false -Now $fire
+        $c = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 18:00') -RecentAnchor $false -Now $fire
+        # boundary of the 5-minute lead: estimate chase = 18:51; a weekly fire at 18:55 wins, one at 18:57 does not
+        $d1 = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 18:55') -RecentAnchor $false -Now $fire
+        $d2 = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 18:57') -RecentAnchor $false -Now $fire
+        ($a.skip -like '*chain*') -and ($b.skip -like '*no local*') -and ($c.skip -like '*comes first*') -and
+        ($d1.skip -like '*comes first*') -and ($d2.at -eq (& $D '2026-09-13 18:51'))
+    }
+    Test-Case 'chase plan: an end already behind us (a slow ping) still lands 2 minutes ahead, never in the past' {
+        $fire = & $D '2026-09-13 15:00'
+        $p = Get-ChasePlan -FireStart $fire -LastAct (& $D '2026-09-13 10:30') -KnownEnd (& $D '2026-09-13 15:02') -NextWeekly $null -RecentAnchor $false -Now (& $D '2026-09-13 15:04')
+        $p.at -eq (& $D '2026-09-13 15:06')
+    }
+    Test-Case 'recent anchor: an anchored fire inside 5h or a PENDING chase blocks a new chase; an older one, a white fire or a chase that already came due does not' {
+        $j = Join-Path $Tmp 'chase-journal.jsonl'
+        $before = & $D '2026-09-13 15:00'
+        $stamp = { param($s) (& $D $s).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) }
+        ('{"ev":"fire","ok":true,"anchored":true,"ts":"' + (& $stamp '2026-09-13 12:30') + '"}') | Set-Content -Path $j -Encoding UTF8
+        $r1 = Test-RecentPreheatAnchor $before $j
+        ('{"ev":"fire","ok":true,"anchored":true,"ts":"' + (& $stamp '2026-09-13 09:30') + '"}') | Set-Content -Path $j -Encoding UTF8
+        $r2 = Test-RecentPreheatAnchor $before $j
+        ('{"ev":"fire","ok":true,"anchored":false,"ts":"' + (& $stamp '2026-09-13 12:30') + '"}') | Set-Content -Path $j -Encoding UTF8
+        $r3 = Test-RecentPreheatAnchor $before $j
+        ('{"ev":"schedule-once","fireAt":"2026-09-13T16:38:00","label":"chase ratelimits","ts":"' + (& $stamp '2026-09-13 14:00') + '"}') | Set-Content -Path $j -Encoding UTF8
+        $r4 = Test-RecentPreheatAnchor $before $j
+        # a chase that came due at 12:00 with no fire record behind it (asleep, signed out) must not block
+        ('{"ev":"schedule-once","fireAt":"2026-09-13T12:00:00","label":"chase estimate","ts":"' + (& $stamp '2026-09-13 10:00') + '"}') | Set-Content -Path $j -Encoding UTF8
+        $r5 = Test-RecentPreheatAnchor $before $j
+        $r1 -and (-not $r2) -and (-not $r3) -and $r4 -and (-not $r5)
+    }
+    Test-Case 'the chase gate reads what Write-Log actually writes (the stamp round-trips under the current culture)' {
+        $LogPath = Join-Path $Tmp 'writer-journal.jsonl'   # shadows the real journal in this scope
+        Write-Log @{ ev = 'fire'; ok = $true; anchored = $true; attempts = 1 }
+        $seen = Test-RecentPreheatAnchor (Get-Date).AddMinutes(1) $LogPath
+        $own  = Get-LastPreheatAnchor $LogPath
+        $seen -and $own -and (((Get-Date) - $own).TotalMinutes -lt 2)
+    }
+    Test-Case 'Get-FireEvents pairs a white fire with the follow-up it booked' {
+        $j = Join-Path $Tmp 'events-chase.jsonl'
+        $stamp = { param($s) (& $D $s).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) }
+        @(
+            ('{"ev":"fire","ok":true,"anchored":false,"attempts":1,"last_local_activity":"2026-09-12 13:49","ts":"' + (& $stamp '2026-09-12 15:00') + '"}'),
+            ('{"ev":"schedule-once","fireAt":"2026-09-12T16:39:00","label":"chase ratelimits","ts":"' + (& $stamp '2026-09-12 15:00') + '"}'),
+            ('{"ev":"fire","ok":true,"anchored":true,"attempts":1,"ts":"' + (& $stamp '2026-09-12 16:39') + '"}')
+        ) | Set-Content -Path $j -Encoding UTF8
+        $ev = @(Get-FireEvents $j 60)
+        ($ev.Count -eq 2) -and ($null -eq $ev[0].chase_at) -and ($ev[1].chase_at -eq '2026-09-12 16:39')
+    }
+    Test-Case 'known window end: read from the tap file as local time; junk or missing file -> null' {
+        $f = Join-Path $Tmp 'rl.json'
+        $epoch = (New-Object DateTimeOffset (& $D '2026-09-13 16:37')).ToUnixTimeSeconds()
+        ('{"capturedAt":"x","rate_limits":{"five_hour":{"used_percentage":18,"resets_at":' + $epoch + '}}}') | Set-Content -Path $f -Encoding UTF8
+        $ok = ((Get-KnownWindowEnd $f) -eq (& $D '2026-09-13 16:37')) -and ((Get-KnownWindowEnd $f).Kind -eq 'Local')
+        Set-Content -Path $f -Value 'not json' -Encoding UTF8
+        $ok -and ($null -eq (Get-KnownWindowEnd $f)) -and ($null -eq (Get-KnownWindowEnd (Join-Path $Tmp 'nope.json')))
+    }
+    Test-Case 'next weekly fire: from schedule.json, always ahead of the given moment, at reset - 5h' {
+        # 11:07 -> fire 06:07: a time no real schedule.json is likely to share, so a fixture path bug shows
+        $ConfigPath = New-Fixture 'sched.json' @('{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"11:07"}]}')
+        (Get-NextWeeklyFire (& $D '2026-09-13 15:00')) -eq (& $D '2026-09-14 06:07')
+    }
+    Test-Case 'a spent one-shot is flagged (past next on macOS, NO next on Windows); a pending one, one inside the 3-minute grace, and weekly jobs are not' {
+        $now = & $D '2026-09-13 15:00'
+        (Test-SpentOnce @{ name = 'ClaudePreheat-Once-20260913-1400'; next = (& $D '2026-09-13 14:00') } $now) -and
+        (Test-SpentOnce @{ name = 'ClaudePreheat-Once-20260913-1400'; next = $null } $now) -and
+        (Test-SpentOnce @{ name = 'ClaudePreheat-Once-20260913-1456'; next = (& $D '2026-09-13 14:56') } $now) -and
+        (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Once-20260913-1459'; next = (& $D '2026-09-13 14:59') } $now)) -and
+        (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Once-20260913-1638'; next = (& $D '2026-09-13 16:38') } $now)) -and
+        (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Wk-0330-MonTue'; next = (& $D '2026-09-13 14:00') } $now)) -and
+        (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Wk-0330-MonTue'; next = $null } $now))
+    }
+    Test-Case 'a white ping wires the chase, and a chase failure can never cost the toast' {
+        $src = Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8
+        ($src -match 'Invoke-Chase \$fireStart \$lastAct \$knownEnd') -and ($src -match "catch \{ Write-Log @\{ ev = 'chase-skip'")
+    }
+
     Test-Case 'status names the time of the local activity that kept the window open' {
         # "landed in existing window" without a time sent the user to the raw jsonl
         (Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8) -match 'window was still open'
@@ -456,7 +560,15 @@ try {
     $onWin = $true
     try { if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) { $onWin = $false } } catch { }
     if ($onWin) { $spArgs.WindowStyle = 'Hidden' }
+    # the child inherits this: its request log lands in the temp dir, not in the repo
+    # (a LIVE panel on 7878 may keep appending to the repo log meanwhile, so the
+    # check below looks only at lines added during this run, for the test port)
+    $repoPanelLog = Join-Path $Repo 'panel-log.txt'
+    $repoPanelLogLines = 0
+    if (Test-Path $repoPanelLog) { $repoPanelLogLines = @(Get-Content $repoPanelLog -Encoding UTF8).Count }
+    $env:PREHEAT_PANEL_LOG = Join-Path $Tmp 'panel-log.txt'
     $panelProc = Start-Process @spArgs
+    Remove-Item Env:PREHEAT_PANEL_LOG -ErrorAction SilentlyContinue
     $base = "http://localhost:$panelPort"
     $up = $false
     for ($i = 0; $i -lt 25 -and -not $up; $i++) {
@@ -465,6 +577,14 @@ try {
     }
 
     Test-Case 'panel comes up and answers /api/status' { $up }
+    Test-Case 'the test panel logs into the temp dir, not into the repo' {
+        $leaked = @()
+        if (Test-Path $repoPanelLog) {
+            $leaked = @(Get-Content $repoPanelLog -Encoding UTF8 | Select-Object -Skip $repoPanelLogLines | Where-Object { $_ -like ('*' + $panelPort + '*') })
+        }
+        $tmpLog = Join-Path $Tmp 'panel-log.txt'
+        (Test-Path $tmpLog) -and ((Get-Content $tmpLog -Raw -Encoding UTF8) -like ('*' + $panelPort + '*')) -and ($leaked.Count -eq 0)
+    }
 
     Test-Case 'GET / serves the page and forbids caching' {
         # stale cached pages masqueraded as bugs twice, hence the header
@@ -645,8 +765,9 @@ Test-Case 'panel page ships the fire-history block and its strings in both langu
     }
     $ok
 }
-Test-Case 'the scheduled-task registrar keeps -WakeToRun (sleep must not eat a fire)' {
-    (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8) -match '-WakeToRun'
+Test-Case 'the scheduled-task registrar keeps WakeToRun for weekly fires (sleep must not eat a fire); only a -NoWake one-shot drops it' {
+    $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+    $p.Contains('if (-not $NoWake) { $p.WakeToRun = $true }') -and $p.Contains('New-PreheatSettings -NoWake:$NoWake')
 }
 Test-Case 'the registrar also survives a laptop running on battery' {
     # the Task Scheduler default is "only on AC, stop when unplugged": every
