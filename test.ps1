@@ -310,6 +310,102 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Wk-0330-MonTue'; next = (& $D '2026-09-13 14:00') } $now)) -and
         (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Wk-0330-MonTue'; next = $null } $now))
     }
+    Write-Host '-- preheat: fire integration (stub claude; scheduler, toast and probes doubled) --'
+    # Invoke-Fire end to end with every side effect redirected: the journal,
+    # state, pit and lock into the temp dir; the scheduler, the toast and the
+    # activity/tap probes replaced by doubles defined in the CALLING scope
+    # (PowerShell scopes are dynamic, so the callees see them). Nothing here
+    # touches the real journal, the real state, a real task, or the account.
+    $intStub = Join-Path $Tmp 'fire-int-stub'
+    New-Item -ItemType Directory -Path $intStub -Force | Out-Null
+    $intOnWin = $true
+    try { if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) { $intOnWin = $false } } catch { }
+    # both stubs refuse an argv that drifted from what preheat.ps1 sends (same
+    # contract as the e2e-mac stub): a wrong ping shape must fail, not pass
+    if ($intOnWin) {
+        $intClaude = Join-Path $intStub 'claude.cmd'
+        Set-Content -Path $intClaude -Encoding ASCII -Value @(
+            '@echo %* | findstr /C:"--output-format json" >nul || exit /b 2',
+            '@echo %* | findstr /C:"--strict-mcp-config" >nul || exit /b 2',
+            '@echo %* | findstr /C:"-p " >nul || exit /b 2',
+            '@echo {"type":"result","total_cost_usd":0.0001}')
+    } else {
+        $intClaude = Join-Path $intStub 'claude'
+        [System.IO.File]::WriteAllText($intClaude, (@(
+            '#!/bin/bash',
+            'args=" $* "',
+            'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format json "; do',
+            '  case "$args" in *"$f"*) ;; *) echo "stub claude: missing$f in argv: $*" >&2; exit 2 ;; esac',
+            'done',
+            'echo ''{"type":"result","total_cost_usd":0.0001}''',
+            '') -join "`n"))
+        & chmod +x $intClaude
+        if ($LASTEXITCODE -ne 0) { throw 'chmod on the stub claude failed' }
+    }
+    # the fire reads mcp-empty.json under $Root; give it a private copy so $Root can move to the temp dir
+    Copy-Item (Join-Path $Repo 'mcp-empty.json') (Join-Path $Tmp 'mcp-empty.json') -Force
+    function Invoke-FireInt([scriptblock]$LastActivity, [scriptblock]$KnownEnd, [string]$Config, [string]$Seed = '') {
+        # one fire against the stub with the given probes -> @{ journal; reg; toast }
+        $Root       = $Tmp                                   # .fire-out-*.tmp and friends land here, not in the repo
+        $EmptyMcp   = Join-Path $Tmp 'mcp-empty.json'
+        $LogPath    = Join-Path $Tmp ('fire-int-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.jsonl')
+        if ($Seed) { Set-Content -Path $LogPath -Value $Seed -Encoding UTF8 }
+        $StatePath  = Join-Path $Tmp 'fire-int-state.json'
+        $FirePit    = Join-Path $Tmp 'fire-int-pit'
+        $FireLock   = Join-Path $Tmp 'fire-int.lock'
+        $ConfigPath = New-Fixture 'fire-int-sched.json' @($Config)
+        (@{ claude = $intClaude } | ConvertTo-Json -Compress) | Set-Content -Path $StatePath -Encoding UTF8
+        $script:IntReg = @(); $script:IntToast = ''
+        # the self-heal after a failed attempt calls Resolve-ClaudeExe -NoCache, which
+        # would otherwise find the REAL claude on PATH and spend real quota: pin it
+        function Resolve-ClaudeExe { param([switch]$NoCache) $intClaude }
+        # a broken stub must fail in seconds, not sit through 2 x 90s retry sleeps
+        function Start-Sleep { param($Seconds, $Milliseconds) }
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake) $script:IntReg += @{ name = $Name; at = $At; nowake = [bool]$NoWake } }
+        function Remove-StaleOnceJobs { }
+        function Send-Toast { param($Ok, $Anchored, $Kind, $Extra) $script:IntToast = ('{0}|{1}|{2}|{3}' -f $Ok, $Anchored, $Kind, $Extra) }
+        function Get-Proxy { $null }
+        function Get-LastLocalActivity { & $LastActivity }
+        function Get-KnownWindowEnd([string]$path = $null) { & $KnownEnd }
+        Invoke-Fire 6>$null
+        @{ journal = @(Get-JournalEvents $LogPath 50); reg = @($script:IntReg); toast = $script:IntToast }
+    }
+    Test-Case 'fire integration: a ping inside a running window books ONE no-wake follow-up 2 minutes after the tap reset, journals it, and the toast says so' {
+        # the daily rule fires 3h from now (reset = now + 8h), so the follow-up (now + 32min) is not pre-empted
+        $sched = '{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"' + (Get-Date).AddHours(8).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + '"}]}'
+        $end = (Get-Date).AddMinutes(30)
+        $r = Invoke-FireInt { (Get-Date).AddHours(-2) } { $end } $sched
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $once = $r.journal | Where-Object { $_.ev -eq 'schedule-once' } | Select-Object -First 1
+        $at = $null
+        if ($once) { $at = ConvertTo-LocalTime $once.rec.fireAt }
+        # to the second: a +60s regression must go red here, not only in the pure unit case
+        $fire -and $fire.rec.ok -and ($fire.rec.anchored -eq $false) -and
+            $once -and ([string]$once.rec.label -eq 'chase ratelimits') -and $at -and ([Math]::Abs(($at - $end.AddMinutes(2)).TotalSeconds) -lt 30) -and
+            ($r.reg.Count -eq 1) -and ($r.reg[0].name -like 'ClaudePreheat-Once-*') -and $r.reg[0].nowake -and
+            ($r.toast -eq ('True|False|| - follow-up preheat at ' + $end.AddMinutes(2).ToString('HH:mm')))
+    }
+    Test-Case 'fire integration: a ping after 5h of quiet anchors a new window and books nothing' {
+        $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $fire -and $fire.rec.ok -and ($fire.rec.anchored -eq $true) -and ($r.reg.Count -eq 0) -and
+            (@($r.journal | Where-Object { $_.ev -eq 'schedule-once' }).Count -eq 0) -and ($r.toast -like 'True|True|*')
+    }
+    Test-Case 'fire integration: "chase": false in schedule.json keeps a white ping from booking anything' {
+        $r = Invoke-FireInt { (Get-Date).AddHours(-2) } { (Get-Date).AddMinutes(30) } '{"chase":false,"rules":[{"days":["Mon"],"reset":"11:07"}]}'
+        $skip = $r.journal | Where-Object { $_.ev -eq 'chase-skip' } | Select-Object -First 1
+        ($r.reg.Count -eq 0) -and $skip -and ([string]$skip.rec.reason -like '*disabled*')
+    }
+    Test-Case 'fire integration: a fire inside a window our own ping opened is white and does NOT chase again' {
+        # the temp journal starts with an anchored fire of ours 90 minutes ago
+        $seed = '{"ev":"fire","ok":true,"anchored":true,"attempts":1,"ts":"' + (Get-Date).AddMinutes(-90).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) + '"}'
+        $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}' $seed
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $skip = $r.journal | Where-Object { $_.ev -eq 'chase-skip' } | Select-Object -First 1
+        # quiet for 10h locally, yet white: the 90-minute-old anchored fire is ours; the chase is skipped for the same reason
+        $fire -and ($fire.rec.anchored -eq $false) -and ($r.reg.Count -eq 0) -and $skip -and ([string]$skip.rec.reason -like '*chain*')
+    }
+
     Test-Case 'a white ping wires the chase, and a chase failure can never cost the toast' {
         $src = Get-Content (Join-Path $Repo 'preheat.ps1') -Raw -Encoding UTF8
         ($src -match 'Invoke-Chase \$fireStart \$lastAct \$knownEnd') -and ($src -match "catch \{ Write-Log @\{ ev = 'chase-skip'")
