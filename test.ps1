@@ -211,6 +211,103 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
     Test-Case 'Get-FireEvents on a missing journal is an empty list, not an error' {
         @(Get-FireEvents (Join-Path $Tmp 'no-such-journal.jsonl') 60).Count -eq 0
     }
+    Write-Host '-- preheat: ping stream + rate limits (pure, costs nothing) --'
+    $streamOk = @(
+        '{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}',
+        '{"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","output":"text a hook printed"}',
+        '{"type":"system","subtype":"init","model":"claude-haiku"}',
+        '{"type":"assistant","message":{"model":"claude-haiku","content":[{"type":"text","text":"ok"}]}}',
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1790010000,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.32,"resetsAt":1790010000},"seven_day":{"utilization":0.53,"resetsAt":1790300000}}}}',
+        '{"type":"system","subtype":"post_turn_summary"}',
+        '{"type":"result","subtype":"success","is_error":false,"result":"ok","total_cost_usd":0.0037}'
+    ) -join "`n"
+    Test-Case 'Split-PingStream: the result line goes to the verdict, the rate_limit_event comes out alongside' {
+        $s = Split-PingStream $streamOk
+        $v = Test-PingOutput 0 $s.result ''
+        $v.ok -and ([math]::Abs([double]$v.cost - 0.0037) -lt 0.000001) -and $s.rl -and
+            ([double]$s.rl.unifiedWindows.five_hour.utilization -eq 0.32) -and ([long]$s.rl.unifiedWindows.five_hour.resetsAt -eq 1790010000)
+    }
+    Test-Case 'Split-PingStream: a failed run inside the stream still surfaces its reason' {
+        $bad = @(
+            '{"type":"system","subtype":"init"}',
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1790010000,"rateLimitType":"five_hour"}}',
+            '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached|1790010000"}'
+        ) -join "`r`n"
+        $s = Split-PingStream $bad
+        $v = Test-PingOutput 1 $s.result ''
+        (-not $v.ok) -and ($v.kind -eq 'limit') -and ($v.err -like 'Claude AI usage limit reached*') -and ($s.rl.status -eq 'rejected')
+    }
+    Test-Case 'Split-PingStream: the old single-object output and plain text pass through untouched; a stream with no result is empty' {
+        $legacy = Split-PingStream '{"type":"result","total_cost_usd":0.0123,"is_error":false}'
+        $plain  = Split-PingStream 'hello from claude'
+        $cut    = Split-PingStream ('{"type":"system","subtype":"init"}' + "`n" + '{"type":"system","subtype":"hook_response","output":"private hook text"}')
+        $none   = Split-PingStream ''
+        (Test-PingOutput 0 $legacy.result '').ok -and ($null -eq $legacy.rl) -and
+            ($plain.result -eq 'hello from claude') -and
+            ($cut.result -eq '') -and (-not (Test-PingOutput 0 $cut.result '').ok) -and
+            ($none.result -eq '') -and ($null -eq $none.rl)
+    }
+    Test-Case 'Read-PingFile: a UTF-8 stream with a Chinese reply survives the file round trip and stays a success' {
+        # Windows PowerShell 5.1 reads a BOM-less file in the ANSI code page; on a
+        # Chinese desktop (936) a GBK lead byte swallows the quote after the reply
+        # and a good ping was judged a failure - then pinged twice more
+        $cjk = -join ([char[]]@(0x4F60, 0x597D, 0xFF01, 0x6709, 0x4EC0, 0x4E48, 0x6211, 0x53EF, 0x4EE5, 0x5E2E, 0x4F60, 0x7684, 0x5417, 0xFF1F))
+        $text = @(
+            '{"type":"system","subtype":"init"}',
+            ('{"type":"assistant","message":{"content":[{"type":"text","text":"' + $cjk + '"}]}}'),
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.1,"resetsAt":1790010000}}}}',
+            ('{"type":"result","subtype":"success","is_error":false,"result":"' + $cjk + '","total_cost_usd":0.0037}')
+        ) -join "`n"
+        $f = Join-Path $Tmp 'cjk-stream.out'
+        [System.IO.File]::WriteAllText($f, $text, (New-Object System.Text.UTF8Encoding($false)))
+        $v = Test-PingOutput 0 (Split-PingStream (Read-PingFile $f)).result ''
+        $v.ok -and ([math]::Abs([double]$v.cost - 0.0037) -lt 0.000001) -and ((Read-PingFile (Join-Path $Tmp 'no-such.out')) -eq '')
+    }
+    Test-Case 'Split-PingStream: a stream that dies on a login error still hands the reason over (auth: no retries), never the hook text' {
+        $plain = Split-PingStream (@('{"type":"system","subtype":"hook_response","output":"private hook text"}', 'Invalid API key - Please run /login') -join "`n")
+        $json  = Split-PingStream (@('{"type":"system","subtype":"init"}', '{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}') -join "`n")
+        $a = Test-PingOutput 1 $plain.result ''
+        $b = Test-PingOutput 1 $json.result ''
+        ($a.kind -eq 'auth') -and ($a.err -notlike '*private hook text*') -and ($b.kind -eq 'auth')
+    }
+    Test-Case 'ConvertFrom-RateLimitInfo: both windows in the tap shape, fractions turned into percent' {
+        $w = ConvertFrom-RateLimitInfo (Split-PingStream $streamOk).rl
+        ($w.five_hour.used_percentage -eq 32) -and ([long]$w.five_hour.resets_at -eq 1790010000) -and
+            ($w.seven_day.used_percentage -eq 53) -and ([long]$w.seven_day.resets_at -eq 1790300000)
+    }
+    Test-Case 'ConvertFrom-RateLimitInfo: no unified windows -> the top-level 5h reset only; a weekly-only event or nothing -> null' {
+        $five = ConvertFrom-RateLimitInfo ('{"status":"allowed","resetsAt":1790010000,"rateLimitType":"five_hour"}' | ConvertFrom-Json)
+        $week = ConvertFrom-RateLimitInfo ('{"status":"allowed","resetsAt":1790300000,"rateLimitType":"seven_day"}' | ConvertFrom-Json)
+        ([long]$five.five_hour.resets_at -eq 1790010000) -and ($null -eq $five.seven_day) -and
+            ($null -eq $week) -and ($null -eq (ConvertFrom-RateLimitInfo $null))
+    }
+    Test-Case 'ConvertFrom-RateLimitInfo: past 100% (overage) stays a percent, a junk utilization keeps its reset' {
+        $w = ConvertFrom-RateLimitInfo ('{"unifiedWindows":{"five_hour":{"utilization":1.6,"resetsAt":1790010000},"seven_day":{"utilization":"x","resetsAt":1790300000}}}' | ConvertFrom-Json)
+        ($w.five_hour.used_percentage -eq 160) -and ($null -eq $w.seven_day.used_percentage) -and ([long]$w.seven_day.resets_at -eq 1790300000)
+    }
+    Test-Case 'ground-truth anchor: a window ending ~5h out was opened by the ping; sooner means it rode one; no end -> unknown' {
+        $D2 = { param($s) [datetime]::ParseExact($s, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $fire = & $D2 '2026-09-13 04:10:13'
+        (Test-AnchorFromWindow $fire (& $D2 '2026-09-13 09:10:00')) -and
+            (Test-AnchorFromWindow (& $D2 '2026-09-13 18:01:07') (& $D2 '2026-09-13 23:00:00')) -and
+            (Test-AnchorFromWindow $fire (& $D2 '2026-09-13 08:55:13')) -and
+            (-not (Test-AnchorFromWindow $fire (& $D2 '2026-09-13 08:54:13'))) -and
+            (-not (Test-AnchorFromWindow $fire (& $D2 '2026-09-13 05:47:00'))) -and
+            ($null -eq (Test-AnchorFromWindow $fire (& $D2 '2026-09-13 03:40:00'))) -and
+            ($null -eq (Test-AnchorFromWindow $fire $null))
+    }
+    Test-Case 'Write-RateLimitCache: the fire leaves a tap-shaped cache that Get-KnownWindowEnd reads, and overwrites an older one' {
+        $f = Join-Path $Tmp 'rl-fire.json'
+        '{"capturedAt":"old","rate_limits":{"five_hour":{"used_percentage":1,"resets_at":1700000000}}}' | Set-Content -Path $f -Encoding UTF8
+        Write-RateLimitCache (ConvertFrom-RateLimitInfo (Split-PingStream $streamOk).rl) $f
+        $o = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+        $end = Get-KnownWindowEnd $f
+        ($o.source -eq 'fire') -and ($o.rate_limits.five_hour.used_percentage -eq 32) -and ($o.rate_limits.seven_day.used_percentage -eq 53) -and
+            ($end -eq [DateTimeOffset]::FromUnixTimeSeconds(1790010000).LocalDateTime) -and
+            ((Get-Content $f -Raw -Encoding UTF8) -match '"capturedAt":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z"') -and
+            (@(Get-ChildItem $Tmp -Filter 'rl-fire.json.tmp*').Count -eq 0)
+    }
+
     Write-Host '-- preheat: anchor inference + chase --'
     $D = { param($s) [datetime]::ParseExact($s, 'yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
     Test-Case 'fresh anchor: quiet 5h+, or the tap saw the window end before the fire with no turn after it; never inside a window our own ping opened' {
@@ -225,7 +322,7 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         (Test-FreshAnchor $fire (& $D '2026-09-13 09:00') $null (& $D '2026-09-13 09:30'))
     }
     Test-Case 'chase plan: exact end from the tap wins, else last turn + 5h; always 2 minutes after the end' {
-        $fire = & $D '2026-09-13 15:00'; $last = & $D '2026-09-13 13:49'; $wk = & $D '2026-09-13 20:30'
+        $fire = & $D '2026-09-13 15:00'; $last = & $D '2026-09-13 13:49'; $wk = & $D '2026-09-14 00:15'
         $exact = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd (& $D '2026-09-13 16:37') -NextWeekly $wk -RecentAnchor $false -Now $fire
         $est   = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly $wk -RecentAnchor $false -Now $fire
         ($exact.source -eq 'ratelimits') -and ($exact.at -eq (& $D '2026-09-13 16:39')) -and
@@ -241,11 +338,42 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $a = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly $null -RecentAnchor $true -Now $fire
         $b = Get-ChasePlan -FireStart $fire -LastAct $null -KnownEnd $null -NextWeekly $null -RecentAnchor $false -Now $fire
         $c = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 18:00') -RecentAnchor $false -Now $fire
-        # boundary of the 5-minute lead: estimate chase = 18:51; a weekly fire at 18:55 wins, one at 18:57 does not
-        $d1 = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 18:55') -RecentAnchor $false -Now $fire
-        $d2 = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 18:57') -RecentAnchor $false -Now $fire
+        # boundary: the estimate chase at 18:51 holds its own window until 23:51 - a weekly fire before that wins
+        $d1 = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 23:50') -RecentAnchor $false -Now $fire
+        $d2 = Get-ChasePlan -FireStart $fire -LastAct $last -KnownEnd $null -NextWeekly (& $D '2026-09-13 23:52') -RecentAnchor $false -Now $fire
         ($a.skip -like '*chain*') -and ($b.skip -like '*no local*') -and ($c.skip -like '*comes first*') -and
         ($d1.skip -like '*comes first*') -and ($d2.at -eq (& $D '2026-09-13 18:51'))
+    }
+    Test-Case 'chase plan: no chase when its own 5h window would swallow the next weekly fire (the schedule comes first)' {
+        # weekly fires 5.5h apart: a chase at 14:02 would hold the account until
+        # ~19:02, so the 17:45 fire lands inside it, misses its own reset, and the
+        # no-chains rule then forbids that fire to chase in turn
+        $fire = & $D '2026-09-13 12:15'
+        $p = Get-ChasePlan -FireStart $fire -LastAct $null -KnownEnd (& $D '2026-09-13 14:00') -NextWeekly (& $D '2026-09-13 17:45') -RecentAnchor $false -Now $fire
+        $q = Get-ChasePlan -FireStart $fire -LastAct $null -KnownEnd (& $D '2026-09-13 14:00') -NextWeekly (& $D '2026-09-13 19:05') -RecentAnchor $false -Now $fire
+        ($p.skip -like '*comes first*') -and ($q.at -eq (& $D '2026-09-13 14:02'))
+    }
+    Test-Case 'chase once: a fire knows it IS a follow-up from the journal record of its own one-shot, by name' {
+        $j = Join-Path $Tmp 'chase-self.jsonl'
+        @(
+            '{"ev":"schedule-once","fireAt":"2026-09-13T16:39:00","label":"chase ratelimits","ts":"2026-09-13T12:15:05-07:00"}',
+            '{"ev":"schedule-once","fireAt":"2026-09-13T18:00:00","label":"reset 23:00","ts":"2026-09-13T12:20:00-07:00"}'
+        ) | Set-Content -Path $j -Encoding UTF8
+        (Test-ChaseFire 'ClaudePreheat-Once-20260913-1639' $j) -and
+            (-not (Test-ChaseFire 'ClaudePreheat-Once-20260913-1800' $j)) -and
+            (-not (Test-ChaseFire 'ClaudePreheat-Wk-0400-MonTue' $j)) -and
+            (-not (Test-ChaseFire '' $j)) -and
+            (-not (Test-ChaseFire 'ClaudePreheat-Once-20260913-1639' (Join-Path $Tmp 'no-such.jsonl')))
+    }
+    Test-Case 'chase plan: a follow-up never books another follow-up (once per gap)' {
+        $fire = & $D '2026-09-13 15:00'
+        $p = Get-ChasePlan -FireStart $fire -LastAct $null -KnownEnd (& $D '2026-09-13 16:37') -NextWeekly $null -RecentAnchor $false -Now $fire -IsChase $true
+        $p.skip -like '*follow-up*'
+    }
+    Test-Case 'chase plan: a known end still chases when nothing local ran (phone or web made the window)' {
+        $fire = & $D '2026-09-13 15:00'
+        $p = Get-ChasePlan -FireStart $fire -LastAct $null -KnownEnd (& $D '2026-09-13 16:37') -NextWeekly $null -RecentAnchor $false -Now $fire
+        ($p.source -eq 'ratelimits') -and ($p.at -eq (& $D '2026-09-13 16:39'))
     }
     Test-Case 'chase plan: an end already behind us (a slow ping) still lands 2 minutes ahead, never in the past' {
         $fire = & $D '2026-09-13 15:00'
@@ -287,6 +415,12 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $ev = @(Get-FireEvents $j 60)
         ($ev.Count -eq 2) -and ($null -eq $ev[0].chase_at) -and ($ev[1].chase_at -eq '2026-09-12 16:39')
     }
+    Test-Case 'Get-FireEvents carries the real reset time a fire learned from its own ping' {
+        $j = Join-Path $Tmp 'events-resets.jsonl'
+        '{"ev":"fire","ok":true,"anchored":true,"anchor_src":"ratelimit","resets_at":"2026-09-12 09:00","attempts":1,"ts":"2026-09-12T04:00:12-07:00"}' | Set-Content -Path $j -Encoding UTF8
+        $ev = @(Get-FireEvents $j 60)
+        ($ev.Count -eq 1) -and ($ev[0].resets_at -eq '2026-09-12 09:00')
+    }
     Test-Case 'known window end: read from the tap file as local time; junk or missing file -> null' {
         $f = Join-Path $Tmp 'rl.json'
         $epoch = (New-Object DateTimeOffset (& $D '2026-09-13 16:37')).ToUnixTimeSeconds()
@@ -325,18 +459,26 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
     if ($intOnWin) {
         $intClaude = Join-Path $intStub 'claude.cmd'
         Set-Content -Path $intClaude -Encoding ASCII -Value @(
-            '@echo %* | findstr /C:"--output-format json" >nul || exit /b 2',
+            '@echo %* | findstr /C:"--output-format stream-json" >nul || exit /b 2',
+            '@echo %* | findstr /C:"--verbose" >nul || exit /b 2',
             '@echo %* | findstr /C:"--strict-mcp-config" >nul || exit /b 2',
             '@echo %* | findstr /C:"-p " >nul || exit /b 2',
+            '@echo {"type":"system","subtype":"init"}',
+            '@if defined STUB_RL echo %STUB_RL%',
+            '@if defined STUB_RESULT echo %STUB_RESULT%',
+            '@if defined STUB_RESULT exit /b 1',
             '@echo {"type":"result","total_cost_usd":0.0001}')
     } else {
         $intClaude = Join-Path $intStub 'claude'
         [System.IO.File]::WriteAllText($intClaude, (@(
             '#!/bin/bash',
             'args=" $* "',
-            'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format json "; do',
+            'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format stream-json " " --verbose "; do',
             '  case "$args" in *"$f"*) ;; *) echo "stub claude: missing$f in argv: $*" >&2; exit 2 ;; esac',
             'done',
+            'echo ''{"type":"system","subtype":"init"}''',
+            '[ -n "$STUB_RL" ] && echo "$STUB_RL"',
+            'if [ -n "$STUB_RESULT" ]; then echo "$STUB_RESULT"; exit 1; fi',
             'echo ''{"type":"result","total_cost_usd":0.0001}''',
             '') -join "`n"))
         & chmod +x $intClaude
@@ -344,7 +486,7 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
     }
     # the fire reads mcp-empty.json under $Root; give it a private copy so $Root can move to the temp dir
     Copy-Item (Join-Path $Repo 'mcp-empty.json') (Join-Path $Tmp 'mcp-empty.json') -Force
-    function Invoke-FireInt([scriptblock]$LastActivity, [scriptblock]$KnownEnd, [string]$Config, [string]$Seed = '') {
+    function Invoke-FireInt([scriptblock]$LastActivity, [scriptblock]$KnownEnd, [string]$Config, [string]$Seed = '', [string]$Rl = '', [string]$Result = '', [string]$Self = '') {
         # one fire against the stub with the given probes -> @{ journal; reg; toast }
         $Root       = $Tmp                                   # .fire-out-*.tmp and friends land here, not in the repo
         $EmptyMcp   = Join-Path $Tmp 'mcp-empty.json'
@@ -367,12 +509,15 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         function Get-Proxy { $null }
         function Get-LastLocalActivity { & $LastActivity }
         function Get-KnownWindowEnd([string]$path = $null) { & $KnownEnd }
-        Invoke-Fire 6>$null
+        # the stub echoes this rate_limit_event line (inherited env); none = the pre-stream path
+        # the job name a scheduled fire runs under (a one-shot chase, a weekly job...)
+        $env:STUB_RL = $Rl; $env:STUB_RESULT = $Result; $env:CLAUDE_PREHEAT_SELF = $Self
+        try { Invoke-Fire 6>$null } finally { Remove-Item Env:STUB_RL, Env:STUB_RESULT, Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue }
         @{ journal = @(Get-JournalEvents $LogPath 50); reg = @($script:IntReg); toast = $script:IntToast }
     }
     Test-Case 'fire integration: a ping inside a running window books ONE no-wake follow-up 2 minutes after the tap reset, journals it, and the toast says so' {
-        # the daily rule fires 3h from now (reset = now + 8h), so the follow-up (now + 32min) is not pre-empted
-        $sched = '{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"' + (Get-Date).AddHours(8).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + '"}]}'
+        # the daily rule fires 6h from now (reset = now + 11h): beyond the follow-up's own window (now + 32min + 5h)
+        $sched = '{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"' + (Get-Date).AddHours(11).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + '"}]}'
         $end = (Get-Date).AddMinutes(30)
         $r = Invoke-FireInt { (Get-Date).AddHours(-2) } { $end } $sched
         $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
@@ -404,6 +549,69 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $skip = $r.journal | Where-Object { $_.ev -eq 'chase-skip' } | Select-Object -First 1
         # quiet for 10h locally, yet white: the 90-minute-old anchored fire is ours; the chase is skipped for the same reason
         $fire -and ($fire.rec.anchored -eq $false) -and ($r.reg.Count -eq 0) -and $skip -and ([string]$skip.rec.reason -like '*chain*')
+    }
+
+    function New-StubRl([datetime]$End) {
+        # one rate_limit_event line whose 5h window ends at $End (epoch seconds)
+        $e5 = (New-Object DateTimeOffset $End).ToUnixTimeSeconds()
+        $e7 = (New-Object DateTimeOffset ($End.AddDays(3))).ToUnixTimeSeconds()
+        '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":' + $e5 + ',"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.32,"resetsAt":' + $e5 + '},"seven_day":{"utilization":0.53,"resetsAt":' + $e7 + '}}}}'
+    }
+    Test-Case 'fire integration: the ping''s own rate limits say it rode a window - chase at the REAL end even with no local activity and a stale tap, cache refreshed' {
+        $sched = '{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"' + (Get-Date).AddHours(11).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + '"}]}'
+        $end = (Get-Date).AddMinutes(30)
+        $end = $end.AddSeconds(-$end.Second).AddMilliseconds(-$end.Millisecond)
+        Remove-Item (Join-Path $Tmp 'state-ratelimits.json') -ErrorAction SilentlyContinue
+        # the tap still holds a window that ended an hour ago (desktop-only use): the measured end must win
+        $r = Invoke-FireInt { $null } { (Get-Date).AddHours(-1) } $sched '' (New-StubRl $end)
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $once = $r.journal | Where-Object { $_.ev -eq 'schedule-once' } | Select-Object -First 1
+        $at = $null
+        if ($once) { $at = ConvertTo-LocalTime $once.rec.fireAt }
+        $cache = $null
+        try { $cache = Get-Content (Join-Path $Tmp 'state-ratelimits.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        # cost 0.0001 only comes through when the verdict read the RESULT line, not the whole stream
+        $fire -and $fire.rec.ok -and ($fire.rec.anchored -eq $false) -and ([string]$fire.rec.anchor_src -eq 'ratelimit') -and
+            ([Math]::Abs([double]$fire.rec.cost - 0.0001) -lt 1e-9) -and
+            ([string]$fire.rec.resets_at -eq $end.ToString('yyyy-MM-dd HH:mm')) -and
+            $once -and ([string]$once.rec.label -eq 'chase ratelimits') -and $at -and ([Math]::Abs(($at - $end.AddMinutes(2)).TotalSeconds) -lt 30) -and
+            ($r.reg.Count -eq 1) -and $cache -and ($cache.source -eq 'fire') -and ($cache.rate_limits.five_hour.used_percentage -eq 32)
+    }
+    Test-Case 'fire integration: the ping''s own rate limits say it opened a window - that beats the local-activity guess, nothing booked' {
+        $end = (Get-Date).AddHours(5).AddMinutes(-3)
+        # local activity 2h ago: the old guess would call this a white ping and chase
+        $r = Invoke-FireInt { (Get-Date).AddHours(-2) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}' '' (New-StubRl $end)
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $fire -and $fire.rec.ok -and ($fire.rec.anchored -eq $true) -and ([string]$fire.rec.anchor_src -eq 'ratelimit') -and
+            ($r.reg.Count -eq 0) -and ($r.toast -like 'True|True|*')
+    }
+    Test-Case 'fire integration: a usage-limit hit in the stream fails once (no retries), says limit, and still refreshes the cache' {
+        Remove-Item (Join-Path $Tmp 'state-ratelimits.json') -ErrorAction SilentlyContinue
+        $res = '{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached"}'
+        $r = Invoke-FireInt { (Get-Date).AddHours(-1) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}' '' (New-StubRl (Get-Date).AddHours(2)) $res
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $cache = $null
+        try { $cache = Get-Content (Join-Path $Tmp 'state-ratelimits.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        $fire -and (-not $fire.rec.ok) -and ([string]$fire.rec.kind -eq 'limit') -and ($fire.rec.attempts -eq 1) -and
+            (-not $fire.rec.PSObject.Properties['anchored']) -and ($r.reg.Count -eq 0) -and ($r.toast -eq 'False||limit|') -and
+            $cache -and ($cache.rate_limits.five_hour.used_percentage -eq 32)
+    }
+    Test-Case 'fire integration: a follow-up that rides a window again books nothing more (once per gap)' {
+        $sched = '{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"' + (Get-Date).AddHours(11).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + '"}]}'
+        # this fire IS the follow-up booked for a minute ago (its one-shot came due)
+        $due = (Get-Date).AddMinutes(-1)
+        $self = 'ClaudePreheat-Once-' + $due.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)
+        $seed = '{"ev":"schedule-once","fireAt":"' + $due.ToString('s', [System.Globalization.CultureInfo]::InvariantCulture) + '","label":"chase ratelimits","ts":"' + (Get-Date).AddHours(-3).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) + '"}'
+        $r = Invoke-FireInt { (Get-Date).AddMinutes(-5) } { $null } $sched $seed (New-StubRl (Get-Date).AddMinutes(40)) '' $self
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $skip = $r.journal | Where-Object { $_.ev -eq 'chase-skip' } | Select-Object -First 1
+        $fire -and $fire.rec.ok -and ($fire.rec.anchored -eq $false) -and ($r.reg.Count -eq 0) -and
+            $skip -and ([string]$skip.rec.reason -like '*follow-up*') -and ($r.toast -eq 'True|False||')
+    }
+    Test-Case 'fire integration: without a rate_limit_event the fire falls back to the local-activity guess and says so' {
+        $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $fire -and ($fire.rec.anchored -eq $true) -and ([string]$fire.rec.anchor_src -eq 'activity') -and (-not $fire.rec.PSObject.Properties['resets_at'])
     }
 
     Test-Case 'a white ping wires the chase, and a chase failure can never cost the toast' {
@@ -860,6 +1068,10 @@ Test-Case 'panel page ships the fire-history block and its strings in both langu
         if (-not $zh.Contains($k) -or -not $en.Contains($k)) { $ok = $false }
     }
     $ok
+}
+Test-Case 'fire history shows the reset time the fire measured, falling back to fire + 5h' {
+    $h = Get-Content (Join-Path $Repo 'web\index.html') -Raw -Encoding UTF8
+    $h -match 'e\.resets_at \? parseDate\(e\.resets_at\)'
 }
 Test-Case 'the scheduled-task registrar keeps WakeToRun for weekly fires (sleep must not eat a fire); only a -NoWake one-shot drops it' {
     $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8

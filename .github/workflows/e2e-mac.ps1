@@ -41,14 +41,15 @@ $stubDir = Join-Path ([System.IO.Path]::GetTempPath()) 'clr-e2e-stub'
 New-Item -ItemType Directory -Path $stubDir -Force | Out-Null
 $stub = Join-Path $stubDir 'claude'
 # the stub answers like claude only when called the way preheat.ps1 calls it
-# (-p ... --output-format json): a fire whose argv drifted must FAIL here, not
+# (-p ... --output-format stream-json --verbose): a fire whose argv drifted must FAIL here, not
 # pass on a stub that says yes to anything
 $stubBody = @(
     '#!/bin/bash',
     'args=" $* "',
-    'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format json "; do',
+    'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format stream-json " " --verbose "; do',
     '  case "$args" in *"$f"*) ;; *) echo "stub claude: missing$f in argv: $*" >&2; exit 2 ;; esac',
     'done',
+    'echo ''{"type":"system","subtype":"init"}''',
     'echo ''{"type":"result","total_cost_usd":0.0001}''',
     ''
 ) -join "`n"

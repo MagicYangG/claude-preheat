@@ -123,7 +123,7 @@ function Get-FireEvents([string]$path, [int]$max = 60) {
             # then hand back the desktop culture's format - keep the journal's own text
             $ts = [string]$e.ts
             if ($lines[$i] -match '"ts"\s*:\s*"([^"]+)"') { $ts = $Matches[1] }
-            $rec = [ordered]@{ ts = $ts; ok = [bool]$e.ok; anchored = $null; kind = $null; attempts = $null; last_local_activity = $null; err = $null; chase_at = $null }
+            $rec = [ordered]@{ ts = $ts; ok = [bool]$e.ok; anchored = $null; kind = $null; attempts = $null; last_local_activity = $null; err = $null; chase_at = $null; resets_at = $null }
             if ($pendingChase) {
                 $fts = ConvertTo-LocalTime $e.ts
                 if ($fts -and $pendingChase.ts -and $pendingChase.at -and ($pendingChase.ts -ge $fts) -and (($pendingChase.ts - $fts).TotalMinutes -le 5)) {
@@ -135,6 +135,7 @@ function Get-FireEvents([string]$path, [int]$max = 60) {
             if ($e.PSObject.Properties['kind'] -and $e.kind) { $rec.kind = [string]$e.kind }
             if ($e.PSObject.Properties['attempts'] -and ($null -ne $e.attempts)) { $rec.attempts = [int]$e.attempts }
             if ($e.PSObject.Properties['last_local_activity'] -and $e.last_local_activity) { $rec.last_local_activity = [string]$e.last_local_activity }
+            if ($e.PSObject.Properties['resets_at'] -and $e.resets_at) { $rec.resets_at = [string]$e.resets_at }
             if ($e.PSObject.Properties['err'] -and $e.err) {
                 $s = [string]$e.err
                 $rec.err = $s.Substring(0, [Math]::Min(120, $s.Length))
@@ -343,9 +344,11 @@ function Get-LastLocalActivity {
 }
 
 function Get-KnownWindowEnd([string]$path = $null) {
-    # the exact end of the 5h window the statusline tap last saw. Transcript
-    # activity only says WHEN the account was busy; state-ratelimits.json
-    # (written on every statusline render) says when that window expires.
+    # the exact end of the 5h window last seen. Transcript activity only says
+    # WHEN the account was busy; state-ratelimits.json says when that window
+    # expires - written on every statusline render (CLI only: the desktop app
+    # runs Claude Code headless, no statusline) and by every fire from its own
+    # ping's rate_limit_event (Write-RateLimitCache).
     # $null when the tap is not installed or the file is unreadable.
     try {
         if (-not $path) { $path = Join-Path $Root 'state-ratelimits.json' }
@@ -355,6 +358,142 @@ function Get-KnownWindowEnd([string]$path = $null) {
         if (-not $r) { return $null }
         return [DateTimeOffset]::FromUnixTimeSeconds([long]$r).LocalDateTime
     } catch { return $null }
+}
+
+function Split-PingStream([string]$StdOut) {
+    # `claude -p --output-format stream-json --verbose` prints one JSON event a
+    # line: hook chatter, init, the reply, a rate_limit_event and, last, the
+    # very object `--output-format json` used to print alone. The verdict
+    # (Test-PingOutput) reads that result line; the rate_limit_event says when
+    # the 5h window really ends. Pure.
+    # -> @{ result = <the result line> | <the text itself when it is no stream>
+    #               | '' (a stream that never got to its result);
+    #       rl = <rate_limit_info> | $null }
+    $res = @{ result = ''; rl = $null }
+    if (-not $StdOut) { return $res }
+    $isStream = $false; $resultLine = $null
+    $loose = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($StdOut -split '\r?\n')) {
+        $s = $line.Trim()
+        if (-not $s) { continue }
+        $e = $null; $type = $null
+        if ($s.StartsWith('{')) {
+            try { $e = $s | ConvertFrom-Json } catch { $e = $null }
+            if ($e -and $e.PSObject.Properties['type']) { $type = [string]$e.type }
+            # a line that no longer parses still names its type up front
+            elseif ($s -match '^\{\s*"type"\s*:\s*"([A-Za-z_]+)"') { $type = $Matches[1] }
+        }
+        if (-not $type) { [void]$loose.Add($s); continue }   # plain text: the CLI's own output
+        $isStream = $true
+        switch ($type) {
+            'result' { $resultLine = $s; break }
+            'rate_limit_event' { if ($e -and $e.PSObject.Properties['rate_limit_info'] -and $e.rate_limit_info) { $res.rl = $e.rate_limit_info }; break }
+            # hook chatter carries whatever the user's own hooks printed, the
+            # reply is the model's: neither belongs in a log line
+            { $_ -in @('system', 'assistant', 'user', 'stream_event') } { break }
+            default { [void]$loose.Add($s) }
+        }
+    }
+    if ($resultLine) { $res.result = $resultLine }
+    elseif (-not $isStream) { $res.result = $StdOut }
+    # a stream cut short: hand the verdict what the CLI itself said (an auth
+    # error must still read as auth - no retries, the login toast), or ''
+    elseif ($loose.Count) { $res.result = ($loose -join "`n") }
+    $res
+}
+
+function ConvertFrom-RateLimitInfo($rl) {
+    # rate_limit_info -> the statusline tap's shape (five_hour / seven_day, each
+    # used_percentage + resets_at in epoch seconds), so the panel and
+    # Get-KnownWindowEnd read one format whoever wrote the cache. $null when
+    # it says nothing about the 5h window: writing that would only erase what
+    # the tap knew. Utilization arrives as a fraction (0.32 - past 1.0 with
+    # overage); used_percentage is percent, like the tap's.
+    if (-not $rl) { return $null }
+    $toWin = {
+        param($o)
+        if ((-not $o) -or (-not $o.PSObject.Properties['resetsAt']) -or (-not $o.resetsAt)) { return $null }
+        $w = [ordered]@{ used_percentage = $null; resets_at = [long]$o.resetsAt }
+        if ($o.PSObject.Properties['utilization'] -and ($null -ne $o.utilization)) {
+            # a value that is no number leaves the percent unknown - the reset still counts
+            try { $w.used_percentage = [int][Math]::Round(([double]$o.utilization) * 100) } catch { }
+        }
+        $w
+    }
+    $five = $null; $week = $null
+    if ($rl.PSObject.Properties['unifiedWindows'] -and $rl.unifiedWindows) {
+        $uw = $rl.unifiedWindows
+        if ($uw.PSObject.Properties['five_hour']) { $five = & $toWin $uw.five_hour }
+        if ($uw.PSObject.Properties['seven_day']) { $week = & $toWin $uw.seven_day }
+    }
+    # older payloads: only the binding limit, at the top level
+    if ((-not $five) -and $rl.PSObject.Properties['rateLimitType'] -and ($rl.rateLimitType -eq 'five_hour')) { $five = & $toWin $rl }
+    if (-not $five) { return $null }
+    $out = [ordered]@{ five_hour = $five }
+    if ($week) { $out.seven_day = $week }
+    $out
+}
+
+function Write-RateLimitCache($windows, [string]$path = $null, [string]$source = 'fire') {
+    # the file the statusline tap writes (state-ratelimits.json): with only the
+    # desktop app in use nothing else ever refreshes it, and both the panel's
+    # quota strip and the chase read it. temp + replace: no reader ever sees
+    # half a file. A reader holding it open at that very instant (no
+    # FILE_SHARE_DELETE) makes the replace fail: one retry, then this reading
+    # waits for the next fire. Telemetry: never throws.
+    if (-not $windows) { return }
+    if (-not $path) { $path = Join-Path $Root 'state-ratelimits.json' }
+    $tmp = $path + '.tmp-' + $PID
+    try {
+        $obj = [ordered]@{
+            capturedAt  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+            source      = $source
+            rate_limits = $windows
+        }
+        # not $json: the script's own [switch]$Json param is the same variable to
+        # PowerShell, and a string assigned to it throws
+        $text = ConvertTo-Json -InputObject $obj -Compress -Depth 6
+        [System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        for ($n = 1; $n -le 2; $n++) {
+            try {
+                # [NullString]: a bare $null reaches a .NET string parameter as '' ("the path is empty")
+                if (Test-Path $path) { [System.IO.File]::Replace($tmp, $path, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $path) }
+                break
+            } catch {
+                if ($n -ge 2) { throw }
+                Start-Sleep -Milliseconds 50
+            }
+        }
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Read-PingFile([string]$path) {
+    # the ping's redirected stdout/stderr: UTF-8 without a BOM. Windows
+    # PowerShell 5.1 reads such a file in the ANSI code page (936 on a Chinese
+    # desktop), where a GBK lead byte swallows the quote after a Chinese reply:
+    # the result line stopped parsing and a good ping was judged a failure.
+    if (-not (Test-Path $path)) { return '' }
+    $t = Get-Content $path -Raw -Encoding UTF8
+    if ($null -eq $t) { return '' }
+    $t
+}
+
+function Test-AnchorFromWindow([datetime]$FireStart, $WindowEnd) {
+    # ground truth for "did this ping open a NEW window?": its own
+    # rate_limit_event says when the 5h window ends right after it. Ending ~5h
+    # out = this ping opened it; sooner = one was already running. The end is
+    # truncated (a 04:10:13 ping -> 09:10, 18:01:07 -> 23:00), hence the
+    # 15-minute margin - which also counts a window someone opened under 15
+    # minutes before the fire as ours: harmless, it ends within 15 minutes of
+    # the reset the schedule asked for.
+    # -> $true | $false | $null (no usable end: fall back to the activity guess)
+    if (-not $WindowEnd) { return $null }
+    $left = ($WindowEnd.ToUniversalTime() - $FireStart.ToUniversalTime()).TotalMinutes
+    if ($left -le 0) { return $null }
+    $left -ge ($WindowHours * 60 - 15)
 }
 
 function Test-FreshAnchor([datetime]$FireStart, $LastAct, $KnownEnd, $LastPreheatAnchor = $null) {
@@ -441,6 +580,24 @@ function Test-RecentPreheatAnchor([datetime]$Before, [string]$path = $null) {
     $false
 }
 
+function Test-ChaseFire([string]$Self, [string]$path = $null) {
+    # is this fire itself a follow-up? Its job name ($env:CLAUDE_PREHEAT_SELF)
+    # is the one-shot Invoke-Once derived from fireAt, and the journal's
+    # 'schedule-once' record with a chase label carries that fireAt. Matching
+    # the name, not a time window, also recognises a follow-up launchd ran
+    # late after a sleep. -> $true / $false
+    if ((-not $Self) -or ($Self -notlike ($TaskOncePrefix + '-*'))) { return $false }
+    if (-not $path) { $path = $LogPath }
+    foreach ($j in @(Get-JournalEvents $path 200)) {
+        $e = $j.rec
+        if (($j.ev -ne 'schedule-once') -or (-not $e.PSObject.Properties['label']) -or ([string]$e.label -notlike 'chase*')) { continue }
+        $at = $null
+        if ($e.PSObject.Properties['fireAt']) { $at = ConvertTo-LocalTime $e.fireAt }
+        if ($at -and (($TaskOncePrefix + '-' + $at.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)) -eq $Self)) { return $true }
+    }
+    $false
+}
+
 function Get-NextWeeklyFire([datetime]$After) {
     # the next weekly fire time after $After, from schedule.json (not from the
     # scheduler: the answer must not depend on which backend is registered).
@@ -464,22 +621,31 @@ function Get-ChasePlan {
     # schedule wanted a fresh window anchored at fire time, so that the reset
     # lands 5h later - inside the user's session. Chase = ping again one
     # minute after the running window expires, the earliest moment the
-    # intended anchor can still happen. Pure: every input is a parameter so
-    # the self-test can walk the edges without a clock or a scheduler.
+    # intended anchor can still happen - unless the next weekly fire comes
+    # before the chase's OWN window would end: that fire would land inside it,
+    # miss its reset, and (no chains) not chase either. Pure: every input is a
+    # parameter so the self-test can walk the edges without a clock or a scheduler.
     # -> @{ at; source; end }  or  @{ skip = reason }
-    param([datetime]$FireStart, $LastAct, $KnownEnd, $NextWeekly, [bool]$RecentAnchor, [datetime]$Now)
+    param([datetime]$FireStart, $LastAct, $KnownEnd, $NextWeekly, [bool]$RecentAnchor, [datetime]$Now, [bool]$IsChase = $false)
+    # once per gap: a follow-up that rides a window again does not book another
+    # (with the account kept busy, chase after chase only rode window after window)
+    if ($IsChase) { return @{ skip = 'a follow-up does not chase again (once per gap)' } }
     if ($RecentAnchor) { return @{ skip = 'a preheat anchored the running window (no chase chains)' } }
-    if (-not $LastAct) { return @{ skip = 'no local activity to chase' } }
+    # exact when the tap or this fire's own rate_limit_event saw the running
+    # window (its end still ahead of the fire) - then nothing local is needed:
+    # a window opened from a phone or claude.ai ends just the same
+    $known = [bool]($KnownEnd -and ($KnownEnd -gt $FireStart))
+    if ((-not $LastAct) -and (-not $known)) { return @{ skip = 'no local activity to chase' } }
+    $end = $null; $src = $null
     # upper bound: the running window opened no later than the last local
     # turn, so it ends no later than 5h after it
-    $end = $LastAct.ToUniversalTime().AddHours($WindowHours).ToLocalTime(); $src = 'estimate'
-    # exact when the tap saw the running window (its end still ahead of the fire)
-    if ($KnownEnd -and ($KnownEnd -gt $FireStart)) { $end = $KnownEnd; $src = 'ratelimits' }
+    if ($LastAct) { $end = $LastAct.ToUniversalTime().AddHours($WindowHours).ToLocalTime(); $src = 'estimate' }
+    if ($known) { $end = $KnownEnd; $src = 'ratelimits' }
     # two whole minutes, not 60s: resets_at is truncated to the minute, so a
     # +60s chase could still land a second inside the old window
     $at = $end.AddMinutes(2)
     if ($at -lt $Now.AddMinutes(2)) { $at = $Now.AddMinutes(2) }
-    if ($NextWeekly -and ($at -ge $NextWeekly.AddMinutes(-5))) {
+    if ($NextWeekly -and ($NextWeekly -lt $at.AddHours($WindowHours))) {
         return @{ skip = ('next scheduled preheat ' + $NextWeekly.ToString('MM-dd HH:mm') + ' comes first') }
     }
     @{ at = $at; source = $src; end = $end }
@@ -495,7 +661,8 @@ function Invoke-Chase([datetime]$FireStart, $LastAct, $KnownEnd) {
     }
     $now  = Get-Date
     $plan = Get-ChasePlan -FireStart $FireStart -LastAct $LastAct -KnownEnd $KnownEnd `
-        -NextWeekly (Get-NextWeeklyFire $now) -RecentAnchor (Test-RecentPreheatAnchor $FireStart) -Now $now
+        -NextWeekly (Get-NextWeeklyFire $now) -RecentAnchor (Test-RecentPreheatAnchor $FireStart) -Now $now `
+        -IsChase (Test-ChaseFire $env:CLAUDE_PREHEAT_SELF)
     if ($plan.skip) { Write-Log @{ ev = 'chase-skip'; reason = $plan.skip }; return $plan }
     # -NoWake: a follow-up is best effort - it must never wake a sleeping PC at
     # a minute the user did not choose (the weekly fires keep their wake timers)
@@ -602,8 +769,8 @@ function Invoke-Fire {
         $knownEnd  = Get-KnownWindowEnd
         $ownAnchor = Get-LastPreheatAnchor
 
-        $pingArgs = '-p "hi" --model haiku --no-session-persistence --strict-mcp-config --mcp-config "{0}" --output-format json' -f $EmptyMcp
-        $ok = $false; $attempts = 0; $cost = $null; $ms = $null; $errText = $null; $kind = $null
+        $pingArgs = '-p "hi" --model haiku --no-session-persistence --strict-mcp-config --mcp-config "{0}" --output-format stream-json --verbose' -f $EmptyMcp
+        $ok = $false; $attempts = 0; $cost = $null; $ms = $null; $errText = $null; $kind = $null; $rlInfo = $null; $rlOk = $null
 
         while (-not $ok -and $attempts -lt 3) {
             $attempts++
@@ -621,11 +788,14 @@ function Invoke-Fire {
                 }
                 $sw.Stop(); $ms = $sw.ElapsedMilliseconds
                 $stdout = ''
-                if (Test-Path $outFile) { $stdout = Get-Content $outFile -Raw }
+                $stdout = Read-PingFile $outFile
                 $stderrText = ''
-                if (Test-Path $errFile) { $stderrText = Get-Content $errFile -Raw }
-                $verdict = Test-PingOutput $p.ExitCode $stdout $stderrText
-                if ($verdict.ok) { $ok = $true; $cost = $verdict.cost }
+                $stderrText = Read-PingFile $errFile
+                # stream-json: the verdict reads the result line, the rate_limit_event rides along
+                $split = Split-PingStream $stdout
+                if ($split.rl) { $rlInfo = $split.rl }
+                $verdict = Test-PingOutput $p.ExitCode $split.result $stderrText
+                if ($verdict.ok) { $ok = $true; $cost = $verdict.cost; $rlOk = $split.rl }
                 else { $errText = $verdict.err; $kind = $verdict.kind }
             } catch {
                 $sw.Stop()
@@ -654,10 +824,36 @@ function Invoke-Fire {
             } catch { }
         }
 
+        # the ping's own rate_limit_event: refresh the cache the panel strip and
+        # the chase read with the newest reading (a usage-limit failure carries
+        # one too: worth showing)
+        $windows = $null
+        if ($rlInfo) { try { $windows = ConvertFrom-RateLimitInfo $rlInfo } catch { } }
+        if ($windows) { Write-RateLimitCache $windows }
+        # the anchor is judged on the SUCCESSFUL attempt's own reading only: a
+        # failed attempt's could describe a window that has ended since
+        $okWindows = $null
+        if ($rlOk) { try { $okWindows = ConvertFrom-RateLimitInfo $rlOk } catch { } }
+
         $entry = @{ ev = 'fire'; ok = $ok; attempts = $attempts; ms = $ms; cost = $cost }
         if (-not $ok) { $entry.err = $errText; $entry.kind = $kind }
         if ($ok) {
-            $entry.anchored = Test-FreshAnchor $fireStart $lastAct $knownEnd $ownAnchor
+            $rlEnd = $null
+            if ($okWindows -and $okWindows.five_hour -and $okWindows.five_hour.resets_at) {
+                try { $rlEnd = [DateTimeOffset]::FromUnixTimeSeconds([long]$okWindows.five_hour.resets_at).LocalDateTime } catch { }
+            }
+            $truth = Test-AnchorFromWindow $fireStart $rlEnd
+            if ($null -ne $truth) {
+                # measured, not guessed: blind spots of the local guess (phone,
+                # claude.ai, a stale tap) no longer matter
+                $entry.anchored = $truth; $entry.anchor_src = 'ratelimit'
+                $entry.resets_at = $rlEnd.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+                # a chase lands 2 minutes after the REAL end, whatever the tap last saw
+                $knownEnd = $rlEnd
+            } else {
+                $entry.anchored = Test-FreshAnchor $fireStart $lastAct $knownEnd $ownAnchor
+                $entry.anchor_src = 'activity'
+            }
             if ($lastAct) { $entry.last_local_activity = $lastAct.ToString('yyyy-MM-dd HH:mm') }
         }
         Write-Log $entry
@@ -779,7 +975,7 @@ function Invoke-Status {
                     if ($e.PSObject.Properties['label'] -and $e.label) {
                         # journal vocabulary -> what the user sees
                         $lbl = switch -Regex ([string]$e.label) {
-                            '^chase ratelimits' { ' (follow-up preheat, exact reset from statusline)'; break }
+                            '^chase ratelimits' { ' (follow-up preheat, exact reset)'; break }
                             '^chase estimate'   { ' (follow-up preheat, estimated reset)'; break }
                             default             { ' (' + [string]$e.label + ')' }
                         }

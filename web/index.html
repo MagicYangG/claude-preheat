@@ -729,7 +729,9 @@ function evLine(e, v, d){
   if (v === 'ok') {
     // records older than the anchored flag cannot say whether a window opened
     if (e.anchored !== true) return t('ev_ok_line_na').replace('{a}', hm(d));
-    var r = new Date(d.getTime() + 5 * 3600 * 1000);
+    // the fire's own measurement when it has one (rounded to the account's grain), else fire + 5h
+    var r = e.resets_at ? parseDate(e.resets_at) : null;
+    if (!r) r = new Date(d.getTime() + 5 * 3600 * 1000);
     return t('ev_ok_line').replace('{a}', hm(d)).replace('{b}', hm(r));
   }
   if (v === 'noeff') {
