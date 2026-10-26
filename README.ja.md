@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | **日本語** | [한국어](README.ko.md)
 
-![claude-preheat デモ](docs/demo.webp)
+https://github.com/user-attachments/assets/b0614c1a-fe78-4464-a11e-aaeb1794829e
 
 Windows または macOS で Claude Code CLI を使う Claude サブスクリプションユーザー向けのツールです。5 時間の利用枠ウィンドウは、枠が空いている状態で送られた最初のメッセージにアンカーされます — スケジュールした極小のピングであなたの選んだ時刻にウィンドウをアンカーし、本番の作業を 2 つの 5 時間ウィンドウにまたがらせます。できることは 2 つ:
 
