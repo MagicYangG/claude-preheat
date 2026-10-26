@@ -194,10 +194,12 @@ function Build-LaunchdPlist {
         [datetime]$At,
         [string]$HostShell,
         [string]$ScriptPath,
-        [string]$PathEnv
+        [string]$PathEnv,
+        [string[]]$ScriptArgs = @('fire')
     )
     $e = { param($s) [System.Security.SecurityElement]::Escape([string]$s) }
     $label  = ConvertTo-LaunchdLabel $Name
+    $argXml = (@($ScriptArgs) | ForEach-Object { '        <string>' + (& $e $_) + '</string>' }) -join "`n"
     $dayNum = @{ Sunday = 0; Monday = 1; Tuesday = 2; Wednesday = 3; Thursday = 4; Friday = 5; Saturday = 6 }
     if ($Days -and $Days.Count -gt 0) {
         $entries = foreach ($d in $Days) {
@@ -222,7 +224,7 @@ function Build-LaunchdPlist {
         <string>-NoProfile</string>
         <string>-File</string>
         <string>$(& $e $ScriptPath)</string>
-        <string>fire</string>
+$argXml
     </array>
     <key>EnvironmentVariables</key>
     <dict><key>PATH</key><string>$(& $e $PathEnv)</string><key>CLAUDE_PREHEAT_SELF</key><string>$(& $e $Name)</string></dict>
@@ -235,11 +237,26 @@ $cal
 
 # ---------- Windows-only scheduler internals ----------
 
-function New-PreheatAction {
+function Get-PreheatActionArgument([string]$VbsPath, [string]$ShellPath, [string]$ScriptPath, [string[]]$ScriptArgs = @('fire')) {
+    # PURE - the wscript argument line. Every item is quoted; run-hidden.vbs
+    # re-quotes each one for the shell, so a script arg must not carry a quote.
+    $tail = (@($ScriptArgs) | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    '//B //Nologo "{0}" "{1}" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "{2}" {3}' -f $VbsPath, $ShellPath, $ScriptPath, $tail
+}
+
+function Format-LocalBoundary([datetime]$At) {
+    # PURE - a trigger StartBoundary WITHOUT a UTC offset. Task Scheduler reads
+    # an offset-less boundary as local wall-clock time, so the task keeps firing
+    # at 06:30 across a DST change. New-ScheduledTaskTrigger writes the instant
+    # with the offset of the day it was registered on, and after the clocks
+    # change that same instant is an hour off on the wall clock.
+    $At.ToString("yyyy-MM-dd'T'HH':'mm':'ss", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function New-PreheatAction([string[]]$ScriptArgs = @('fire')) {
     # via run-hidden.vbs: a console action flashes a cmd window at every fire
     New-ScheduledTaskAction -Execute 'wscript.exe' `
-        -Argument ('//B //Nologo "{0}" "{1}" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "{2}" "fire"' -f `
-            (Join-Path $PlatformRoot 'run-hidden.vbs'), (Resolve-HostShell), (Join-Path $PlatformRoot 'preheat.ps1'))
+        -Argument (Get-PreheatActionArgument (Join-Path $PlatformRoot 'run-hidden.vbs') (Resolve-HostShell) (Join-Path $PlatformRoot 'preheat.ps1') $ScriptArgs)
 }
 
 function New-PreheatSettings([switch]$NoWake) {
@@ -262,13 +279,14 @@ function New-PreheatSettings([switch]$NoWake) {
 function Register-PreheatJob {
     # $Days present -> weekly at $At's time-of-day on those days
     # $Days absent  -> one-shot at $At
-    param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake)
+    # $ScriptArgs = what the job passes to preheat.ps1 (default: fire)
+    param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs = @('fire'))
     if ($OnMac) {
         if (-not (Test-Path $LaunchAgentDir)) { New-Item -ItemType Directory -Path $LaunchAgentDir -Force | Out-Null }
         $label = ConvertTo-LaunchdLabel $Name
         $plist = Join-Path $LaunchAgentDir ($label + '.plist')
         $xml   = Build-LaunchdPlist -Name $Name -Days $Days -At $At `
-                    -HostShell (Resolve-HostShell) -ScriptPath (Join-Path $PlatformRoot 'preheat.ps1') -PathEnv $env:PATH
+                    -HostShell (Resolve-HostShell) -ScriptPath (Join-Path $PlatformRoot 'preheat.ps1') -PathEnv $env:PATH -ScriptArgs $ScriptArgs
         # plists must not carry a BOM
         [System.IO.File]::WriteAllText($plist, $xml, (New-Object System.Text.UTF8Encoding($false)))
         $uid = Get-MacUid
@@ -288,10 +306,28 @@ function Register-PreheatJob {
             throw "launchctl bootstrap failed for $label (exit $LASTEXITCODE)"
         }
     } else {
-        $trigger = if ($Days -and $Days.Count -gt 0) { New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Days -At $At }
-                   else { New-ScheduledTaskTrigger -Once -At $At }
-        Register-ScheduledTask -TaskName $Name -Action (New-PreheatAction) -Trigger $trigger -Settings (New-PreheatSettings -NoWake:$NoWake) -Force | Out-Null
+        $weekly = [bool]($Days -and $Days.Count -gt 0)
+        $At = Get-RegistrableTime $At $weekly
+        if ($weekly) {
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Days -At $At
+            # weekly only: a one-shot keeps the absolute instant the cmdlet
+            # writes - a chase is computed from a UTC window end, and the
+            # repeated 01:00-02:00 hour of a DST end is ambiguous on the wall clock
+            $trigger.StartBoundary = Format-LocalBoundary $At
+        } else {
+            $trigger = New-ScheduledTaskTrigger -Once -At $At
+        }
+        Register-ScheduledTask -TaskName $Name -Action (New-PreheatAction $ScriptArgs) -Trigger $trigger -Settings (New-PreheatSettings -NoWake:$NoWake) -Force | Out-Null
     }
+}
+
+function Get-RegistrableTime([datetime]$At, [bool]$Weekly, [System.TimeZoneInfo]$Zone = [System.TimeZoneInfo]::Local) {
+    # a wall-clock time the spring DST change skips (02:30 that night) makes
+    # New-ScheduledTaskTrigger throw - pwsh 7 has been seen to crash outright.
+    # Weekly: start a day later, the time of day is what matters and the
+    # skipped day has no 02:30 anyway. One-shot: the same instant is 03:30.
+    if (-not $Zone.IsInvalidTime($At)) { return $At }
+    if ($Weekly) { $At.AddDays(1) } else { $At.AddHours(1) }
 }
 
 function Get-PreheatJobs {

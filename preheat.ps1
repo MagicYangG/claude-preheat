@@ -30,10 +30,15 @@ window is already active is a harmless no-op (anchor unchanged).
 param(
     [Parameter(Position = 0)][string]$Command = 'status',
     [Parameter(Position = 1)][string]$Arg,
-    [switch]$Json
+    [switch]$Json,
+    [string]$Job
 )
 
 $ErrorActionPreference = 'Stop'
+# A Windows task carries no environment block, so a one-shot passes its own
+# name as -Job; launchd sets CLAUDE_PREHEAT_SELF in the plist instead. The fire
+# needs it to know whether it is a follow-up (Test-ChaseFire).
+if ($Job -and (-not $env:CLAUDE_PREHEAT_SELF) -and ($Job -match '^ClaudePreheat-[A-Za-z0-9-]+$')) { $env:CLAUDE_PREHEAT_SELF = $Job }
 $Root       = $PSScriptRoot
 $ConfigPath = Join-Path $Root 'schedule.json'
 $StatePath  = Join-Path $Root 'state.json'
@@ -890,7 +895,7 @@ function Invoke-Once($fireAt, $label, [switch]$NoWake) {
     # InvariantCulture: on macOS the name IS the schedule (Get-JobNextRun decodes
     # it with the invariant calendar), so a Buddhist year here would decode wrong
     $name = '{0}-{1}' -f $TaskOncePrefix, $fireAt.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)
-    Register-PreheatJob -Name $name -At $fireAt -NoWake:$NoWake
+    Register-PreheatJob -Name $name -At $fireAt -NoWake:$NoWake -ScriptArgs @('fire', '-Job', $name)
     Write-Log @{ ev = 'schedule-once'; fireAt = $fireAt.ToString('s'); label = $label }
     Write-Host ('one-shot registered: fire at {0}  ({1})' -f $fireAt.ToString('yyyy-MM-dd HH:mm'), $label)
 }
@@ -1115,6 +1120,24 @@ function Get-LearnReport($stamps, $now) {
     }
 }
 
+function New-LearnedConfig($Existing, $Rules) {
+    # PURE - the schedule.json 'learn auto' writes: new rules, every other key
+    # of the existing file kept as is (proxy, "chase": false, ...). Rebuilding
+    # from a fixed key list used to drop "chase": false silently.
+    $out = [ordered]@{
+        _readme = 'days: Mon..Sun | reset = HH:mm target reset time (previous 5h window expiry); fire time auto = reset - 5h | edit then run: preheat apply | chase: false = no follow-up ping when a scheduled preheat lands in a running window'
+        proxy   = ''
+    }
+    if ($Existing) {
+        foreach ($p in $Existing.PSObject.Properties) {
+            if ($p.Name -eq 'rules') { continue }
+            $out[$p.Name] = $p.Value
+        }
+    }
+    $out['rules'] = @($Rules)
+    $out
+}
+
 function Invoke-Learn {
     $stamps = Get-HistoryTimestamps 30
     if ($stamps.Count -eq 0) {
@@ -1168,10 +1191,10 @@ function Invoke-Learn {
         Write-Host 'apply them: preheat learn auto   (backs up schedule.json, writes these rules, runs apply)'
         return
     }
-    # auto: write + apply, preserving the proxy; days without a suggestion get
-    # no rule (no observed rhythm -> nothing worth pre-warming)
-    $proxy = ''
-    $bak   = $null
+    # auto: write + apply; days without a suggestion get no rule (no observed
+    # rhythm -> nothing worth pre-warming)
+    $c0  = $null
+    $bak = $null
     try {
         if (Test-Path $ConfigPath) {
             $probe = Get-Content $ConfigPath -Raw -Encoding UTF8
@@ -1180,18 +1203,12 @@ function Invoke-Learn {
                 # overwrite the only copy of the schedule the user hand-wrote
                 $bak = Backup-File $ConfigPath
                 $c0 = $probe | ConvertFrom-Json
-                if ($c0.PSObject.Properties['proxy']) { $proxy = $c0.proxy }
             }
         }
     } catch { }
     $rulesOut = @()
     foreach ($k in $groups.Keys) { $rulesOut += [ordered]@{ days = @($groups[$k]); reset = [string]$k } }
-    $newConfig = [ordered]@{
-        _readme = 'days: Mon..Sun | reset = HH:mm target reset time (previous 5h window expiry); fire time auto = reset - 5h | edit then run: preheat apply'
-        proxy   = $proxy
-        rules   = $rulesOut
-    }
-    Write-Utf8NoBom $ConfigPath (ConvertTo-Json -InputObject $newConfig -Depth 6)
+    Write-Utf8NoBom $ConfigPath (ConvertTo-Json -InputObject (New-LearnedConfig $c0 $rulesOut) -Depth 8)
     Write-Host ''
     if ($bak) { Write-Host ('schedule.json written (previous copy saved as {0}) - applying:' -f (Split-Path $bak -Leaf)) }
     else { Write-Host 'schedule.json written - applying:' }

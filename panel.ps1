@@ -57,8 +57,8 @@ try { . $PreheatScript '__selftest__' 6>$null | Out-Null } catch { }
 # the dot-source also lands preheat.ps1's param variables in this scope, one of
 # them a [switch]-typed $Json - and PowerShell variable names are case-
 # insensitive, so any later top-level `$json = ...` would hit that type
-# constraint and throw. Drop them (and its $Command/$Arg) right away.
-Remove-Variable -Name Json, Command, Arg -Scope Script -ErrorAction SilentlyContinue
+# constraint and throw. Drop them (and its $Command/$Arg/$Job) right away.
+Remove-Variable -Name Json, Command, Arg, Job -Scope Script -ErrorAction SilentlyContinue
 
 # cache for the preheat-status read: it runs in-process, but each uncached
 # poll is still a Get-ScheduledTask + Get-ScheduledTaskInfo query, so keep a

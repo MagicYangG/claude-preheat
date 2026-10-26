@@ -503,7 +503,7 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         function Resolve-ClaudeExe { param([switch]$NoCache) $intClaude }
         # a broken stub must fail in seconds, not sit through 2 x 90s retry sleeps
         function Start-Sleep { param($Seconds, $Milliseconds) }
-        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake) $script:IntReg += @{ name = $Name; at = $At; nowake = [bool]$NoWake } }
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:IntReg += @{ name = $Name; at = $At; nowake = [bool]$NoWake; args = @($ScriptArgs) } }
         function Remove-StaleOnceJobs { }
         function Send-Toast { param($Ok, $Anchored, $Kind, $Extra) $script:IntToast = ('{0}|{1}|{2}|{3}' -f $Ok, $Anchored, $Kind, $Extra) }
         function Get-Proxy { $null }
@@ -528,6 +528,7 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $fire -and $fire.rec.ok -and ($fire.rec.anchored -eq $false) -and
             $once -and ([string]$once.rec.label -eq 'chase ratelimits') -and $at -and ([Math]::Abs(($at - $end.AddMinutes(2)).TotalSeconds) -lt 30) -and
             ($r.reg.Count -eq 1) -and ($r.reg[0].name -like 'ClaudePreheat-Once-*') -and $r.reg[0].nowake -and
+            (($r.reg[0].args -join ' ') -eq ('fire -Job ' + $r.reg[0].name)) -and
             ($r.toast -eq ('True|False|| - follow-up preheat at ' + $end.AddMinutes(2).ToString('HH:mm')))
     }
     Test-Case 'fire integration: a ping after 5h of quiet anchors a new window and books nothing' {
@@ -754,6 +755,52 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         } finally { $env:USERPROFILE = $prev }
     }
 
+    Test-Case 'learn auto keeps every other schedule.json key ("chase": false, proxy, other sections)' {
+        # regression: learn auto rebuilt the file from _readme/proxy/rules only
+        # and silently turned follow-ups back on
+        $c0 = '{"_readme":"old","proxy":"http://127.0.0.1:7890","chase":false,"extra":{"rules":[{"days":["Sun"],"reset":"15:00"}]},"rules":[]}' | ConvertFrom-Json
+        $out = New-LearnedConfig $c0 @([ordered]@{ days = @('Mon'); reset = '10:00' })
+        $j = ConvertTo-Json -InputObject $out -Depth 8 | ConvertFrom-Json
+        ($j.chase -eq $false) -and ($j.proxy -eq 'http://127.0.0.1:7890') -and
+            (@($j.extra.rules[0].days).Count -eq 1) -and ($j.extra.rules[0].days[0] -eq 'Sun') -and
+            (@($j.rules).Count -eq 1) -and ($j.rules[0].reset -eq '10:00') -and ($j._readme -eq 'old')
+    }
+    Test-Case 'learn auto with no schedule.json yet writes an empty proxy, the rules and a _readme that explains chase' {
+        $j = ConvertTo-Json -InputObject (New-LearnedConfig $null @([ordered]@{ days = @('Tue', 'Wed'); reset = '14:00' })) -Depth 8 | ConvertFrom-Json
+        ($j.proxy -eq '') -and (@($j.rules).Count -eq 1) -and (@($j.rules[0].days).Count -eq 2) -and
+            (-not $j.PSObject.Properties['chase']) -and ($j._readme -like '*chase: false*')
+    }
+
+    Write-Host '-- preheat: one-shots name themselves (-Job) --'
+    Test-Case 'a one-shot passes its own name as -Job, so a Windows fire can tell it is a follow-up' {
+        # a Windows task has no environment block; launchd sets CLAUDE_PREHEAT_SELF in the plist
+        $LogPath = Join-Path $Tmp 'once-job.jsonl'
+        $script:OnceReg = $null
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:OnceReg = @{ name = $Name; args = @($ScriptArgs) } }
+        Invoke-Once ((Get-Date).AddHours(2)) 'test' 6>$null
+        $r = $script:OnceReg
+        ($r.name -like 'ClaudePreheat-Once-*') -and ($r.args.Count -eq 3) -and
+            ($r.args[0] -eq 'fire') -and ($r.args[1] -eq '-Job') -and ($r.args[2] -eq $r.name)
+    }
+    Test-Case '-Job names the running job: only a ClaudePreheat-* name, never over an existing value' {
+        $prev = $env:CLAUDE_PREHEAT_SELF
+        $ps = Join-Path $Repo 'preheat.ps1'
+        try {
+            Remove-Item Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue
+            & { . $ps '__selftest__' -Job 'ClaudePreheat-Once-20990101-0000' 6>$null | Out-Null }
+            $a = $env:CLAUDE_PREHEAT_SELF
+            Remove-Item Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue
+            & { . $ps '__selftest__' -Job '..\..\not-a-job' 6>$null | Out-Null }
+            $b = $env:CLAUDE_PREHEAT_SELF
+            $env:CLAUDE_PREHEAT_SELF = 'ClaudePreheat-Wk-0400-Sat'
+            & { . $ps '__selftest__' -Job 'ClaudePreheat-Once-20990101-0000' 6>$null | Out-Null }
+            $c = $env:CLAUDE_PREHEAT_SELF
+            ($a -eq 'ClaudePreheat-Once-20990101-0000') -and (-not $b) -and ($c -eq 'ClaudePreheat-Wk-0400-Sat')
+        } finally {
+            if ($prev) { $env:CLAUDE_PREHEAT_SELF = $prev } else { Remove-Item Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue }
+        }
+    }
+
     Write-Host '-- preheat: journal rotation --'
     Test-Case 'a journal over 2MB is trimmed to the last 1000 lines + the new one' {
         $LogPath = Join-Path $Tmp 'rot.jsonl'   # shadows the real journal in this scope
@@ -802,6 +849,28 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
             ($xml -like '*<key>CLAUDE_PREHEAT_SELF</key><string>ClaudePreheat-Wk-0400-SatSun</string>*') -and
             ($xml -like '*com.claude-preheat.Wk-0400-SatSun*')
     }
+    Test-Case 'plist passes extra script args after fire, each its own <string> (default stays bare fire)' {
+        $x1 = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260824-1530' -Days @() -At ([datetime]::new(2026, 8, 24, 15, 30, 0)) `
+            -HostShell '/p' -ScriptPath '/s' -PathEnv '/b' -ScriptArgs @('fire', '-Job', 'ClaudePreheat-Once-20260824-1530')
+        $x0 = Build-LaunchdPlist -Name 'ClaudePreheat-Wk-0400-Sat' -Days @('Saturday') -At ([datetime]::new(2026, 1, 1, 4, 0, 0)) `
+            -HostShell '/p' -ScriptPath '/s' -PathEnv '/b'
+        ($x1 -match '<string>/s</string>\s*<string>fire</string>\s*<string>-Job</string>\s*<string>ClaudePreheat-Once-20260824-1530</string>\s*</array>') -and
+            ($x0 -match '<string>/s</string>\s*<string>fire</string>\s*</array>')
+    }
+    Test-Case 'task action line: default ends in "fire"; a one-shot appends "-Job" "<name>"' {
+        $a0 = Get-PreheatActionArgument 'C:\r\run-hidden.vbs' 'C:\pw\pwsh.exe' 'C:\r\preheat.ps1'
+        $a1 = Get-PreheatActionArgument 'C:\r\run-hidden.vbs' 'C:\pw\pwsh.exe' 'C:\r\preheat.ps1' @('fire', '-Job', 'ClaudePreheat-Once-20990101-0000')
+        ($a0 -eq '//B //Nologo "C:\r\run-hidden.vbs" "C:\pw\pwsh.exe" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "C:\r\preheat.ps1" "fire"') -and
+            ($a1 -like '* "-File" "C:\r\preheat.ps1" "fire" "-Job" "ClaudePreheat-Once-20990101-0000"')
+    }
+    Test-Case 'trigger boundary = local wall-clock time, no UTC offset, culture-proof (DST keeps 05:00 at 05:00)' {
+        $th = [System.Threading.Thread]::CurrentThread
+        $c0 = $th.CurrentCulture
+        try {
+            $th.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('fi-FI')
+            (Format-LocalBoundary ([datetime]::new(2026, 11, 1, 5, 0, 0))) -eq '2026-11-01T05:00:00'
+        } finally { $th.CurrentCulture = $c0 }
+    }
     Test-Case 'once plist: pins Month and Day (stale cleanup neutralizes the yearly repeat)' {
         $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260824-1530' -Days @() `
             -At ([datetime]::new(2026, 8, 24, 15, 30, 0)) -HostShell '/p' -ScriptPath '/s' -PathEnv '/b'
@@ -814,6 +883,78 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260101-0000' -Days @() `
             -At ([datetime]::new(2026, 1, 1, 0, 0, 0)) -HostShell '/a&b/pwsh' -ScriptPath '/s' -PathEnv '/x&y'
         ($xml -like '*/a&amp;b/pwsh*') -and ($xml -like '*/x&amp;y*') -and ($xml -notlike '*<string>/a&b/pwsh</string>*')
+    }
+
+    Write-Host '-- platform: real Task Scheduler (Windows only) --'
+    $winOnly = $true
+    try { if (($PSVersionTable.PSEdition -eq 'Core') -and (-not $IsWindows)) { $winOnly = $false } } catch { }
+    function Register-SelftestJob([string]$Kind, [datetime]$At) {
+        # NOT ClaudePreheat-*: apply / off / the one-shot sweep never see it, and
+        # it runs a harmless 'status' - a killed test run must not leave a weekly
+        # task behind that pings claude. -> task, or 'SKIP' where policy forbids
+        $n = 'zzPreheatSelftest-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        try {
+            if ($Kind -eq 'weekly') { Register-PreheatJob -Name $n -Days @($At.DayOfWeek.ToString()) -At $At -NoWake -ScriptArgs @('status') }
+            else { Register-PreheatJob -Name $n -At $At -NoWake -ScriptArgs @('status') }
+        } catch {
+            if ($_.Exception.Message -match 'denied|0x80070005') { return 'SKIP' }
+            throw
+        }
+        Get-ScheduledTask -TaskName $n
+    }
+    Test-Case 'Windows: a registered weekly task keeps an offset-less boundary and its local fire time' {
+        if (-not $winOnly) { return 'SKIP' }
+        $at = (Get-Date).Date.AddDays(1).AddHours(5)
+        $t = Register-SelftestJob 'weekly' $at
+        if ($t -eq 'SKIP') { return 'SKIP' }
+        try {
+            $sb   = [string]$t.Triggers[0].StartBoundary
+            $next = ($t | Get-ScheduledTaskInfo).NextRunTime
+            ($sb -eq (Format-LocalBoundary $at)) -and ($next -eq $at) -and ($t.Actions[0].Arguments -like '*"status"')
+        } finally { Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+    }
+    Test-Case 'Windows: a registered one-shot keeps an absolute instant (a chase is computed from a UTC end)' {
+        if (-not $winOnly) { return 'SKIP' }
+        $n0 = (Get-Date).AddHours(3)
+        $at = [datetime]::new($n0.Year, $n0.Month, $n0.Day, $n0.Hour, $n0.Minute, 0)
+        $t = Register-SelftestJob 'once' $at
+        if ($t -eq 'SKIP') { return 'SKIP' }
+        try {
+            $sb   = [string]$t.Triggers[0].StartBoundary
+            $next = ($t | Get-ScheduledTaskInfo).NextRunTime
+            ($sb -match '(Z|[+-]\d\d:\d\d)$') -and ($next -eq $at)
+        } finally { Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+    }
+    Test-Case 'Windows: the real task argument line binds fire and -Job through wscript + run-hidden.vbs' {
+        if (-not $winOnly) { return 'SKIP' }
+        # the dot-sourced -Job case above never crosses the vbs shim: this one
+        # runs the exact line a one-shot task runs, against a probe script with
+        # preheat.ps1's own parameter block
+        $probe = Join-Path $Tmp 'job-probe.ps1'
+        $out   = Join-Path $Tmp 'job-probe.txt'
+        Set-Content -Path $probe -Encoding ASCII -Value @(
+            'param([Parameter(Position = 0)][string]$Command, [Parameter(Position = 1)][string]$Arg, [switch]$Json, [string]$Job)',
+            ('Set-Content -Path ''{0}'' -Value (''cmd=['' + $Command + ''] arg=['' + $Arg + ''] job=['' + $Job + '']'') -Encoding ASCII' -f $out)
+        )
+        $line = Get-PreheatActionArgument (Join-Path $Repo 'run-hidden.vbs') (Get-Process -Id $PID).Path $probe @('fire', '-Job', 'ClaudePreheat-Once-20990101-0000')
+        $p = Start-Process -FilePath 'wscript.exe' -ArgumentList $line -PassThru -Wait
+        $null = $p.Handle
+        ($p.ExitCode -eq 0) -and ((Get-Content $out -Raw).Trim() -eq 'cmd=[fire] arg=[] job=[ClaudePreheat-Once-20990101-0000]')
+    }
+    Test-Case 'a wall-clock time skipped by the spring DST change moves to a registrable one' {
+        $z = $null
+        foreach ($id in @('Eastern Standard Time', 'America/New_York')) {
+            try { $z = [System.TimeZoneInfo]::FindSystemTimeZoneById($id); break } catch { }
+        }
+        if (-not $z) { return 'SKIP' }
+        $gap = [datetime]::new(2027, 3, 14, 2, 30, 0)
+        $ok  = [datetime]::new(2027, 3, 14, 4, 30, 0)
+        ((Get-RegistrableTime $gap $true $z) -eq $gap.AddDays(1)) -and
+            ((Get-RegistrableTime $gap $false $z) -eq $gap.AddHours(1)) -and
+            ((Get-RegistrableTime $ok $true $z) -eq $ok)
+    }
+    Test-Case 'Windows triggers are registered with an offset-less boundary (static guard)' {
+        (Get-Content (Join-Path $Repo 'platform.ps1') -Raw) -match '\$trigger\.StartBoundary\s*=\s*Format-LocalBoundary\s+\$At'
     }
 
     Write-Host '-- platform: host shell resolution (Store pwsh alias) --'
