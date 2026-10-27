@@ -180,6 +180,22 @@ function Restore-CxEnvSnapshot($s) {
         else { [Environment]::SetEnvironmentVariable($n, $s[$n]) }
     }
 }
+function Clear-TestProxy {
+    # the panel cases talk to a local test panel directly. A proxy left in this
+    # process (a Codex case points it at the dead 127.0.0.1:9) would carry even
+    # localhost on macOS - .NET bypasses loopback for an env proxy on Windows
+    # only - and .NET keeps the default proxy it built first, so reset that too
+    foreach ($n in @('HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy', 'ALL_PROXY', 'all_proxy')) {
+        $v = [Environment]::GetEnvironmentVariable($n)
+        if ($v) {
+            # name the value only when it is the suite's own dead proxy (a real one may carry credentials)
+            $shown = $(if ($v -eq 'http://127.0.0.1:9') { $v } else { 'from the environment' })
+            Write-Host ('  note: {0} was set ({1}); cleared for the panel cases' -f $n, $shown)
+            Remove-Item ('Env:' + $n) -ErrorAction SilentlyContinue
+        }
+    }
+    try { if ($PSVersionTable.PSEdition -eq 'Core') { [System.Net.Http.HttpClient]::DefaultProxy = [System.Net.WebProxy]::new() } } catch { }
+}
 function Read-JsonLines([string]$Path) {
     # every parseable record, oldest first
     $out = @()
@@ -1814,6 +1830,7 @@ try {
     $repoPanelLog = Join-Path $Repo 'panel-log.txt'
     $repoPanelLogLines = 0
     if (Test-Path $repoPanelLog) { $repoPanelLogLines = @(Get-Content $repoPanelLog -Encoding UTF8).Count }
+    Clear-TestProxy
     $env:PREHEAT_PANEL_LOG = Join-Path $Tmp 'panel-log.txt'
     $panelProc = Start-Process @spArgs
     Remove-Item Env:PREHEAT_PANEL_LOG -ErrorAction SilentlyContinue
@@ -2059,6 +2076,7 @@ try {
     if ($cxOnWin) { $spArgs.WindowStyle = 'Hidden' }
     $env:PREHEAT_PANEL_LOG = Join-Path $Tmp 'panel-cx-log.txt'
     Set-CodexStub @{ profile = 'free30d' }
+    Clear-TestProxy
     $cxPanelProc = Start-Process @spArgs
     Remove-Item Env:PREHEAT_PANEL_LOG -ErrorAction SilentlyContinue
     $cxBase = "http://localhost:$cxPanelPort"
