@@ -2152,6 +2152,8 @@ try {
             $after = [System.IO.File]::ReadAllText($sf)
             [System.IO.File]::WriteAllText($sf, $keep)
             ('{"pid":' + $PID + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $lk -Encoding UTF8
+            $probe = '$p = ''' + $lk + '''; $l = Get-Content $p -Raw | ConvertFrom-Json; $gp = Get-Process -Id ([int]$l.pid) -ErrorAction SilentlyContinue; $e = $null; try { $null = [System.Diagnostics.Process]::GetProcessById([int]$l.pid) } catch { $e = $_.Exception.Message }; ''child: pid={0} gp={1} gpbid_err={2} lwt={3:o} now={4:o} fresh={5}'' -f $l.pid, [bool]$gp, $e, (Get-Item $p).LastWriteTime, (Get-Date), ((Get-Item $p).LastWriteTime -gt (Get-Date).AddMinutes(-20))'
+            Write-Host ('  debug: ' + ((& $cxShell -NoProfile -Command $probe 2>&1) | Out-String).Trim())
             $b = Invoke-CxPost '/api/preheat/apply' '{"provider":"codex","rules":[{"days":["Fri"],"reset":"16:00"}]}'
         } finally {
             [System.IO.File]::WriteAllText($sf, $keep)
