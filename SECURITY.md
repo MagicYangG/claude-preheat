@@ -24,6 +24,11 @@ traffic it causes is:
 - the follow-up ping a scheduled preheat books for itself when it landed in
   a window that was already running (same command, at most one per window;
   `"chase": false` in `schedule.json` turns it off),
+- no Claude ping at all when Claude Code points at a third-party endpoint:
+  before each Claude fire, preheat reads only `env.ANTHROPIC_BASE_URL` from
+  `~/.claude/settings.json` / `settings.local.json` (and the same
+  environment variable), and journals only the host and which file it came
+  from — never the URL, a token or any other setting,
 - the Codex preheat (beta, only when `schedule.json` has a `codex`
   section): quota reads and a tiny `codex exec` ping through the Codex
   CLI or desktop app you already have — see the next section,

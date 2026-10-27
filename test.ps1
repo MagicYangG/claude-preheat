@@ -127,13 +127,19 @@ if (-not ((Test-Path -LiteralPath $cxStub -PathType Leaf) -and (Test-Path -Liter
     throw "stub codex was not set up in $cxDir"
 }
 $cxEnvPrev = @{}
-foreach ($n in @('PREHEAT_CODEX_EXE', 'STUB_CODEX_CONFIG', 'STUB_CODEX_SHELL', 'PREHEAT_CODEX_FORCE_PING')) {
+foreach ($n in @('PREHEAT_CODEX_EXE', 'STUB_CODEX_CONFIG', 'STUB_CODEX_SHELL', 'PREHEAT_CODEX_FORCE_PING', 'ANTHROPIC_BASE_URL', 'PREHEAT_CLAUDE_ANY_ENDPOINT', 'CLAUDE_CONFIG_DIR')) {
     $cxEnvPrev[$n] = [Environment]::GetEnvironmentVariable($n)
 }
 $env:PREHEAT_CODEX_EXE = $cxStub
 $env:STUB_CODEX_CONFIG = $cxConfig
 $env:STUB_CODEX_SHELL  = $cxShell
 Remove-Item Env:PREHEAT_CODEX_FORCE_PING -ErrorAction SilentlyContinue
+# the Claude third-party endpoint check stays off for the whole run (children
+# inherit it): no case reads this machine's ~/.claude/settings*.json. The
+# detector cases switch it back on against a temp home only.
+Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue
+Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+$env:PREHEAT_CLAUDE_ANY_ENDPOINT = '1'
 
 function Set-CodexStub([hashtable]$Over = @{}) {
     # fresh stub state for one case: config rewritten, calls log and the
@@ -577,6 +583,10 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
     if ($intOnWin) {
         $intClaude = Join-Path $intStub 'claude.cmd'
         Set-Content -Path $intClaude -Encoding ASCII -Value @(
+            '@if defined STUB_CALLS echo called>>"%STUB_CALLS%"',
+            '@echo %* | findstr /C:"--model haiku" >nul || exit /b 2',
+            '@echo %* | findstr /C:"--no-session-persistence" >nul || exit /b 2',
+            '@echo %* | findstr /C:"--mcp-config" >nul || exit /b 2',
             '@echo %* | findstr /C:"--output-format stream-json" >nul || exit /b 2',
             '@echo %* | findstr /C:"--verbose" >nul || exit /b 2',
             '@echo %* | findstr /C:"--strict-mcp-config" >nul || exit /b 2',
@@ -590,6 +600,7 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $intClaude = Join-Path $intStub 'claude'
         [System.IO.File]::WriteAllText($intClaude, (@(
             '#!/bin/bash',
+            'if [ -n "$STUB_CALLS" ]; then echo called >> "$STUB_CALLS"; fi',
             'args=" $* "',
             'for f in " -p " " --model haiku " " --no-session-persistence " " --strict-mcp-config " " --mcp-config " " --output-format stream-json " " --verbose "; do',
             '  case "$args" in *"$f"*) ;; *) echo "stub claude: missing$f in argv: $*" >&2; exit 2 ;; esac',
@@ -631,7 +642,7 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         # the job name a scheduled fire runs under (a one-shot chase, a weekly job...)
         $env:STUB_RL = $Rl; $env:STUB_RESULT = $Result; $env:CLAUDE_PREHEAT_SELF = $Self
         try { Invoke-Fire 6>$null } finally { Remove-Item Env:STUB_RL, Env:STUB_RESULT, Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue }
-        @{ journal = @(Get-JournalEvents $LogPath 50); reg = @($script:IntReg); toast = $script:IntToast }
+        @{ journal = @(Get-JournalEvents $LogPath 50); reg = @($script:IntReg); toast = $script:IntToast; path = $LogPath }
     }
     Test-Case 'fire integration: a ping inside a running window books ONE no-wake follow-up 2 minutes after the tap reset, journals it, and the toast says so' {
         # the daily rule fires 6h from now (reset = now + 11h): beyond the follow-up's own window (now + 32min + 5h)
@@ -740,6 +751,114 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
         $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
         $fire -and $fire.rec.ok -and (-not $fire.rec.PSObject.Properties['provider'])
+    }
+
+    Write-Host '-- preheat: Claude third-party endpoint (temp home; escape hatch off inside the case only) --'
+    function Invoke-WithClaudeHome([string]$Settings = '', [string]$Local = '', [string]$EnvUrl = '', [string]$Hatch = '', [string]$ConfigDir = '', [scriptblock]$Body) {
+        # runs $Body against a temp home whose .claude/settings.json and
+        # settings.local.json hold the given text, with ANTHROPIC_BASE_URL and
+        # PREHEAT_CLAUDE_ANY_ENDPOINT as given ('' = unset); all put back after
+        $tpHome = Join-Path $Tmp ('tp-home-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $tpDir = Join-Path $tpHome '.claude'
+        New-Item -ItemType Directory -Path $tpDir -Force | Out-Null
+        if ($Settings) { [System.IO.File]::WriteAllText((Join-Path $tpDir 'settings.json'), $Settings) }
+        if ($Local) { [System.IO.File]::WriteAllText((Join-Path $tpDir 'settings.local.json'), $Local) }
+        $tpPrev = @{}
+        foreach ($n in @('USERPROFILE', 'ANTHROPIC_BASE_URL', 'PREHEAT_CLAUDE_ANY_ENDPOINT', 'CLAUDE_CONFIG_DIR')) { $tpPrev[$n] = [Environment]::GetEnvironmentVariable($n) }
+        try {
+            $env:USERPROFILE = $tpHome
+            if ($EnvUrl) { $env:ANTHROPIC_BASE_URL = $EnvUrl } else { Remove-Item Env:ANTHROPIC_BASE_URL -ErrorAction SilentlyContinue }
+            if ($Hatch) { $env:PREHEAT_CLAUDE_ANY_ENDPOINT = $Hatch } else { Remove-Item Env:PREHEAT_CLAUDE_ANY_ENDPOINT -ErrorAction SilentlyContinue }
+            if ($ConfigDir) { $env:CLAUDE_CONFIG_DIR = $ConfigDir } else { Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
+            & $Body
+        } finally { Restore-CxEnvSnapshot $tpPrev }
+    }
+    function Get-TpEnvJson([string]$Url) { '{"env":{"ANTHROPIC_BASE_URL":' + (ConvertTo-Json -InputObject $Url) + '}}' }
+    Test-Case 'Test-AnthropicHost: anthropic.com and its subdomains only (case, trailing dot); look-alikes and other hosts are third-party' {
+        (Test-AnthropicHost 'api.anthropic.com') -and (Test-AnthropicHost 'anthropic.com') -and (Test-AnthropicHost 'API.Anthropic.com.') -and
+            (-not (Test-AnthropicHost 'evil-anthropic.com')) -and (-not (Test-AnthropicHost 'anthropic.com.evil.io')) -and
+            (-not (Test-AnthropicHost 'api.vendor-a.example')) -and (-not (Test-AnthropicHost ''))
+    }
+    Test-Case 'Get-ClaudeThirdPartyEndpoint: nothing set or an Anthropic URL -> null; a third-party env URL -> its host from env, nothing else returned' {
+        $none = Invoke-WithClaudeHome -Body { Get-ClaudeThirdPartyEndpoint }
+        $anth = Invoke-WithClaudeHome -EnvUrl 'https://api.anthropic.com' -Body { Get-ClaudeThirdPartyEndpoint }
+        $tpHit = Invoke-WithClaudeHome -EnvUrl 'https://api.vendor-a.example/anthropic' -Body { Get-ClaudeThirdPartyEndpoint }
+        $keys = @()
+        if ($tpHit -is [System.Collections.IDictionary]) { $keys = @($tpHit.Keys) } elseif ($tpHit) { $keys = @($tpHit.PSObject.Properties | ForEach-Object { $_.Name }) }
+        ($null -eq $none) -and ($null -eq $anth) -and $tpHit -and ($tpHit.host -eq 'api.vendor-a.example') -and ($tpHit.src -eq 'env') -and
+            ($keys.Count -eq 2) -and ($keys -contains 'host') -and ($keys -contains 'src')
+    }
+    Test-Case 'Get-ClaudeThirdPartyEndpoint: settings.local.json beats settings.json beats the process env' {
+        $s = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://api.vendor-b.example/api/anthropic') -Body { Get-ClaudeThirdPartyEndpoint }
+        $l = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://api.vendor-b.example/api/anthropic') -Local (Get-TpEnvJson 'https://api.vendor-a.example/anthropic') -EnvUrl 'https://env.example.net' -Body { Get-ClaudeThirdPartyEndpoint }
+        $e = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://gw.example.org') -EnvUrl 'https://env.example.net' -Body { Get-ClaudeThirdPartyEndpoint }
+        # settings that point at Anthropic win over a third-party shell variable too
+        $a = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://api.anthropic.com') -EnvUrl 'https://env.example.net' -Body { Get-ClaudeThirdPartyEndpoint }
+        $s -and ($s.host -eq 'api.vendor-b.example') -and ($s.src -eq 'settings.json') -and
+            $l -and ($l.host -eq 'api.vendor-a.example') -and ($l.src -eq 'settings.local.json') -and
+            $e -and ($e.host -eq 'gw.example.org') -and ($e.src -eq 'settings.json') -and ($null -eq $a)
+    }
+    Test-Case 'Get-ClaudeThirdPartyEndpoint: an unparseable value is third-party, a broken settings.json is skipped, the escape hatch turns it all off' {
+        $u = Invoke-WithClaudeHome -EnvUrl 'not a url' -Body { Get-ClaudeThirdPartyEndpoint }
+        $b = Invoke-WithClaudeHome -Settings '{"env": {"ANTHROPIC_BASE_URL": ' -EnvUrl 'https://api.vendor-a.example/anthropic' -Body { Get-ClaudeThirdPartyEndpoint }
+        $b0 = Invoke-WithClaudeHome -Settings '{"env": {"ANTHROPIC_BASE_URL": ' -Body { Get-ClaudeThirdPartyEndpoint }
+        $h = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://api.vendor-b.example/api/anthropic') -EnvUrl 'https://api.vendor-a.example' -Hatch '1' -Body { Get-ClaudeThirdPartyEndpoint }
+        $u -and ($u.host -eq '(unparseable)') -and $b -and ($b.src -eq 'env') -and ($null -eq $b0) -and ($null -eq $h)
+    }
+    Test-Case 'Get-ClaudeThirdPartyEndpoint: CLAUDE_CONFIG_DIR replaces ~/.claude as the settings folder' {
+        $cd = Join-Path $Tmp ('tp-cfgdir-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $cd -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $cd 'settings.json'), (Get-TpEnvJson 'https://api.vendor-a.example/anthropic'))
+        # the home's own settings point at Anthropic: only the relocated folder counts
+        $c = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://api.anthropic.com') -ConfigDir $cd -Body { Get-ClaudeThirdPartyEndpoint }
+        $n = Invoke-WithClaudeHome -Settings (Get-TpEnvJson 'https://api.anthropic.com') -Body { Get-ClaudeThirdPartyEndpoint }
+        $c -and ($c.host -eq 'api.vendor-a.example') -and ($c.src -eq 'settings.json') -and ($null -eq $n)
+    }
+    $tpSettings = '{"env":{"ANTHROPIC_BASE_URL":"https://user:zzpw@api.vendor-b.example/api/anthropic?k=zzq","ANTHROPIC_AUTH_TOKEN":"sk-zzsecret"}}'
+    $tpCfg = '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
+    $tpCalls = Join-Path $Tmp 'tp-stub-calls.txt'
+    Test-Case 'fire integration: a third-party endpoint - stub claude never run, one ok:false third-party record with the host only, no secret in the journal, one toast' {
+        Remove-Item $tpCalls -ErrorAction SilentlyContinue
+        $env:STUB_CALLS = $tpCalls
+        try {
+            $r = Invoke-WithClaudeHome -Settings $tpSettings -Body { Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } $tpCfg }
+        } finally { Remove-Item Env:STUB_CALLS -ErrorAction SilentlyContinue }
+        $fires = @($r.journal | Where-Object { $_.ev -eq 'fire' })
+        $raw = Get-Content $r.path -Raw -Encoding UTF8
+        if ($fires.Count -ne 1) { return ('fire records: ' + $fires.Count) }
+        $f = $fires[0].rec
+        (-not (Test-Path $tpCalls)) -and ($f.ok -eq $false) -and ([string]$f.kind -eq 'third-party') -and ([string]$f.state -eq 'third-party') -and
+            ([string]$f.endpoint -eq 'api.vendor-b.example') -and ([string]$f.endpoint_src -eq 'settings.json') -and
+            (-not $raw.Contains('zzpw')) -and (-not $raw.Contains('zzq')) -and (-not $raw.Contains('sk-zzsecret')) -and (-not $raw.Contains('https://')) -and
+            ($r.reg.Count -eq 0) -and ($r.toast -eq 'False||third-party|api.vendor-b.example')
+    }
+    Test-Case 'fire integration: a second third-party fire stays quiet (the previous Claude fire had the same kind); the escape hatch pings as before' {
+        $seed = '{"ev":"fire","ok":false,"kind":"third-party","state":"third-party","attempts":0,"pinged":false,"endpoint":"api.vendor-b.example","endpoint_src":"settings.json","ts":"' +
+            (Get-Date).AddHours(-5).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) + '"}'
+        $q = Invoke-WithClaudeHome -Settings $tpSettings -Body { Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } $tpCfg $seed }
+        Remove-Item $tpCalls -ErrorAction SilentlyContinue
+        $env:STUB_CALLS = $tpCalls
+        try {
+            $p = Invoke-WithClaudeHome -Settings $tpSettings -Hatch '1' -Body { Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } $tpCfg }
+        } finally { Remove-Item Env:STUB_CALLS -ErrorAction SilentlyContinue }
+        $qf = @($q.journal | Where-Object { ($_.ev -eq 'fire') -and ([string]$_.rec.kind -eq 'third-party') })
+        $pf = @($p.journal | Where-Object { $_.ev -eq 'fire' })
+        ($qf.Count -eq 2) -and ($q.toast -eq '') -and
+            (Test-Path $tpCalls) -and ($pf.Count -eq 1) -and $pf[0].rec.ok -and (-not $pf[0].rec.PSObject.Properties['endpoint'])
+    }
+    Test-Case 'status warns when Claude Code points at a third-party endpoint, and says nothing with the escape hatch' {
+        $LogPath = Join-Path $Tmp 'tp-status-none.jsonl'
+        $ConfigPath = New-Fixture 'tp-status-sched.json' @('{"rules":[]}')
+        function Get-LastLocalActivity { $null }
+        function Get-PreheatJobs { param([string]$Pattern) @() }
+        function Write-CodexStatusSummary { param($AllTasks) }
+        function Test-WakeTimers { }
+        function Get-ScheduledTask { }
+        function launchctl { }
+        $on = Invoke-WithClaudeHome -EnvUrl 'https://api.vendor-a.example/anthropic' -Body { Invoke-Status 6>&1 | Out-String }
+        $off = Invoke-WithClaudeHome -EnvUrl 'https://api.vendor-a.example/anthropic' -Hatch '1' -Body { Invoke-Status 6>&1 | Out-String }
+        ($on -match '! endpoint: Claude Code points at api\.vendor-a\.example \(from env\)') -and ($on -match 'PREHEAT_CLAUDE_ANY_ENDPOINT=1') -and
+            ($off -notmatch '! endpoint:')
     }
 
     Test-Case 'a white ping wires the chase, and a chase failure can never cost the toast' {
@@ -989,6 +1108,14 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
             ($xml -like '*<key>CLAUDE_PREHEAT_SELF</key><string>ClaudePreheat-Wk-0400-SatSun</string>*') -and
             ($xml -like '*com.claude-preheat.Wk-0400-SatSun*')
     }
+    Test-Case 'plist: -AnyEndpoint carries PREHEAT_CLAUDE_ANY_ENDPOINT=1 into the job; without it the env block is PATH + CLAUDE_PREHEAT_SELF only' {
+        $a = @{ Name = 'ClaudePreheat-Wk-0400-Sat'; Days = @('Saturday'); At = ([datetime]::new(2026, 1, 1, 4, 0, 0)); HostShell = '/usr/local/bin/pwsh'; ScriptPath = '/repo/preheat.ps1'; PathEnv = '/usr/bin' }
+        $on = Build-LaunchdPlist @a -AnyEndpoint
+        $off = Build-LaunchdPlist @a
+        $src = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+        ($on -like '*<key>CLAUDE_PREHEAT_SELF</key><string>ClaudePreheat-Wk-0400-Sat</string><key>PREHEAT_CLAUDE_ANY_ENDPOINT</key><string>1</string></dict>*') -and
+            ($off -notmatch 'PREHEAT_CLAUDE_ANY_ENDPOINT') -and $src.Contains("-AnyEndpoint:(`$env:PREHEAT_CLAUDE_ANY_ENDPOINT -eq '1')")
+    }
     Test-Case 'plist passes extra script args after fire, each its own <string> (default stays bare fire)' {
         $x1 = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260824-1530' -Days @() -At ([datetime]::new(2026, 8, 24, 15, 30, 0)) `
             -HostShell '/p' -ScriptPath '/s' -PathEnv '/b' -ScriptArgs @('fire', '-Job', 'ClaudePreheat-Once-20260824-1530')
@@ -1023,6 +1150,54 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $xml = Build-LaunchdPlist -Name 'ClaudePreheat-Once-20260101-0000' -Days @() `
             -At ([datetime]::new(2026, 1, 1, 0, 0, 0)) -HostShell '/a&b/pwsh' -ScriptPath '/s' -PathEnv '/x&y'
         ($xml -like '*/a&amp;b/pwsh*') -and ($xml -like '*/x&amp;y*') -and ($xml -notlike '*<string>/a&b/pwsh</string>*')
+    }
+
+    Write-Host '-- providers: the table, unknown names (pure) --'
+    Test-Case 'provider table: claude then codex, all 17 fields, Name = key, prefixes under ClaudePreheat- and clash-free, only claude untagged and top-level' {
+        $fields = @('Name', 'Label', 'WkPrefix', 'OncePrefix', 'LockFile', 'CacheFile', 'FirePit', 'ConfigKey', 'JournalTag', 'LongFire',
+            'Fire', 'Apply', 'Status', 'StatusJson', 'StatusSummary', 'Report', 'Learn')
+        # claude and codex first, in that order; a later row appends
+        $ok = (((Get-ProviderNames) -join ',') -like 'claude,codex*')
+        $untagged = @(); $topLevel = @(); $prefixes = @()
+        foreach ($k in $ProviderTable.Keys) {
+            $s = $ProviderTable[$k]
+            foreach ($f in $fields) { if (-not $s.ContainsKey($f)) { $ok = $false } }
+            if ($s.Count -ne $fields.Count) { $ok = $false }
+            if ($s.Name -cne $k) { $ok = $false }
+            foreach ($p in @($s.WkPrefix, $s.OncePrefix)) {
+                if (-not ([string]$p).StartsWith($JobNamePrefix)) { $ok = $false }
+                $prefixes += ([string]$p + '-')
+            }
+            if ($null -eq $s.JournalTag) { $untagged += $k }
+            if ($null -eq $s.ConfigKey) { $topLevel += $k }
+        }
+        foreach ($a in $prefixes) { foreach ($b in $prefixes) { if (($a -ne $b) -and $a.StartsWith($b)) { $ok = $false } } }
+        $ok -and (($untagged -join ',') -eq 'claude') -and (($topLevel -join ',') -eq 'claude')
+    }
+    Test-Case 'an unknown provider name throws at every way in (never silently Claude); a known one resolves case-insensitively' {
+        $script:UnkReg = $null
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:UnkReg = $Name }
+        function Get-ScheduledTask { }
+        function Unregister-ScheduledTask { throw 'test: the real Unregister-ScheduledTask was reached' }
+        function launchctl { }
+        $LogPath = Join-Path $Tmp 'unknown-provider.jsonl'
+        Remove-Item $LogPath -ErrorAction SilentlyContinue
+        $thrown = 0
+        $ways = @(
+            { Get-ProviderSpec 'zznope' }, { Get-ProviderSpec '' }, { Get-ProviderSet 'zznope' },
+            { Get-ProviderConfig ([pscustomobject]@{ rules = @() }) 'zznope' }, { Test-LineProvider 'x' 'zznope' },
+            { Remove-StaleOnceJobs 'zznope' }, { Invoke-Once ((Get-Date).AddHours(2)) 'test' -Provider 'zznope' 6>$null })
+        foreach ($w in $ways) { try { $null = & $w } catch { $thrown++ } }
+        $msg = ''
+        try { Get-ProviderSpec 'zznope' } catch { $msg = $_.Exception.Message }
+        ($thrown -eq $ways.Count) -and ($null -eq $script:UnkReg) -and (-not (Test-Path $LogPath)) -and
+            ($msg -like '*zznope*claude, codex*') -and ((Get-ProviderSpec 'CODEX').Name -eq 'codex') -and
+            (@(Get-ProviderSet 'all').Count -eq @(Get-ProviderNames).Count) -and (@(Get-ProviderSet '').Count -eq @(Get-ProviderNames).Count)
+    }
+    Test-Case 'a name of no known shape belongs to no provider (null, never Claude), and has no next run' {
+        ($null -eq (Get-JobProvider 'SomethingElse')) -and ($null -eq (Get-JobProvider 'ClaudePreheat-Bogus-1')) -and
+            ($null -eq (Get-JobNextRun 'ClaudePreheat-Bogus-1')) -and (-not (Test-OnceJobName 'ClaudePreheat-Bogus-1')) -and
+            (Test-OnceJobName 'ClaudePreheat-Once-20261231-1530') -and (Test-OnceJobName 'ClaudePreheat-Codex-Once-20261231-1530')
     }
 
     Write-Host '-- platform: real Task Scheduler (Windows only) --'
@@ -1781,7 +1956,8 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $script:LRemove = @()
         Invoke-Off 6>$null
         ($m1 -like '*running right now*') -and ($m2 -like '*running right now*') -and ($m3 -like '*running right now*') -and ($blocked -eq 0) -and
-            (-not $m4) -and ($codexOnly.Count -eq 1) -and ($codexOnly[0] -eq 'ClaudePreheat-Codex-*') -and ($script:LRemove -contains 'ClaudePreheat*')
+            (-not $m4) -and ($codexOnly.Count -eq 2) -and ($codexOnly -contains 'ClaudePreheat-Codex-Wk*') -and ($codexOnly -contains 'ClaudePreheat-Codex-Once*') -and
+            ($script:LRemove -contains 'ClaudePreheat*')
     }
     Test-Case 'the one-shot sweep covers Codex one-shots on macOS: spent plist booted out, pending and running kept, orphan Codex label swept, scoped by provider' {
         $OnMac = $true
@@ -1816,6 +1992,238 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
             (-not (Test-Path (Join-Path $LaunchAgentDir 'com.claude-preheat.Once-20200101-0000.plist'))) -and
             (@($script:Boot | Where-Object { $_ -like '*com.claude-preheat.Codex-Once-20200102-0000' }).Count -ge 1) -and
             (@($script:Boot | Where-Object { $_ -like '*Codex-Once-20991231-2300' }).Count -eq 0)
+    }
+
+    Write-Host '-- providers: a fake row (zzfake) goes through every table-driven path --'
+    # the table-driven paths, tested: one row added to the table inside this
+    # process, every generic path driven through it, the row removed at the end.
+    # Expected names are spelled out, never read back from the table.
+    $script:ZzCalls = @()
+    $script:ZzThrow = $false
+    function Invoke-ZzfakeApply($config) { $script:ZzCalls += 'zzfake'; if ($script:ZzThrow) { throw 'boom' } }
+    function Invoke-ZzfakeFire { $script:ZzCalls += 'fire' }
+    function Invoke-ZzfakeStatus { $script:ZzCalls += 'status' }
+    $zzOff = @{
+        claude = @('ClaudePreheat-Wk*', 'ClaudePreheat-Once*')
+        codex  = @('ClaudePreheat-Codex-Wk*', 'ClaudePreheat-Codex-Once*')
+        zzfake = @('ClaudePreheat-Zzfake-Wk*', 'ClaudePreheat-Zzfake-Once*')
+    }
+    $zzBefore = (Get-ProviderNames) -join ','
+    $ProviderTable['zzfake'] = @{
+        Name = 'zzfake'; Label = 'Zzfake'; WkPrefix = 'ClaudePreheat-Zzfake-Wk'; OncePrefix = 'ClaudePreheat-Zzfake-Once'
+        LockFile = '.fire-zzfake.lock'; CacheFile = 'state-ratelimits-zzfake.json'; FirePit = 'firepit-zzfake'
+        ConfigKey = 'zzfake'; JournalTag = 'zzfake'; LongFire = $false
+        Fire = 'Invoke-ZzfakeFire'; Apply = 'Invoke-ZzfakeApply'; Status = 'Invoke-ZzfakeStatus'; StatusJson = 'Invoke-ZzfakeStatus'
+        StatusSummary = $null; Report = $null; Learn = $null
+    }
+    try {
+        Test-Case 'zzfake names: their own provider (longest prefix wins), generic next-run / spent / launchd decode, claude and codex names unchanged' {
+            $now = & $D '2026-09-13 15:00'
+            $n = Get-JobNextRun 'ClaudePreheat-Zzfake-Wk-0745-TueWedThu'
+            $jobs = @(@{ name = 'ClaudePreheat-Wk-0400-Mon' }, @{ name = 'ClaudePreheat-Codex-Wk-0400-Mon' }, @{ name = 'ClaudePreheat-Zzfake-Wk-0400-Mon' }, @{ name = 'ClaudePreheat-Zzfake-Once-20261231-1530' })
+            $names = { param($p) (@(Get-ProviderJobs $p $jobs) | ForEach-Object { $_.name }) -join ',' }
+            ((Get-JobProvider 'ClaudePreheat-Zzfake-Wk-0400-Mon') -eq 'zzfake') -and ((Get-JobProvider 'ClaudePreheat-Zzfake-Once-20261231-1530') -eq 'zzfake') -and
+                ((Get-JobProvider 'ClaudePreheat-Codex-Wk-0400-Mon') -eq 'codex') -and ((Get-JobProvider 'ClaudePreheat-Once-20261231-1530') -eq 'claude') -and
+                ((Get-JobNextRun 'ClaudePreheat-Zzfake-Once-20261231-1530') -eq ([datetime]::new(2026, 12, 31, 15, 30, 0))) -and
+                $n -and ($n.Hour -eq 7) -and ($n.Minute -eq 45) -and
+                (Test-OnceJobName 'ClaudePreheat-Zzfake-Once-20261231-1530') -and (-not (Test-OnceJobName 'ClaudePreheat-Zzfake-Wk-0400-Mon')) -and
+                (Test-SpentOnce @{ name = 'ClaudePreheat-Zzfake-Once-20260913-1400'; next = $null } $now) -and
+                (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Zzfake-Wk-0330-MonTue'; next = $null } $now)) -and
+                ((ConvertFrom-LaunchdLabel (ConvertTo-LaunchdLabel 'ClaudePreheat-Zzfake-Once-20261231-1530')) -eq 'ClaudePreheat-Zzfake-Once-20261231-1530') -and
+                ((& $names 'zzfake') -eq 'ClaudePreheat-Zzfake-Wk-0400-Mon,ClaudePreheat-Zzfake-Once-20261231-1530') -and
+                ((& $names 'claude') -eq 'ClaudePreheat-Wk-0400-Mon') -and ((& $names 'codex') -eq 'ClaudePreheat-Codex-Wk-0400-Mon')
+        }
+        Test-Case 'zzfake config: its own section, null when absent; the Claude top level and the Codex section unchanged' {
+            $c = '{"rules":[{"days":["Mon"],"reset":"08:40"}],"codex":{"rules":[{"days":["Tue"],"reset":"15:00"}]},"zzfake":{"rules":[{"days":["Wed"],"reset":"12:00"}],"chase":false}}' | ConvertFrom-Json
+            $c0 = '{"rules":[{"days":["Mon"],"reset":"08:40"}],"codex":{"rules":[]}}' | ConvertFrom-Json
+            $z = Get-ProviderConfig $c 'zzfake'
+            $z -and ($z.rules[0].days[0] -eq 'Wed') -and ($z.chase -eq $false) -and ($null -eq (Get-ProviderConfig $c0 'zzfake')) -and
+                ((Get-ProviderConfig $c 'claude').rules[0].days[0] -eq 'Mon') -and ((Get-ProviderConfig $c 'codex').rules[0].days[0] -eq 'Tue')
+        }
+        Test-Case 'zzfake journal: every reader returns only its own records, same-minute chase bookings never cross providers, Claude and Codex read as without zzfake' {
+            $st = & $cxStamp '2026-09-12 15:00'
+            $tagged = { param($t, $line) if ($t) { '{"provider":"' + $t + '",' + $line.Substring(1) } else { $line } }
+            $fire = { param($t) & $tagged $t ('{"ev":"fire","ok":true,"anchored":false,"attempts":1,"ts":"' + $st + '"}') }
+            $chase = { param($t, $at) & $tagged $t ('{"ev":"schedule-once","fireAt":"' + $at + '","label":"chase ratelimits","ts":"' + $st + '"}') }
+            $plain = @((& $fire $null), (& $fire 'codex'), (& $chase $null '2026-09-12T16:39:00'), (& $chase 'codex' '2026-09-12T16:32:00'))
+            # each booking is the newer line after ALL three fires: pairing must filter first
+            $mixed = @($plain[0], $plain[1], (& $fire 'zzfake'), $plain[2], $plain[3], (& $chase 'zzfake' '2026-09-12T16:45:00'))
+            $jm = Join-Path $Tmp 'zz-journal-mixed.jsonl'
+            $jp = Join-Path $Tmp 'zz-journal-plain.jsonl'
+            $mixed | Set-Content -Path $jm -Encoding UTF8
+            $plain | Set-Content -Path $jp -Encoding UTF8
+            $want = @{ claude = '2026-09-12 16:39'; codex = '2026-09-12 16:32'; zzfake = '2026-09-12 16:45' }
+            $ok = (@(Get-FireEvents $jm 60 -Provider 'all').Count -eq 3)
+            foreach ($p in 'claude', 'codex', 'zzfake') {
+                $fe = @(Get-FireEvents $jm 60 -Provider $p)
+                $je = @(Get-JournalEvents $jm 50 -Provider $p)
+                if (($fe.Count -ne 1) -or ($fe[0].provider -ne $p) -or ($fe[0].chase_at -ne $want[$p])) { $ok = $false }
+                if (($je.Count -ne 2) -or (@($je | Where-Object { (Get-RecordProvider $_.rec) -ne $p }).Count -gt 0)) { $ok = $false }
+                if ($p -ne 'zzfake') {
+                    $a = ConvertTo-Json -InputObject @(Get-FireEvents $jm 60 -Provider $p) -Depth 4 -Compress
+                    $b = ConvertTo-Json -InputObject @(Get-FireEvents $jp 60 -Provider $p) -Depth 4 -Compress
+                    if ($a -ne $b) { $ok = $false }
+                }
+            }
+            $ok
+        }
+        Test-Case 'zzfake one-shot sweep (macOS doubles): only its own spent plist and orphan label; claude and codex sweeps never touch it, all does' {
+            $OnMac = $true
+            $LaunchAgentDir = Join-Path $Tmp 'zz-sweep-la'
+            New-Item -ItemType Directory -Path $LaunchAgentDir -Force | Out-Null
+            $mk = { param($n) Set-Content -Path (Join-Path $LaunchAgentDir ('com.claude-preheat.' + $n + '.plist')) -Value '<plist/>' -Encoding ASCII }
+            $has = { param($n) Test-Path (Join-Path $LaunchAgentDir ('com.claude-preheat.' + $n + '.plist')) }
+            foreach ($n in @('Once-20200101-0000', 'Codex-Once-20200101-0000', 'Zzfake-Once-20200101-0000', 'Zzfake-Once-20991231-2300')) { & $mk $n }
+            $script:Boot = @()
+            function Get-MacUid { '501' }
+            function launchctl {
+                if (($args[0] -eq 'print') -and ([string]$args[1] -eq 'gui/501')) {
+                    return 'services = { com.claude-preheat.Once-20200102-0000 com.claude-preheat.Codex-Once-20200102-0000 com.claude-preheat.Zzfake-Once-20200102-0000 }'
+                }
+                if ($args[0] -eq 'print') { return '' }
+                if ($args[0] -eq 'bootout') { $script:Boot += [string]$args[1] }
+            }
+            function Unregister-ScheduledTask { throw 'test: the real Unregister-ScheduledTask was reached' }
+            function Get-ScheduledTask { }
+            $snapS = Get-CxEnvSnapshot
+            try {
+                Remove-Item Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue
+                Remove-StaleOnceJobs 'zzfake'
+                $zzBoot = @($script:Boot)
+                $zzOk = (-not (& $has 'Zzfake-Once-20200101-0000')) -and (& $has 'Zzfake-Once-20991231-2300') -and
+                    (& $has 'Once-20200101-0000') -and (& $has 'Codex-Once-20200101-0000') -and
+                    (@($zzBoot | Where-Object { $_ -like '*com.claude-preheat.Zzfake-Once-20200102-0000' }).Count -ge 1) -and
+                    (@($zzBoot | Where-Object { $_ -notlike '*Zzfake-*' }).Count -eq 0)
+                & $mk 'Zzfake-Once-20200101-0000'
+                $script:Boot = @()
+                Remove-StaleOnceJobs 'claude'
+                Remove-StaleOnceJobs 'codex'
+                $otherOk = (& $has 'Zzfake-Once-20200101-0000') -and (-not (& $has 'Once-20200101-0000')) -and (-not (& $has 'Codex-Once-20200101-0000')) -and
+                    (@($script:Boot | Where-Object { $_ -like '*Zzfake-*' }).Count -eq 0)
+                Remove-StaleOnceJobs 'all'
+                $allOk = (-not (& $has 'Zzfake-Once-20200101-0000')) -and (& $has 'Zzfake-Once-20991231-2300')
+            } finally { Restore-CxEnvSnapshot $snapS }
+            $zzOk -and $otherOk -and $allOk
+        }
+        Test-Case 'Invoke-Once for claude, codex and zzfake: own name, its own fire args (-Provider only off Claude), journal tagged only off Claude' {
+            function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:OnceReg = @{ name = $Name; args = @($ScriptArgs) } }
+            $want = @{
+                claude = @('ClaudePreheat-Once-', 'fire -Job ')
+                codex  = @('ClaudePreheat-Codex-Once-', 'fire -Provider codex -Job ')
+                zzfake = @('ClaudePreheat-Zzfake-Once-', 'fire -Provider zzfake -Job ')
+            }
+            $ok = $true
+            foreach ($p in 'claude', 'codex', 'zzfake') {
+                $LogPath = Join-Path $Tmp ('zz-once-' + $p + '.jsonl')
+                Remove-Item $LogPath -ErrorAction SilentlyContinue
+                $script:OnceReg = $null
+                Invoke-Once ((Get-Date).AddHours(2)) 'test' -Provider $p 6>$null
+                $r = $script:OnceReg
+                $rec = @(Read-JsonLines $LogPath | Where-Object { $_.ev -eq 'schedule-once' })
+                $tag = $null
+                if (($rec.Count -eq 1) -and (Test-Prop $rec[0] 'provider')) { $tag = [string]$rec[0].provider }
+                $wantTag = $null
+                if ($p -ne 'claude') { $wantTag = $p }
+                if (-not ($r -and $r.name.StartsWith($want[$p][0]) -and (($r.args -join ' ') -eq ($want[$p][1] + $r.name)) -and ($rec.Count -eq 1) -and ($tag -eq $wantTag))) { $ok = $false }
+            }
+            $ok
+        }
+        Test-Case 'off -Provider <p> for claude, codex and zzfake: exactly that provider''s Wk* and Once*, its own lock only, an off record with its name' {
+            $Root = Join-Path $Tmp 'zz-off-root'
+            New-Item -ItemType Directory -Path $Root -Force | Out-Null
+            $FireLock = Join-Path $Root 'claude.lock'
+            $CodexFireLock = Join-Path $Root 'codex.lock'
+            $LogPath = Join-Path $Tmp 'zz-off.jsonl'
+            Remove-Item $LogPath -ErrorAction SilentlyContinue
+            $script:LRemove = @()
+            function Start-Sleep { param($Seconds, $Milliseconds) }
+            function Remove-PreheatJobs { param([string]$Pattern) $script:LRemove += $Pattern }
+            function Unregister-ScheduledTask { throw 'test: the real Unregister-ScheduledTask was reached' }
+            function Get-ScheduledTask { }
+            function launchctl { throw 'test: the real launchctl was reached' }
+            $ok = $true
+            foreach ($p in 'claude', 'codex', 'zzfake') {
+                $script:LRemove = @()
+                Invoke-Off -Provider $p 6>$null
+                if ((@($script:LRemove) -join ',') -ne ($zzOff[$p] -join ',')) { $ok = $false }
+            }
+            # a live zzfake fire holds up zzfake off, and nothing else
+            $zl = Join-Path $Root '.fire-zzfake.lock'
+            ('{"pid":' + $PID + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $zl -Encoding UTF8
+            $script:LRemove = @()
+            $m = ''
+            try { Invoke-Off -Provider 'zzfake' 6>$null } catch { $m = $_.Exception.Message }
+            $blocked = $script:LRemove.Count
+            Invoke-Off -Provider 'codex' 6>$null
+            $codexRan = ($script:LRemove.Count -eq 2)
+            Remove-Item $zl -Force -ErrorAction SilentlyContinue
+            $offs = @(Read-JsonLines $LogPath | Where-Object { $_.ev -eq 'off' } | ForEach-Object { [string]$_.provider })
+            $ok -and ($m -like '*running right now*') -and ($blocked -eq 0) -and $codexRan -and (($offs -join ',') -eq 'claude,codex,zzfake,codex')
+        }
+        Test-Case 'apply -Provider zzfake calls only its Apply; apply all runs claude, codex, zzfake in table order; a throwing zzfake reads "zzfake: <msg>" and stops nobody' {
+            $Root = Join-Path $Tmp 'zz-apply-root'
+            New-Item -ItemType Directory -Path $Root -Force | Out-Null
+            $FireLock = Join-Path $Root 'claude.lock'
+            $CodexFireLock = Join-Path $Root 'codex.lock'
+            $ConfigPath = New-Fixture 'zz-apply.json' @('{"rules":[],"zzfake":{"rules":[]}}')
+            $LogPath = Join-Path $Tmp 'zz-apply.jsonl'
+            function Invoke-ClaudeApply($config) { $script:ZzCalls += 'claude' }
+            function Invoke-CodexApply($config) { $script:ZzCalls += 'codex' }
+            function Test-WakeTimers { }
+            function Start-Sleep { param($Seconds, $Milliseconds) }
+            $script:ZzThrow = $false
+            $script:ZzCalls = @()
+            Invoke-Apply 'zzfake' 6>$null
+            $one = $script:ZzCalls -join ','
+            $script:ZzCalls = @()
+            Invoke-Apply 'all' 6>$null
+            $all = $script:ZzCalls -join ','
+            $script:ZzCalls = @()
+            $script:ZzThrow = $true
+            $err = ''
+            try { Invoke-Apply 'all' 6>$null } catch { $err = $_.Exception.Message } finally { $script:ZzThrow = $false }
+            ($one -eq 'zzfake') -and ($all -eq 'claude,codex,zzfake') -and (($script:ZzCalls -join ',') -eq 'claude,codex,zzfake') -and ($err -like '*zzfake: boom*')
+        }
+        Test-Case 'status -Json with zzfake: a zzfake key (configured, its own tasks); the codex key and the claude/codex task tags unchanged' {
+            function Get-LastLocalActivity { $null }
+            function Get-PreheatJobs {
+                param([string]$Pattern)
+                @(@{ name = 'ClaudePreheat-Wk-0400-Mon'; next = $null }, @{ name = 'ClaudePreheat-Codex-Wk-0500-Tue'; next = $null }, @{ name = 'ClaudePreheat-Zzfake-Wk-0600-Wed'; next = $null })
+            }
+            function Read-Config { '{"rules":[],"codex":{"rules":[]},"zzfake":{"rules":[]}}' | ConvertFrom-Json }
+            $j = Invoke-StatusJson | ConvertFrom-Json
+            $prov = @{}
+            foreach ($t in @($j.tasks)) { $prov[[string]$t.name] = [string]$t.provider }
+            $j.zzfake -and ($j.zzfake.configured -eq $true) -and (@($j.zzfake.tasks).Count -eq 1) -and (@($j.zzfake.tasks)[0].name -eq 'ClaudePreheat-Zzfake-Wk-0600-Wed') -and
+                $j.codex -and ($j.codex.configured -eq $true) -and (@($j.codex.tasks).Count -eq 1) -and (@($j.codex.tasks)[0].name -eq 'ClaudePreheat-Codex-Wk-0500-Tue') -and
+                ($prov['ClaudePreheat-Wk-0400-Mon'] -eq 'claude') -and ($prov['ClaudePreheat-Codex-Wk-0500-Tue'] -eq 'codex') -and
+                ($prov['ClaudePreheat-Zzfake-Wk-0600-Wed'] -eq 'zzfake') -and ($null -eq $j.PSObject.Properties['claude'])
+        }
+        Test-Case 'zzfake with LongFire and a StatusSummary: its own lock path and wait banner, its summary block in status, its task never in the Claude list' {
+            $ProviderTable['zzfake'].LongFire = $true
+            $ProviderTable['zzfake'].StatusSummary = 'Write-ZzfakeStatusSummary'
+            function Write-ZzfakeStatusSummary($AllTasks) { Write-Host ('ZZSUM ' + ((@(Get-ProviderJobs 'zzfake' $AllTasks) | ForEach-Object { $_.name }) -join ',')) }
+            function Get-LastLocalActivity { $null }
+            function Get-PreheatJobs { param([string]$Pattern) @(@{ name = 'ClaudePreheat-Wk-0400-Mon'; next = $null }, @{ name = 'ClaudePreheat-Zzfake-Wk-0600-Wed'; next = $null }) }
+            function Write-CodexStatusSummary { param($AllTasks) }
+            function Test-WakeTimers { }
+            $ConfigPath = New-Fixture 'zz-status-sched.json' @('{"rules":[]}')
+            $Root = $Tmp
+            $lp = Get-ProviderLockPath 'zzfake'
+            # a fresh lock held by this live process: the banner names Zzfake, then the short wait gives up
+            [System.IO.File]::WriteAllText($lp, ('{"pid":' + $PID + ',"job":"zz"}'))
+            $w = & { try { Wait-FireLock -Path $lp -MaxSec 3 -LivePidOnly -Label (Get-ProviderSpec 'zzfake').Label } catch { 'THROWN' } } 6>&1 | Out-String
+            Remove-Item $lp -Force -ErrorAction SilentlyContinue
+            $s = Invoke-Status 6>&1 | Out-String
+            $claudeBlock = $s.Substring(0, [Math]::Max(0, $s.IndexOf('ZZSUM')))
+            ($lp -eq (Join-Path $Tmp '.fire-zzfake.lock')) -and ($w -match 'waiting for the running Zzfake fire') -and ($w -match 'THROWN') -and
+                ($s -match 'ZZSUM ClaudePreheat-Zzfake-Wk-0600-Wed') -and ($claudeBlock -notmatch 'Zzfake-Wk') -and ($claudeBlock -match 'Wk-0400-Mon')
+        }
+    } finally {
+        $ProviderTable.Remove('zzfake')
+    }
+    Test-Case 'the zzfake row is gone again: the table is what it was before' {
+        (((Get-ProviderNames) -join ',') -eq $zzBefore) -and ($null -eq (Get-JobProvider 'ClaudePreheat-Zzfake-Wk-0400-Mon'))
     }
 }
 
@@ -1877,6 +2285,22 @@ try {
     Test-Case 'GET /api/status shapes {preheat:{tasks}}' {
         $s = (Invoke-WebRequest -Uri "$base/api/status" -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json
         ($null -ne $s.preheat) -and ($s.preheat.PSObject.Properties['tasks'])
+    }
+    Test-Case 'GET /api/status lists the providers from the table: name, label and both task prefixes, in table order' {
+        $s = (Invoke-WebRequest -Uri "$base/api/status" -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json
+        $p = @($s.providers)
+        $row = { param($o) '{0}|{1}|{2}|{3}' -f $o.name, $o.label, $o.wkPrefix, $o.oncePrefix }
+        ($p.Count -ge 2) -and ((& $row $p[0]) -eq 'claude|Claude|ClaudePreheat-Wk|ClaudePreheat-Once') -and
+            ((& $row $p[1]) -eq 'codex|Codex|ClaudePreheat-Codex-Wk|ClaudePreheat-Codex-Once')
+    }
+    Test-Case 'an unknown ?provider= is a 400 that names the known providers' {
+        $code = 0; $body = ''
+        try { $null = Invoke-WebRequest -Uri "$base/api/schedule?provider=zznope" -UseBasicParsing -TimeoutSec 15 }
+        catch {
+            if ($_.Exception.Response) { $code = $_.Exception.Response.StatusCode.value__ }
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $body = $_.ErrorDetails.Message }
+        }
+        ($code -eq 400) -and ($body -like '*provider must be claude*codex*')
     }
     Test-Case 'GET /api/schedule returns the rules, an mtime, and no proxy' {
         # mtime is the optimistic lock the apply button hands back; the proxy
@@ -1982,7 +2406,9 @@ Write-Host ''
 Write-Host '-- codex: CLI + panel in a throwaway preheat root (stub codex) --'
 $cxRoot = Join-Path $Tmp 'cxroot'
 New-Item -ItemType Directory -Path (Join-Path $cxRoot 'web') -Force | Out-Null
-foreach ($f in @('panel.ps1', 'platform.ps1', 'codex.ps1', 'mcp-empty.json', 'run-hidden.vbs')) {
+# every product script by glob (a new adapter is dot-sourced by preheat.ps1), plus the two data files
+$cxCopy = @(Get-ChildItem -Path $Repo -Filter '*.ps1' -File | Where-Object { ($_.Name -ne 'test.ps1') -and ($_.Name -ne 'preheat.ps1') } | ForEach-Object { $_.Name })
+foreach ($f in ($cxCopy + @('mcp-empty.json', 'run-hidden.vbs'))) {
     if (Test-Path (Join-Path $Repo $f)) { Copy-Item (Join-Path $Repo $f) $cxRoot -Force }
 }
 Copy-Item (Join-Path $Repo (Join-Path 'web' 'index.html')) (Join-Path $cxRoot 'web') -Force
@@ -2066,6 +2492,14 @@ Test-Case 'report without -Codex prints a usage hint; learn -Codex says Claude-o
     $b = Invoke-CxCli @('status', '-Provider', 'gemini')
     ($r.out -match 'report -Codex') -and ($l.code -eq 0) -and ($l.out -match 'Claude-only') -and
         (($b.code -ne 0) -or ($b.out -match 'usage'))
+}
+Test-Case 'CLI: an unknown -Provider is a usage error naming every known provider; -Codex with -Provider claude still conflicts' {
+    $b = Invoke-CxCli @('status', '-Provider', 'zznope')
+    $c = Invoke-CxCli @('status', '-Codex', '-Provider', 'claude')
+    # the error text may be colored and wrapped at any column: compare with no colors and no whitespace
+    $flat = { param($t) ([string]$t -replace "$([char]27)\[[0-9;]*m", '') -replace '\s', '' }
+    ($b.code -ne 0) -and (& $flat $b.out).Contains('usage:-Providerclaude|codex|') -and (& $flat $b.out).Contains('|all(got:zznope)') -and
+        ($c.code -ne 0) -and (& $flat $c.out).Contains('usage:-Codexconflictswith-Providerclaude')
 }
 Test-Case 'status / status -Json with a codex section: a codex block, every task tagged with its provider, lastActivity kept' {
     $s = Invoke-CxCli @('status')
@@ -2176,12 +2610,12 @@ try {
         }
         ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
     }
-    Test-Case 'POST once with provider codex hands -Codex to the backend' {
+    Test-Case 'POST once with provider codex hands -Provider codex to the backend' {
         Remove-Item $cxBackendLog -ErrorAction SilentlyContinue
         $r = Invoke-CxPost '/api/preheat/once' '{"kind":"plus","value":"2h","provider":"codex"}'
         $calls = @()
         if (Test-Path $cxBackendLog) { $calls = @(Get-Content $cxBackendLog) }
-        ($r.Code -eq 200) -and ($calls.Count -eq 1) -and ($calls[0] -match '(^| )\+2h( |$)') -and ($calls[0] -match '(^| )-Codex( |$)')
+        ($r.Code -eq 200) -and ($calls.Count -eq 1) -and ($calls[0] -match '(^| )\+2h( |$)') -and ($calls[0] -match '(^| )-Provider codex( |$)')
     }
     Test-Case 'GET /api/ratelimits?provider=codex: the Codex cache verbatim, {} without one' {
         $cf = Join-Path $cxRoot 'state-ratelimits-codex.json'
@@ -2338,7 +2772,9 @@ Test-Case 'journal appends are serialized by a named mutex' {
 }
 Test-Case 'stale once-labels are swept by name pattern, not by what is on disk' {
     # launchd keeps holding a Once label whose plist is already gone
-    (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8).Contains('Once-\d{8}-\d{4}')
+    # the label regex is built from each row's OncePrefix (provider table)
+    $src = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+    $src.Contains(')-\d{8}-\d{4}') -and $src.Contains('ConvertTo-LaunchdLabel $s.OncePrefix')
 }
 Test-Case 'run-hidden.vbs propagates the exit code of what it launched' {
     # it used to swallow every failure: the scheduled task always looked green
@@ -2401,12 +2837,19 @@ Test-Case 'the panel scrubs the child-session marker before spawning' {
     # the pings preheat.ps1 spawns under the panel must start from a clean env
     (Get-Content (Join-Path $Repo 'panel.ps1') -Raw) -match 'Remove-Item Env:CLAUDE_CODE_CHILD_SESSION'
 }
+# every product script at the repo root, found by glob: a new adapter file is
+# guarded by the BOM / ASCII / parse / 5.1 cases below without being listed
+$ProductPs1 = @(Get-ChildItem -Path $Repo -Filter '*.ps1' -File | Where-Object { $_.Name -ne 'test.ps1' } | ForEach-Object { $_.Name } | Sort-Object)
+Test-Case 'the product script glob finds at least the five known scripts (an empty glob must not pass the guards)' {
+    $miss = @(@('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'codex.ps1') | Where-Object { $ProductPs1 -notcontains $_ })
+    $miss.Count -eq 0
+}
 Test-Case 'every shipped script carries a UTF-8 BOM (5.1 decodes BOM-less as ANSI)' {
     # without the BOM, Windows PowerShell 5.1 reads these files through the
     # legacy codepage: on cp936 the middle-dot chars in comments/corpus turn
     # to mojibake, and a bare [] class once became an invalid regex
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1', 'codex.ps1')) {
+    foreach ($f in @($ProductPs1) + @('test.ps1')) {
         $b = [System.IO.File]::ReadAllBytes((Join-Path $Repo $f))
         if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) { $ok = $false }
     }
@@ -2436,14 +2879,14 @@ Test-Case 'statusline on/off consult BOTH settings files and the sidecar path' {
 }
 Test-Case 'every script parses' {
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1', 'codex.ps1', (Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
+    foreach ($f in @($ProductPs1) + @('test.ps1', (Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
         try { $null = [scriptblock]::Create((Get-Content (Join-Path $Repo $f) -Raw)) } catch { $ok = $false }
     }
     $ok
 }
 Test-Case 'no PowerShell 7-only syntax (project claims 5.1 support)' {
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'codex.ps1', (Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
+    foreach ($f in @($ProductPs1) + @((Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
         $c = Get-Content (Join-Path $Repo $f) -Raw
         if ($c -match '\?\?' -or $c -match '\)\s*\?\s*[^\s]+\s*:\s') { $ok = $false }
     }
@@ -2474,7 +2917,6 @@ Test-Case 'personal state stays out of git' {
     }
     $ok
 }
-$cxProductPs1 = @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'codex.ps1')
 Test-Case 'every product .ps1/.vbs/.cjs is pure ASCII after the BOM (5.1 reads a BOM-less byte >= 0x80 through the ANSI code page)' {
     # web/index.html is exempt: it carries the Chinese strings on purpose
     $files = @(Get-ChildItem -Path $Repo -Filter '*.ps1' | ForEach-Object { $_.FullName }) +
@@ -2495,7 +2937,7 @@ Test-Case 'no PowerShell 7-only runtime API in product scripts (ArgumentList, Ki
     # the syntax guard above cannot see these: they parse fine on 5.1 and
     # only throw when the line runs - inside a scheduled fire nobody watches
     $bad = @()
-    foreach ($f in @($cxProductPs1) + @((Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
+    foreach ($f in @($ProductPs1) + @((Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
         $n = 0
         foreach ($line in @(Get-Content (Join-Path $Repo $f) -Encoding UTF8)) {
             $n++
@@ -2530,17 +2972,51 @@ Test-Case 'the codex exec argv in source is the safe ping: ephemeral, read-only 
 }
 Test-Case 'no product line reads auth.json (Test-Path and the mtime only)' {
     $bad = @()
-    foreach ($f in $cxProductPs1) {
+    foreach ($f in $ProductPs1) {
         foreach ($line in @(Get-Content (Join-Path $Repo $f) -Encoding UTF8)) {
             if (($line -match 'auth\.json') -and ($line -match 'Get-Content|ReadAll|Copy-Item|OpenRead|Import-|ConvertFrom-Json|\[System\.IO\.File\]::Open')) { $bad += $f }
         }
     }
     $bad.Count -eq 0
 }
-Test-Case 'the macOS stale-once sweep and the e2e sweep both cover Codex labels' {
-    $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+Test-Case 'the e2e sweep covers Codex labels (the product sweep is covered by the macOS-double cases)' {
     $e = Get-Content (Join-Path $Repo (Join-Path '.github' (Join-Path 'workflows' 'e2e-mac.ps1'))) -Raw -Encoding UTF8
-    $p.Contains("`$labelRe += 'Codex-'") -and $p.Contains(")Once-\d{8}-\d{4}')") -and $e.Contains('com\.claude-preheat\.[A-Za-z0-9-]+') -and $e.Contains('-Codex')
+    $e.Contains('com\.claude-preheat\.[A-Za-z0-9-]+') -and $e.Contains('-Codex')
+}
+Test-Case 'no new hard-coded provider checks: no "-ne codex" / provider -notmatch in the product, no task-name literal outside the table' {
+    # every provider decision goes through $ProviderTable (platform.ps1); a
+    # binary "codex else claude" check or a ClaudePreheat literal elsewhere
+    # would silently mis-file a provider's records. Comment lines are skipped.
+    # The -eq/-ne 'claude'|'codex' lines below are the intentional ones (lock
+    # variables tests repoint, Claude's bare fire argv, Codex toast wording);
+    # a new one must be added here on purpose.
+    $guardAllow = @(
+        "if (`$s.Name -eq 'claude') { `$errors += `$_.Exception.Message }",
+        "if (`$s.Name -eq 'claude') { return `$FireLock }",
+        "if (`$s.Name -eq 'codex') { return `$CodexFireLock }",
+        "if (`$s.Name -ne 'claude') { `$fireArgs = @('fire', '-Provider', `$s.Name) }",
+        "if (`$s.Name -ne 'claude') { `$who = `$s.Label + ' ' }",
+        "} elseif (`$Provider -eq 'codex') {",
+        "if (`$prov -ne 'claude') {",
+        "if (`$prov -ne 'claude') { `$cmdArgs += @('-Provider', `$prov) }",
+        "if ((`$prov -eq 'claude') -or (-not `$existing) -or `$existing.PSObject.Properties['rules']) { `$newConfig.rules = `$claudeRules }",
+        "if ((`$prov -ne 'claude') -or (-not (Get-ProviderSpec `$prov).Learn)) { Send-Json `$context 200 @{ unsupported = `$true }; return }")
+    $bad = @()
+    foreach ($f in @('preheat.ps1', 'platform.ps1', 'panel.ps1')) {
+        $n = 0
+        foreach ($line in @(Get-Content (Join-Path $Repo $f) -Encoding UTF8)) {
+            $n++
+            if ($line.Trim().StartsWith('#')) { continue }
+            # the table-driven Test-LineProvider keeps one -notmatch '"provider"...(?!claude")': only a codex one is the old binary check
+            if (($line -match "-ne\s+'codex'") -or (($line -match '-notmatch\s+''"provider"') -and ($line -match 'codex'))) { $bad += ('{0}:{1}' -f $f, $n) }
+            elseif (($line -match "-(eq|ne)\s+'(codex|claude)'") -and ($guardAllow -notcontains $line.Trim())) { $bad += ('{0}:{1}' -f $f, $n) }
+            if (($f -ne 'platform.ps1') -and ($line -match '[''"]ClaudePreheat')) { $bad += ('{0}:{1}' -f $f, $n) }
+        }
+    }
+    $h = Get-Content (Join-Path $Repo (Join-Path 'web' 'index.html')) -Raw -Encoding UTF8
+    if ($h -match '[/''"]\^?ClaudePreheat') { $bad += 'web/index.html' }
+    if ($bad.Count -gt 0) { return ('hard-coded at ' + ($bad -join ', ')) }
+    $true
 }
 Test-Case 'panel page: Claude | Codex tabs remembered, provider on every call, Refresh wired, the no-5h-window banner in both languages' {
     $h = Get-Content (Join-Path $Repo (Join-Path 'web' 'index.html')) -Raw -Encoding UTF8

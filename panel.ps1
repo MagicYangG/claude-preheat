@@ -10,18 +10,19 @@ panel can never disagree.
 Usage: panel.ps1 [-Port 7878] [-NoBrowser]
 
 Endpoints (see web/index.html for the client side). provider (query string on
-GETs, body field on POSTs) is claude|codex; missing = claude, so an old page
-keeps working.
+GETs, body field on POSTs) is any name in $ProviderTable (claude|codex today);
+missing = claude, so an old page keeps working.
   GET  /                     web/index.html
-  GET  /api/status           {preheat:{tasks:[{name,next,provider}]}, codex:{installed,exeKind}}
+  GET  /api/status           {preheat:{tasks:[{name,next,provider}]}, codex:{installed,exeKind},
+                             providers:[{name,label,wkPrefix,oncePrefix}]} - table order
   GET  /api/schedule         ?provider -> {rules:[...], mtime:"<token>"} - rules
                              only, so a stale tab can never write back a
                              proxy/_readme it read hours ago; mtime is the
                              optimistic-lock token of THAT section only
   GET  /api/ratelimits       ?provider - claude: cache written by statusline-tap.cjs
-                             and fire; codex: state-ratelimits-codex.json verbatim
+                             and fire; others: their cache file verbatim
   GET  /api/learn            30-day rhythm + 7-day window-utilization report
-                             (codex: {unsupported:true})
+                             (a provider without Learn: {unsupported:true})
   GET  /api/events           ?provider -> {events:[...]} fire history, newest first
   POST /api/preheat/once     {provider?, kind:"reset"|"at"|"plus", value:"HH:mm"|"2h"}
   POST /api/preheat/apply    {provider?, rules:[{days:[...], reset:"HH:mm"}, ...], baseMtime?}
@@ -294,17 +295,28 @@ function Handle-ApiStatus($context) {
     if (-not $preheatObj) { $preheatObj = @{ tasks = @() } }
     if (-not $codexObj) { $codexObj = @{ installed = $false; exeKind = $null } }
 
-    Send-Json $context 200 @{ preheat = $preheatObj; codex = $codexObj }
+    Send-Json $context 200 @{ preheat = $preheatObj; codex = $codexObj; providers = (Get-ProviderList) }
+}
+
+function Get-ProviderList {
+    # the page builds its tabs and task-name parsers from this, so it names no
+    # provider or prefix of its own
+    $out = @()
+    foreach ($n in @(Get-ProviderNames)) {
+        $s = Get-ProviderSpec $n
+        $out += [ordered]@{ name = $s.Name; label = $s.Label; wkPrefix = $s.WkPrefix; oncePrefix = $s.OncePrefix }
+    }
+    ,$out
 }
 
 function Get-RequestProvider($context) {
     # ?provider= on a GET: 'claude' when absent (old pages), $null when it is
-    # anything but the two known names - the caller answers 400
+    # not a provider table name - the caller answers 400
     $p = $null
     try { $p = $context.Request.QueryString['provider'] } catch { }
     if (-not $p) { return 'claude' }
     $p = ([string]$p).ToLowerInvariant()
-    if ($p -eq 'claude' -or $p -eq 'codex') { return $p }
+    if ($ProviderTable.Contains($p)) { return $p }
     $null
 }
 
@@ -312,24 +324,25 @@ function Get-BodyProvider($data) {
     # the same rule for a POST body field
     if (-not $data -or -not $data.PSObject.Properties['provider'] -or -not $data.provider) { return 'claude' }
     $p = ([string]$data.provider).ToLowerInvariant()
-    if ($p -eq 'claude' -or $p -eq 'codex') { return $p }
+    if ($ProviderTable.Contains($p)) { return $p }
     $null
 }
 
 function Send-BadProvider($context) {
-    Send-Json $context 400 @{ ok = $false; message = 'provider must be claude or codex' }
+    Send-Json $context 400 @{ ok = $false; message = ('provider must be ' + ((Get-ProviderNames) -join ' or ')) }
 }
 
 function Handle-ApiRateLimits($context) {
     $prov = Get-RequestProvider $context
     if (-not $prov) { Send-BadProvider $context; return }
-    if ($prov -eq 'codex') {
-        # written by codex fire / status -Codex / Refresh. Sent verbatim: a
+    $spec = Get-ProviderSpec $prov
+    if ($prov -ne 'claude') {
+        # written by that provider's fire / status / Refresh. Sent verbatim: a
         # re-serialized copy turns its ISO stamps into engine-specific date
         # shapes. Parsed only so a half-written file reads as {}.
         $raw = $null
         try {
-            $cp = Join-Path $Root 'state-ratelimits-codex.json'
+            $cp = Join-Path $Root $spec.CacheFile
             if (Test-Path $cp) {
                 $raw = Get-Content $cp -Raw -Encoding UTF8
                 if (-not ($raw | ConvertFrom-Json)) { $raw = $null }
@@ -343,7 +356,7 @@ function Handle-ApiRateLimits($context) {
     # tap is installed and a statusline has rendered once)
     $obj = $null
     try {
-        $p = Join-Path $Root 'state-ratelimits.json'
+        $p = Join-Path $Root $ProviderTable.claude.CacheFile
         if (Test-Path $p) { $obj = Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json }
     } catch { }
     if (-not $obj) { $obj = @{} }
@@ -354,7 +367,8 @@ function Handle-ApiLearn($context) {
     $prov = Get-RequestProvider $context
     if (-not $prov) { Send-BadProvider $context; return }
     # learn reads Claude's prompt history only (Codex learn is planned for beta.2)
-    if ($prov -eq 'codex') { Send-Json $context 200 @{ unsupported = $true }; return }
+    # a Learn field on another row is CLI-only: this route serves Claude's history
+    if (($prov -ne 'claude') -or (-not (Get-ProviderSpec $prov).Learn)) { Send-Json $context 200 @{ unsupported = $true }; return }
     # 30-day rhythm + 7-day window-utilization report from preheat.ps1 learn
     $now = Get-Date
     $age = [double]::PositiveInfinity
@@ -399,13 +413,10 @@ function Read-PanelConfig {
 }
 
 function Get-SectionRules($obj, [string]$Provider) {
-    # claude = top-level rules, codex = codex.rules; $null when absent
+    # claude = top-level rules, others = <ConfigKey>.rules; $null when absent
     if (-not $obj) { return $null }
-    if ($Provider -eq 'codex') {
-        if ($obj.PSObject.Properties['codex'] -and $obj.codex -and $obj.codex.PSObject.Properties['rules']) { return ,$obj.codex.rules }
-        return $null
-    }
-    if ($obj.PSObject.Properties['rules']) { return ,$obj.rules }
+    $pc = Get-ProviderConfig $obj $Provider
+    if ($pc -and $pc.PSObject.Properties['rules']) { return ,$pc.rules }
     $null
 }
 
@@ -473,7 +484,7 @@ function Handle-PreheatOnce($context) {
     } else {
         Send-Json $context 400 @{ ok = $false; message = "unknown kind '$kind'" }; return
     }
-    if ($prov -eq 'codex') { $cmdArgs += '-Codex' }
+    if ($prov -ne 'claude') { $cmdArgs += @('-Provider', $prov) }
     $res = Invoke-BackendCommand -ScriptPath $PreheatScript -CmdArgs $cmdArgs
     $script:PreheatStatusCache.ts = [datetime]::MinValue   # next poll shows the new task
     Send-Json $context 200 @{ ok = ($res.ExitCode -eq 0); message = (Get-ResultMessage $res) }
@@ -516,26 +527,27 @@ function Handle-PreheatApply($context) {
     }
     $prov = Get-BodyProvider $data
     if (-not $prov) { Send-BadProvider $context; return }
-    $why = Test-RuleSet $data.rules -AllowEmpty:($prov -eq 'codex')
+    $spec = Get-ProviderSpec $prov
+    $why = Test-RuleSet $data.rules -AllowEmpty:([bool]$spec.ConfigKey)
     if ($why) { Send-Json $context 400 @{ ok = $false; message = ('invalid rules: ' + $why) }; return }
 
     # optimistic lock: a tab left open across a CLI `preheat learn auto` would
     # otherwise apply its hours-old grid over the newer file without a word.
     # Before anything is written or spawned.
-    # a Codex save rewrites the whole file: on one that does not parse it
-    # would keep nothing of the Claude rules or any other key. Refuse rather
-    # than guess (a Claude save keeps its old behaviour).
-    if ($prov -eq 'codex') {
+    # a section save (Codex) rewrites the whole file: on one that does not
+    # parse it would keep nothing of the Claude rules or any other key. Refuse
+    # rather than guess (a Claude save keeps its old behaviour).
+    if ($spec.ConfigKey) {
         $pc = Read-PanelConfig
         if ($pc.raw -and (-not $pc.obj)) {
             Send-Json $context 409 @{ ok = $false; code = 'unparseable'; message = 'schedule.json does not parse - fix it (or restore schedule.json.bak), then apply again' }
             return
         }
-        # its apply would wait minutes on the fire's lock, far past the backend timeout
-        if (Test-CodexFireRunning) {
-            Send-Json $context 409 @{ ok = $false; code = 'busy'; message = 'a Codex fire is running right now - try again in a few minutes' }
-            return
-        }
+    }
+    # a long fire's apply would wait minutes on its lock, far past the backend timeout
+    if ($spec.LongFire -and (Test-ProviderFireRunning $prov)) {
+        Send-Json $context 409 @{ ok = $false; code = 'busy'; message = ('a {0} fire is running right now - try again in a few minutes' -f $spec.Label) }
+        return
     }
     $hasBase = $false
     try { if ($data.PSObject.Properties['baseMtime']) { $hasBase = $true } } catch { }
@@ -571,7 +583,7 @@ function Handle-PreheatApply($context) {
     # only this tab's section is replaced. A Codex save keeps the Claude rules
     # on disk (top-level rules may be [] for Codex-only users).
     $claudeRules = $rulesOut
-    if ($prov -eq 'codex') {
+    if ($spec.ConfigKey) {
         $claudeRules = @()
         $er = Get-SectionRules $existing 'claude'
         if ($er) { $claudeRules = @($er) }
@@ -589,18 +601,19 @@ function Handle-PreheatApply($context) {
             if (@('_readme', 'proxy', 'rules', 'chase') -notcontains $pp.Name) { $newConfig[$pp.Name] = $pp.Value }
         }
     }
-    if ($prov -eq 'codex') {
-        # codex.rules replaced; chase, home and anything else in it kept
+    if ($spec.ConfigKey) {
+        # <key>.rules replaced; chase, home and anything else in it kept
+        $sk = $spec.ConfigKey
         $cx = [ordered]@{}
         $hadRules = $false
-        if ($newConfig.Contains('codex') -and $newConfig['codex']) {
-            foreach ($pp in $newConfig['codex'].PSObject.Properties) {
+        if ($newConfig.Contains($sk) -and $newConfig[$sk]) {
+            foreach ($pp in $newConfig[$sk].PSObject.Properties) {
                 if ($pp.Name -eq 'rules') { $cx['rules'] = $rulesOut; $hadRules = $true }
                 else { $cx[$pp.Name] = $pp.Value }
             }
         }
         if (-not $hadRules) { $cx['rules'] = $rulesOut }
-        $newConfig['codex'] = $cx
+        $newConfig[$sk] = $cx
     }
 
     try {
@@ -620,25 +633,16 @@ function Handle-PreheatApply($context) {
     Send-Json $context 200 @{ ok = ($res.ExitCode -eq 0); message = (Get-ResultMessage $res); mtime = (Get-ConfigMtime $prov) }
 }
 
-function Test-CodexFireRunning {
-    # the fire path's own freshness rule for its lock: present, written in the
-    # last 20 min, and its pid still alive
-    $lk = Join-Path $Root '.fire-codex.lock'
-    if (-not (Test-Path $lk)) { return $false }
-    try {
-        # -Force: a dot file is hidden from a plain Get-Item on macOS
-        if ((Get-Item -Force $lk).LastWriteTime -lt (Get-Date).AddMinutes(-20)) { return $false }
-        $l = Get-Content $lk -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
-        if ($l -and $l.pid -and (Get-Process -Id ([int]$l.pid) -ErrorAction SilentlyContinue)) { return $true }
-    } catch { }
-    $false
+function Test-ProviderFireRunning([string]$Provider) {
+    # the fire path's own freshness rule for its lock (fresh, live pid)
+    [bool](Get-FireLockHolder (Get-ProviderLockPath $Provider))
 }
 
 function Handle-CodexRefresh($context) {
     # the Refresh button: one live quota read through the CLI. The listener is
     # single-threaded, so two clicks never run two codex processes at once; a
     # scheduled Codex fire in flight owns the account, so refuse while it runs.
-    if (Test-CodexFireRunning) {
+    if (Test-ProviderFireRunning 'codex') {
         Send-Json $context 409 @{ ok = $false; code = 'busy'; message = 'a Codex fire is running right now - try again in a few minutes' }
         return
     }

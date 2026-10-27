@@ -321,6 +321,7 @@ var I18N = {
     ev_ok_line:'于 {a} 预热成功，将于 {b} 重置', ev_ok_line_na:'于 {a} 预热成功（当时未记录窗口状态）',
     ev_noeff_line:'探查到 {a} 有使用，预热窗口时，原 5 小时额度未结束', ev_noeff_line_na:'预热窗口时，原 5 小时额度未结束', ev_noeff_chase:'，已补排 {b} 的跟进预热',
     ev_fail_limit:'用量已达限额', ev_fail_auth:'登录已过期', ev_fail_other:'其他错误：{e}', ev_fail_unknown:'原因未记录',
+    ev_third_party:'Claude Code 指向第三方接口（{h}），没发 ping',
     ev_retry:'重试 {n} 次', ev_none:'近 {d} 天没有点火记录', ev_none_kind:'近 {d} 天没有「{k}」的记录', ev_none_all:'还没有点火记录',
     bad_hours:'小时数填个 1 以上的整数', bad_time:'时刻格式要是 HH:mm', langBtn:'EN',
     cx_refresh:'刷新额度', cx_refreshing:'读取中…', cx_read_done:'已读取 Codex 额度',
@@ -369,6 +370,7 @@ var I18N = {
     ev_ok_line:'fired at {a}, resets at {b}', ev_ok_line_na:'fired at {a} (window state was not recorded back then)',
     ev_noeff_line:'activity seen at {a}, the previous 5-hour window was still running', ev_noeff_line_na:'the previous 5-hour window was still running', ev_noeff_chase:' - follow-up preheat booked for {b}',
     ev_fail_limit:'usage limit reached', ev_fail_auth:'login expired', ev_fail_other:'other error: {e}', ev_fail_unknown:'no reason recorded',
+    ev_third_party:'Claude Code points at a third-party endpoint ({h}) - no ping sent',
     ev_retry:'retried {n}\u00d7', ev_none:'No fires in the last {d} days', ev_none_kind:'No \u201c{k}\u201d in the last {d} days', ev_none_all:'No fires yet',
     bad_hours:'Enter a whole number of hours ≥ 1', bad_time:'Time must be HH:mm', langBtn:'中文',
     cx_refresh:'Refresh quota', cx_refreshing:'Reading…', cx_read_done:'Codex quota read',
@@ -407,12 +409,27 @@ function newSlot(){
 var PROV = { claude:newSlot(), codex:newSlot() };
 var provPinned = false;   // the user picked a tab (remembered) - never auto-switch then
 var cur = (function(){
-  try { var v = localStorage.getItem('clr_provider'); if (v === 'claude' || v === 'codex') { provPinned = true; return v; } } catch(e){ }
+  // any table-shaped name: the first /api/status drops one the server does not list
+  try { var v = localStorage.getItem('clr_provider'); if (/^[a-z][a-z0-9]*$/.test(v || '')) { provPinned = true; return v; } } catch(e){ }
   return 'claude';
 })();
-function P(p){ return PROV[p || cur]; }
+function P(p){ p = p || cur; if (!PROV[p]) PROV[p] = newSlot(); return PROV[p]; }
 function q(path, p){ return path + '?provider=' + encodeURIComponent(p || cur); }
-function taskProvider(tk){ return tk.provider || (/^ClaudePreheat-Codex-/.test(String(tk.name || '')) ? 'codex' : 'claude'); }
+// the server tags every task from its provider table; an odd name is on no tab
+function taskProvider(tk){ return tk.provider || ''; }
+// one /api/status providers row ({name,label,wkPrefix,oncePrefix}) or null
+function provSpec(p){
+  var l = (state.status && state.status.providers) || [];
+  for (var i = 0; i < l.length; i++) if (l[i].name === p) return l[i];
+  return null;
+}
+function reEsc(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+// a weekly task name of provider p -> [_, HH, mm, days] or null
+function wkMatch(name, p){
+  var s = provSpec(p);
+  if (!s) return null;
+  return new RegExp('^' + reEsc(s.wkPrefix) + '-(\\d{2})(\\d{2})-(.+)$').exec(String(name || ''));
+}
 function provTasks(p){
   var ig = (state.status && state.status.preheat) ? state.status.preheat : {};
   return (ig.tasks || []).filter(function(tk){ return taskProvider(tk) === (p || cur); });
@@ -518,10 +535,11 @@ function setBusy(b){
 
 /* ---------- 1. scheduled preheats ---------- */
 function taskLabel(task){
-  // registered task names encode the FIRE time (ClaudePreheat-Wk-0400-MonTue);
+  // registered task names encode the FIRE time (<wkPrefix>-0400-MonTue);
   // the grid below speaks in RESET times - translate so the two blocks
   // visibly correspond (raw name stays in the row tooltip)
-  var m = /^ClaudePreheat-(?:Codex-)?Wk-(\d{2})(\d{2})-(.+)$/.exec(String(task.name || ''));
+  var tp = taskProvider(task), ps = provSpec(tp);
+  var m = wkMatch(task.name, tp);
   if (m) {
     var days = String(m[3]).match(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/g) || [];
     var mins = parseInt(m[1],10) * 60 + parseInt(m[2],10);
@@ -537,7 +555,7 @@ function taskLabel(task){
     return '<span class="tt">' + resetHM + '</span> ' + t('reset_word') +
       '<span class="tdim">（' + fireHM + ' 预热）</span> · 周' + dn.join('·');
   }
-  if (/^ClaudePreheat-(?:Codex-)?Once-/.test(String(task.name || ''))) return t('once_task');
+  if (ps && String(task.name || '').indexOf(ps.oncePrefix + '-') === 0) return t('once_task');
   return esc(task.name);
 }
 function renderTasks(){
@@ -673,10 +691,10 @@ function seedRules(rules, p){
   renderWeek();
 }
 function rulesFromTasks(tasks){
-  // callers pass one provider's tasks (provTasks), so both prefixes parse here
+  // callers pass one provider's tasks (provTasks); each parses by its own prefix
   var out = [];
   (tasks || []).forEach(function(tk){
-    var m = /ClaudePreheat-(?:Codex-)?Wk-(\d{2})(\d{2})-(.+)$/.exec(String(tk.name || ''));
+    var m = wkMatch(tk.name, taskProvider(tk));
     if (!m) return;
     var days = String(m[3]).match(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/g);
     if (!days || !days.length) return;
@@ -886,7 +904,7 @@ function evInputs(){
 function hm(d){ return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
 // a Codex fire that chose not to ping (no window / API key / paused) spent nothing - not a failure
 var CX_SKIP = { no5h:1, apikey:1, paused:1 };
-function evVerdict(e){ return !e.ok ? ((e.provider === 'codex' && CX_SKIP[e.kind]) ? 'skip' : 'bad') : (e.anchored === false ? 'noeff' : 'ok'); }
+function evVerdict(e){ return !e.ok ? ((e.kind === 'third-party' || (e.provider === 'codex' && CX_SKIP[e.kind])) ? 'skip' : 'bad') : (e.anchored === false ? 'noeff' : 'ok'); }
 function evTag(v){
   return '<span class="evtag ' + v + '">' + t(v === 'ok' ? 'ev_ok' : (v === 'noeff' ? 'ev_noeff' : (v === 'skip' ? 'ev_skip' : 'ev_fail'))) + '</span>';
 }
@@ -926,6 +944,8 @@ function evLine(e, v, d){
     var sameDay = la.getFullYear() === d.getFullYear() && la.getMonth() === d.getMonth() && la.getDate() === d.getDate();
     return t('ev_noeff_line').replace('{a}', sameDay ? hm(la) : fmtDT(la)) + tail;
   }
+  // Claude Code aimed at another vendor's endpoint: the fire sent no ping
+  if (e.kind === 'third-party') return t('ev_third_party').replace('{h}', function(){ return esc(e.endpoint || '?'); });
   if (e.kind === 'limit') return t('ev_fail_limit');
   if (e.kind === 'auth') return t('ev_fail_auth');
   if (!e.err) return t('ev_fail_unknown');
@@ -966,6 +986,9 @@ function refreshEvents(){
 var provDecided = false;
 function applyStatus(s){
   state.status = s; state.stamp = new Date(); setOnline(true);
+  renderProviderTabs();
+  // a remembered tab the server no longer lists falls back to Claude
+  if (s.providers && !provSpec(cur)) setProvider('claude', false);
   renderTasks(); tickStamp();
   if (cur === 'codex') renderCodexHead();
   var sp = seedSchedule();
@@ -1025,8 +1048,22 @@ function renderTabs(){
   for (var i = 0; i < tabs.length; i++) tabs[i].className = 'ptab' + (tabs[i].getAttribute('data-prov') === cur ? ' on' : '');
   $('cxbox').style.display = (cur === 'codex') ? '' : 'none';
 }
+function renderProviderTabs(){
+  // the two static buttons paint at once; a provider the server adds later
+  // gets its tab here, labelled from the table
+  var l = (state.status && state.status.providers) || [], box = $('ptabs');
+  l.forEach(function(s){
+    if (!/^[a-z][a-z0-9]*$/.test(s.name) || box.querySelector('[data-prov="' + s.name + '"]')) return;
+    var b = document.createElement('button');
+    b.className = 'ptab'; b.setAttribute('data-prov', s.name); b.textContent = s.label || s.name;
+    b.addEventListener('click', function(){ setProvider(s.name, true); });
+    box.appendChild(b);
+  });
+  renderTabs();
+}
 function setProvider(p, remember){
-  if (p !== 'claude' && p !== 'codex') return;
+  var known = (state.status && state.status.providers) ? !!provSpec(p) : !!document.querySelector('[data-prov="' + p + '"]');
+  if (!known) return;
   if (remember) { provPinned = true; try { localStorage.setItem('clr_provider', p); } catch (e) { } }
   if (p === cur) return;
   cur = p;

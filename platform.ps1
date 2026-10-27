@@ -7,9 +7,9 @@ One scheduling contract, two backends:
   Windows : Task Scheduler (Register-ScheduledTask; wake timers can wake the PC)
   macOS   : launchd user LaunchAgents (~/Library/LaunchAgents/com.claude-preheat.*)
 
-Job names are identical on both platforms (ClaudePreheat-Wk-HHmm-Days and
-ClaudePreheat-Once-yyyyMMdd-HHmm; Codex jobs carry an extra Codex- after the
-prefix, see Get-JobProvider). On macOS a name maps 1:1 to the launchd
+Job names are identical on both platforms (<WkPrefix>-HHmm-Days and
+<OncePrefix>-yyyyMMdd-HHmm; each provider's prefixes live in $ProviderTable
+below). On macOS a name maps 1:1 to the launchd
 label com.claude-preheat.<name minus the ClaudePreheat- prefix>, and the NAME
 is the schedule: launchd has no NextRunTime query, so next-fire times are
 recomputed from the name alone (Get-JobNextRun).
@@ -35,13 +35,100 @@ $JobNamePrefix      = 'ClaudePreheat-'
 $LaunchdLabelPrefix = 'com.claude-preheat.'
 $LaunchAgentDir     = if ($OnMac) { Join-Path $HOME (Join-Path 'Library' 'LaunchAgents') } else { $null }
 $LaunchdErrLog      = Join-Path $PlatformRoot 'launchd-err.log'
+$AllJobsPattern     = 'ClaudePreheat*'      # every job of every provider (off, listings)
+
+# one row per provider - the only place that knows a provider's names.
+# Prefixes must start with $JobNamePrefix.
+$ProviderTable = [ordered]@{
+    claude = @{
+        Name          = 'claude'
+        Label         = 'Claude'
+        WkPrefix      = 'ClaudePreheat-Wk'
+        OncePrefix    = 'ClaudePreheat-Once'
+        LockFile      = '.fire.lock'
+        CacheFile     = 'state-ratelimits.json'
+        FirePit       = 'firepit'
+        ConfigKey     = $null                  # top-level rules/chase/proxy
+        JournalTag    = $null                  # records carry no provider field
+        LongFire      = $false
+        Fire          = 'Invoke-Fire'
+        Apply         = 'Invoke-ClaudeApply'
+        Status        = 'Invoke-Status'
+        StatusJson    = 'Invoke-StatusJson'
+        StatusSummary = $null
+        Report        = $null
+        Learn         = 'Invoke-Learn'
+    }
+    codex = @{
+        Name          = 'codex'
+        Label         = 'Codex'
+        WkPrefix      = 'ClaudePreheat-Codex-Wk'
+        OncePrefix    = 'ClaudePreheat-Codex-Once'
+        LockFile      = '.fire-codex.lock'
+        CacheFile     = 'state-ratelimits-codex.json'
+        FirePit       = 'firepit-codex'
+        ConfigKey     = 'codex'
+        JournalTag    = 'codex'
+        LongFire      = $true
+        Fire          = 'Invoke-CodexFire'
+        Apply         = 'Invoke-CodexApply'
+        Status        = 'Invoke-CodexStatus'
+        StatusJson    = 'Invoke-CodexStatus'   # it reads -Json itself
+        StatusSummary = 'Write-CodexStatusSummary'
+        Report        = 'Invoke-CodexReport'
+        Learn         = $null
+    }
+}
+
+function Get-ProviderNames { @($ProviderTable.Keys) }
+
+function Get-ProviderSpec([string]$Name) {
+    # the row for a provider name; an unknown name throws - it is never
+    # silently treated as Claude
+    $n = ([string]$Name).ToLowerInvariant()
+    if ((-not $n) -or (-not $ProviderTable.Contains($n))) {
+        throw ('unknown provider: {0} (known: {1})' -f $Name, ((Get-ProviderNames) -join ', '))
+    }
+    $ProviderTable[$n]
+}
+
+function Get-ProviderSet([string]$Provider) {
+    # '' or 'all' = every row in table order, else the one row (unknown throws)
+    if ((-not $Provider) -or ($Provider -eq 'all')) {
+        $all = @()
+        foreach ($k in $ProviderTable.Keys) { $all += $ProviderTable[$k] }
+        return $all
+    }
+    @(Get-ProviderSpec $Provider)
+}
 
 function Get-JobProvider([string]$Name) {
-    # which provider a job belongs to - the one place that knows the naming:
+    # which provider a job belongs to - the one place that decodes names:
     # every name site (sweeps, next-run decode, spent check, status views)
-    # asks here instead of matching prefixes of its own
-    if ($Name -like 'ClaudePreheat-Codex-*') { return 'codex' }
-    'claude'
+    # asks here instead of matching prefixes of its own. The longest matching
+    # prefix wins; $null for a name of no known shape. Never throws.
+    $best = $null; $bestLen = 0
+    foreach ($k in $ProviderTable.Keys) {
+        $s = $ProviderTable[$k]
+        foreach ($p in @(($s.WkPrefix + '-'), ($s.OncePrefix + '-'))) {
+            if (([string]$Name).StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase) -and ($p.Length -gt $bestLen)) {
+                $best = $s.Name; $bestLen = $p.Length
+            }
+        }
+    }
+    $best
+}
+
+function Test-OnceJobName([string]$Name) {
+    foreach ($k in $ProviderTable.Keys) {
+        if (([string]$Name).StartsWith(($ProviderTable[$k].OncePrefix + '-'), [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    $false
+}
+
+function Get-ProviderJobs([string]$Provider, $Jobs = $null) {
+    if ($null -eq $Jobs) { $Jobs = @(Get-PreheatJobs) }
+    @($Jobs | Where-Object { (Get-JobProvider $_.name) -eq $Provider })
 }
 
 function Quote-Arg([string]$a) {
@@ -178,14 +265,17 @@ function ConvertTo-LaunchdLabel([string]$name)   { $LaunchdLabelPrefix + $name.S
 function ConvertFrom-LaunchdLabel([string]$label) { $JobNamePrefix + $label.Substring($LaunchdLabelPrefix.Length) }
 
 function Get-JobNextRun([string]$name) {
-    # the job name carries its whole schedule - see the header note
-    # (?:Codex-)? - a Codex job decodes exactly like its Claude twin
-    if ($name -match '^ClaudePreheat-(?:Codex-)?Once-(\d{8})-(\d{4})$') {
+    # the job name carries its whole schedule - see the header note; every
+    # provider's job decodes the same way, only the prefix differs
+    $p = Get-JobProvider $name
+    if (-not $p) { return $null }
+    $s = Get-ProviderSpec $p
+    if ($name -match ('^' + [regex]::Escape($s.OncePrefix) + '-(\d{8})-(\d{4})$')) {
         # InvariantCulture, not $null: $null means CurrentCulture, and a non-
         # Gregorian calendar (th-TH, ar-SA) parses these digits into a wrong year
         try { return [datetime]::ParseExact($Matches[1] + $Matches[2], 'yyyyMMddHHmm', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
     }
-    if ($name -match '^ClaudePreheat-(?:Codex-)?Wk-(\d{2})(\d{2})-([A-Za-z]+)$') {
+    if ($name -match ('^' + [regex]::Escape($s.WkPrefix) + '-(\d{2})(\d{2})-([A-Za-z]+)$')) {
         $tod  = New-Object timespan ([int]$Matches[1]), ([int]$Matches[2]), 0
         $tags = $Matches[3]
         $map  = @{ Mon = 'Monday'; Tue = 'Tuesday'; Wed = 'Wednesday'; Thu = 'Thursday'; Fri = 'Friday'; Sat = 'Saturday'; Sun = 'Sunday' }
@@ -216,9 +306,14 @@ function Build-LaunchdPlist {
         [string]$HostShell,
         [string]$ScriptPath,
         [string]$PathEnv,
-        [string[]]$ScriptArgs = @('fire')
+        [string[]]$ScriptArgs = @('fire'),
+        [switch]$AnyEndpoint      # carry PREHEAT_CLAUDE_ANY_ENDPOINT=1 into the job
     )
     $e = { param($s) [System.Security.SecurityElement]::Escape([string]$s) }
+    # launchd never sees the user's shell profile: the escape hatch reaches a
+    # fire only through the plist, so apply/at copy it from the applying shell
+    $hatch = ''
+    if ($AnyEndpoint) { $hatch = '<key>PREHEAT_CLAUDE_ANY_ENDPOINT</key><string>1</string>' }
     $label  = ConvertTo-LaunchdLabel $Name
     $argXml = (@($ScriptArgs) | ForEach-Object { '        <string>' + (& $e $_) + '</string>' }) -join "`n"
     $dayNum = @{ Sunday = 0; Monday = 1; Tuesday = 2; Wednesday = 3; Thursday = 4; Friday = 5; Saturday = 6 }
@@ -248,7 +343,7 @@ function Build-LaunchdPlist {
 $argXml
     </array>
     <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>$(& $e $PathEnv)</string><key>CLAUDE_PREHEAT_SELF</key><string>$(& $e $Name)</string></dict>
+    <dict><key>PATH</key><string>$(& $e $PathEnv)</string><key>CLAUDE_PREHEAT_SELF</key><string>$(& $e $Name)</string>$hatch</dict>
 $cal
     <key>StandardErrorPath</key><string>$(& $e $LaunchdErrLog)</string>
 </dict>
@@ -307,7 +402,8 @@ function Register-PreheatJob {
         $label = ConvertTo-LaunchdLabel $Name
         $plist = Join-Path $LaunchAgentDir ($label + '.plist')
         $xml   = Build-LaunchdPlist -Name $Name -Days $Days -At $At `
-                    -HostShell (Resolve-HostShell) -ScriptPath (Join-Path $PlatformRoot 'preheat.ps1') -PathEnv $env:PATH -ScriptArgs $ScriptArgs
+                    -HostShell (Resolve-HostShell) -ScriptPath (Join-Path $PlatformRoot 'preheat.ps1') -PathEnv $env:PATH -ScriptArgs $ScriptArgs `
+                    -AnyEndpoint:($env:PREHEAT_CLAUDE_ANY_ENDPOINT -eq '1')
         # plists must not carry a BOM
         [System.IO.File]::WriteAllText($plist, $xml, (New-Object System.Text.UTF8Encoding($false)))
         $uid = Get-MacUid
@@ -358,7 +454,7 @@ function Get-PreheatJobs {
     # fire is a silent no-op - status compares this against the filesystem.
     # `shell` is the host binary baked next to it - it disappears when a Store
     # pwsh update replaces its versioned folder (see Resolve-StoreShellAlias).
-    param([string]$Pattern = 'ClaudePreheat*')
+    param([string]$Pattern = $AllJobsPattern)
     $jobs = @()
     if ($OnMac) {
         if (Test-Path $LaunchAgentDir) {
@@ -396,7 +492,7 @@ function Get-PreheatJobs {
 }
 
 function Remove-PreheatJobs {
-    param([string]$Pattern = 'ClaudePreheat*')
+    param([string]$Pattern = $AllJobsPattern)
     if ($OnMac) {
         $uid = Get-MacUid
         foreach ($j in @(Get-PreheatJobs $Pattern)) {
@@ -421,11 +517,16 @@ function Test-LaunchdRunning([string]$Label) {
 function Remove-StaleOnceJobs([string]$Provider = 'all') {
     # a fired one-shot must not linger: on Windows its trigger is spent, on
     # macOS the Month/Day calendar spec would come around AGAIN next year.
-    # $Provider (claude|codex|all): a fire or a provider-scoped apply sweeps
+    # $Provider (a table name or all): a fire or a provider-scoped apply sweeps
     # only its own provider's one-shots - the ones whose lock it holds.
-    $pats = @(); $labelRe = @()
-    if ($Provider -ne 'codex') { $pats += 'ClaudePreheat-Once*'; $labelRe += '' }
-    if ($Provider -ne 'claude') { $pats += 'ClaudePreheat-Codex-Once*'; $labelRe += 'Codex-' }
+    # An unknown name throws (every caller wraps this in try).
+    $specs = @(Get-ProviderSet $Provider)
+    $pats = @(); $labelAlts = @()
+    foreach ($s in $specs) {
+        $pats += ($s.OncePrefix + '*')
+        $labelAlts += [regex]::Escape((ConvertTo-LaunchdLabel $s.OncePrefix))
+    }
+    $labelRe = '(?:' + ($labelAlts -join '|') + ')-\d{8}-\d{4}'
     if ($OnMac) {
         $onceJobs = @()
         foreach ($pat in $pats) { $onceJobs += @(Get-PreheatJobs $pat) }
@@ -449,7 +550,7 @@ function Remove-StaleOnceJobs([string]$Provider = 'all') {
             $selfLabel = $null
             if ($env:CLAUDE_PREHEAT_SELF) { $selfLabel = ConvertTo-LaunchdLabel $env:CLAUDE_PREHEAT_SELF }
             $done = @{}
-            foreach ($m in [regex]::Matches($printed, 'com\.claude-preheat\.(' + ($labelRe -join '|') + ')Once-\d{8}-\d{4}')) {
+            foreach ($m in [regex]::Matches($printed, $labelRe)) {
                 $label = $m.Value
                 if ($done[$label]) { continue }
                 $done[$label] = $true
@@ -528,8 +629,13 @@ function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '', [string]$E
     # each with its own line - a Codex login is fixed with a different command.
     # $Text overrides whatever the rest would say.
     $msg = 'preheat FAILED - check preheat-log.jsonl'
+    $label = 'Claude'
+    try { $label = (Get-ProviderSpec $Provider).Label } catch { }
     if ($Text) {
         $msg = $Text
+    } elseif (@('claude', 'codex') -notcontains ([string]$Provider).ToLowerInvariant()) {
+        # a provider without its own wording: generic, never Claude's advice
+        if ($Ok) { $msg = $label + ' window preheated' } else { $msg = $label + ' preheat FAILED - check preheat-log.jsonl' }
     } elseif ($Provider -eq 'codex') {
         $msg = switch ($Kind) {
             'anchored'        { 'Codex window preheated - new 5h window anchored'; break }
@@ -553,6 +659,8 @@ function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '', [string]$E
         # e.g. " - chase at 16:38": the fire already booked the retry
         # the new part first, and short: a truncated banner drops the tail
         if ($Extra) { $msg = 'window busy' + $Extra }
+    } elseif ($Kind -eq 'third-party') {
+        $msg = 'preheat skipped - Claude Code points at {0}, no ping sent' -f $Extra
     } elseif ($Kind -eq 'auth') {
         $msg = 'preheat FAILED - Claude login expired? run: claude'
     } elseif ($Kind -eq 'limit') {

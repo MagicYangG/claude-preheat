@@ -49,33 +49,16 @@ param(
 $ErrorActionPreference = 'Stop'
 # -Codex is the short form the docs use; -Provider is what tasks and the panel pass
 if ($Codex) {
-    if ($Provider -and ($Provider -ne 'codex')) { throw ('usage: -Codex conflicts with -Provider {0}' -f $Provider) }
+    if ($Provider -and ($Provider -notlike 'codex')) { throw ('usage: -Codex conflicts with -Provider {0}' -f $Provider) }
     $Provider = 'codex'
 }
 $Provider = $Provider.ToLowerInvariant()
-if ($Provider -notin @('', 'claude', 'codex', 'all')) { throw ('usage: -Provider claude | codex | all (got: {0})' -f $Provider) }
-# A Windows task carries no environment block, so a one-shot passes its own
-# name as -Job; launchd sets CLAUDE_PREHEAT_SELF in the plist instead. The fire
-# needs it to know whether it is a follow-up (Test-ChaseFire).
-if ($Job -and (-not $env:CLAUDE_PREHEAT_SELF) -and ($Job -match '^ClaudePreheat-[A-Za-z0-9-]+$')) { $env:CLAUDE_PREHEAT_SELF = $Job }
 $Root       = $PSScriptRoot
 $ConfigPath = Join-Path $Root 'schedule.json'
 $StatePath  = Join-Path $Root 'state.json'
 $LogPath    = Join-Path $Root 'preheat-log.jsonl'
-$FirePit    = Join-Path $Root 'firepit'
 $EmptyMcp   = Join-Path $Root 'mcp-empty.json'
-$FireLock   = Join-Path $Root '.fire.lock'
-$TaskWkPrefix   = 'ClaudePreheat-Wk'
-$TaskOncePrefix = 'ClaudePreheat-Once'
 $WindowHours = 5
-# Codex twins of the above: its own lock (a Codex fire must not block or be
-# blocked by a Claude one), its own cache (the statusline tap overwrites
-# state-ratelimits.json whole), its own empty working dir for `codex exec -C`
-$CodexFireLock   = Join-Path $Root '.fire-codex.lock'
-$CodexCachePath  = Join-Path $Root 'state-ratelimits-codex.json'
-$CodexFirePit    = Join-Path $Root 'firepit-codex'
-$CodexWkPrefix   = 'ClaudePreheat-Codex-Wk'
-$CodexOncePrefix = 'ClaudePreheat-Codex-Once'
 # one Codex fire, start to finish (lock wait included): optional steps (a
 # retry, another candidate, the confirm read) run only while they still fit,
 # so the worst case stays near 11 min - inside the 20 min stale-lock line
@@ -89,6 +72,27 @@ $DayOrder = @('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 
 . (Join-Path $Root 'platform.ps1')
 # Codex adapter: exe discovery, the read-only app-server client, verdicts
 . (Join-Path $Root 'codex.ps1')
+
+# provider names exist only after platform.ps1 ($ProviderTable)
+if (($Provider -notin @('', 'all')) -and (-not $ProviderTable.Contains($Provider))) { throw ('usage: -Provider {0} | all (got: {1})' -f ((Get-ProviderNames) -join ' | '), $Provider) }
+# A Windows task carries no environment block, so a one-shot passes its own
+# name as -Job; launchd sets CLAUDE_PREHEAT_SELF in the plist instead. The fire
+# needs it to know whether it is a follow-up (Test-ChaseFire).
+if ($Job -and (-not $env:CLAUDE_PREHEAT_SELF) -and ($Job -match ('^' + [regex]::Escape($JobNamePrefix) + '[A-Za-z0-9-]+$'))) { $env:CLAUDE_PREHEAT_SELF = $Job }
+# per-provider files and task prefixes, from the table. Tests repoint these
+# variables, so callers read them, not the table, for claude and codex.
+$FirePit        = Join-Path $Root $ProviderTable.claude.FirePit
+$FireLock       = Join-Path $Root $ProviderTable.claude.LockFile
+$TaskWkPrefix   = $ProviderTable.claude.WkPrefix
+$TaskOncePrefix = $ProviderTable.claude.OncePrefix
+# Codex twins of the above: its own lock (a Codex fire must not block or be
+# blocked by a Claude one), its own cache (the statusline tap overwrites
+# state-ratelimits.json whole), its own empty working dir for `codex exec -C`
+$CodexFireLock   = Join-Path $Root $ProviderTable.codex.LockFile
+$CodexCachePath  = Join-Path $Root $ProviderTable.codex.CacheFile
+$CodexFirePit    = Join-Path $Root $ProviderTable.codex.FirePit
+$CodexWkPrefix   = $ProviderTable.codex.WkPrefix
+$CodexOncePrefix = $ProviderTable.codex.OncePrefix
 
 function Read-Config {
     if (-not (Test-Path $ConfigPath)) { throw "schedule.json not found at $ConfigPath" }
@@ -147,15 +151,20 @@ function Test-LineProvider([string]$line, [string]$Provider) {
     # cheap text pre-filter, before any ConvertFrom-Json: a reader scanning
     # 1000 lines for one provider skips the other's without parsing them.
     # 'all' = every line. Callers still check Get-RecordProvider after parsing.
+    # An unknown provider throws.
     if ($Provider -eq 'all') { return $true }
-    ($Provider -eq 'codex') -eq ($line -match '"provider"\s*:\s*"codex"')
+    $tag = (Get-ProviderSpec $Provider).JournalTag
+    if ($tag) { return ($line -match ('"provider"\s*:\s*"' + [regex]::Escape($tag) + '"')) }
+    # untagged (Claude): keep every line not tagged for another provider
+    -not ($line -match '"provider"\s*:\s*"(?!claude")')
 }
 
 function Get-FireEvents([string]$path, [int]$max = 60, [string]$Provider = 'claude') {
     # the journal's fire records, newest first, trimmed to what a reader shows
     # (the panel's fire-history list). Pure in $path so a synthetic journal
-    # exercises every record shape without spending a token. Never throws:
-    # a half-rotated or hand-edited journal just yields fewer records.
+    # exercises every record shape without spending a token. Never throws on
+    # journal content: a half-rotated or hand-edited journal just yields fewer
+    # records (an unknown provider name does throw).
     $out = New-Object System.Collections.Generic.List[object]
     if ($path -and (Test-Path $path)) {
         $lines = @()
@@ -202,6 +211,8 @@ function Get-FireEvents([string]$path, [int]$max = 60, [string]$Provider = 'clau
             # Codex fires say more than anchored yes/no (running, sliding, no5h...)
             if ($e.PSObject.Properties['state'] -and $e.state) { $rec.state = [string]$e.state }
             if ($e.PSObject.Properties['pinged'] -and ($null -ne $e.pinged)) { $rec.pinged = [bool]$e.pinged }
+            # a third-party skip names the host it saw (never the URL)
+            if ($e.PSObject.Properties['endpoint'] -and $e.endpoint) { $rec.endpoint = [string]$e.endpoint }
             if ($e.PSObject.Properties['plan'] -and $e.plan) { $rec.plan = [string]$e.plan }
             [void]$out.Add($rec)
         }
@@ -209,6 +220,51 @@ function Get-FireEvents([string]$path, [int]$max = 60, [string]$Provider = 'clau
     # plain output (callers wrap in @()): a `,`-wrapped return survives a bare
     # assignment but @(...) at the call site then nests the whole list as one item
     $out.ToArray()
+}
+
+function Test-AnthropicHost([string]$HostName) {
+    # PURE: anthropic.com or a subdomain of it (case-insensitive, trailing dot ignored)
+    $h = ([string]$HostName).Trim().TrimEnd('.').ToLowerInvariant()
+    ($h -eq 'anthropic.com') -or $h.EndsWith('.anthropic.com')
+}
+
+function Get-ClaudeThirdPartyEndpoint {
+    # -> $null (ping as usual) or @{ host = <string>; src = 'settings.local.json' | 'settings.json' | 'env' }
+    # The effective ANTHROPIC_BASE_URL: Claude Code applies the settings "env"
+    # over the process environment, local over user. Reads that one key only;
+    # never throws, never returns or logs the URL or any other settings value.
+    # PREHEAT_CLAUDE_ANY_ENDPOINT=1 (a gateway that forwards to Anthropic)
+    # turns the check off.
+    if ($env:PREHEAT_CLAUDE_ANY_ENDPOINT -eq '1') { return $null }
+    $v = $null; $src = $null
+    try {
+        # CLAUDE_CONFIG_DIR relocates Claude Code's settings files
+        $dir = Join-Path (Get-ClaudeHome) '.claude'
+        if ($env:CLAUDE_CONFIG_DIR -and ([string]$env:CLAUDE_CONFIG_DIR).Trim()) { $dir = [string]$env:CLAUDE_CONFIG_DIR }
+        foreach ($f in @('settings.local.json', 'settings.json')) {
+            $p = Join-Path $dir $f
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            $val = $null
+            try {
+                $o = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($o -and $o.PSObject.Properties['env'] -and $o.env -and $o.env.PSObject.Properties['ANTHROPIC_BASE_URL']) {
+                    $val = [string]$o.env.ANTHROPIC_BASE_URL
+                }
+            } catch { }
+            $o = $null
+            if ($val -and $val.Trim()) { $v = $val; $src = $f; break }
+        }
+    } catch { }
+    if ((-not $v) -and $env:ANTHROPIC_BASE_URL -and ([string]$env:ANTHROPIC_BASE_URL).Trim()) { $v = [string]$env:ANTHROPIC_BASE_URL; $src = 'env' }
+    if (-not $v) { return $null }
+    $h = '(unparseable)'
+    $u = $null
+    try {
+        if ([System.Uri]::TryCreate($v.Trim(), [System.UriKind]::Absolute, [ref]$u) -and $u -and $u.Host) { $h = $u.Host.ToLowerInvariant() }
+    } catch { }
+    $v = $null
+    if (Test-AnthropicHost $h) { return $null }
+    @{ host = $h; src = $src }
 }
 
 function Resolve-ClaudeExe {
@@ -314,7 +370,7 @@ function Register-WeeklyPlan($plan, [string[]]$ScriptArgs, [string]$Provider) {
         }
     }
     $entry = @{ ev = 'apply'; tasks = $plan.Count }
-    if ($Provider -eq 'codex') { $entry.provider = 'codex' }
+    Add-RecordProvider $entry $Provider
     if ($failed.Count -gt 0) { $entry.failed = $failed.Count }
     Write-Log $entry
     if ($failed.Count -gt 0) {
@@ -323,39 +379,39 @@ function Register-WeeklyPlan($plan, [string[]]$ScriptArgs, [string]$Provider) {
 }
 
 function Invoke-Apply([string]$Provider = 'all') {
-    # claude, codex or all (''). Each provider plans, sweeps and registers on
-    # its own: one failing never stops the other, and apply still fails when
-    # either did. Apply never spawns codex.
-    $doClaude = $Provider -in @('', 'all', 'claude')
-    $doCodex  = $Provider -in @('', 'all', 'codex')
+    # one table name or all (''). Each provider plans, sweeps and registers on
+    # its own: one failing never stops the others, and apply still fails when
+    # any did. Apply never spawns codex.
+    $specs = @(Get-ProviderSet $Provider)
     $config = Read-Config
     $errors = @()
-    if ($doClaude) {
+    foreach ($s in $specs) {
         try {
             # each provider waits for its own fire inside its own try: a long
             # Codex fire must not cost the Claude half
-            Wait-FireLock
-            $plan = Get-WeeklyPlan $config $TaskWkPrefix
-            # resolve claude path now, in an interactive shell where PATH is
-            # complete - unless there is nothing to fire: a Codex-only user may
-            # not have claude installed at all
-            if ($plan.Count -gt 0) {
-                Write-State @{ claude = (Resolve-ClaudeExe); pwsh = (Resolve-HostShell); appliedAt = (Get-Date).ToString('s') }
-            }
-            Remove-PreheatJobs "$TaskWkPrefix*"
-            try { Remove-StaleOnceJobs 'claude' } catch { }
-            if ($OnMac) { Limit-LaunchdErrLog }
-            Register-WeeklyPlan $plan @('fire') 'claude'
-        } catch { $errors += $_.Exception.Message }
-    }
-    if ($doCodex) {
-        try {
-            Wait-FireLock -Path $CodexFireLock -MaxSec 720 -LivePidOnly
-            Invoke-CodexApply $config
-        } catch { $errors += ('codex: ' + $_.Exception.Message) }
+            Wait-ProviderLock $s.Name
+            & $s.Apply $config
+        } catch {
+            if ($s.Name -eq 'claude') { $errors += $_.Exception.Message }
+            else { $errors += ($s.Name + ': ' + $_.Exception.Message) }
+        }
     }
     if ($errors.Count -gt 0) { throw ($errors -join ' | ') }
     Test-WakeTimers
+}
+
+function Invoke-ClaudeApply($config) {
+    $plan = Get-WeeklyPlan $config $TaskWkPrefix
+    # resolve claude path now, in an interactive shell where PATH is
+    # complete - unless there is nothing to fire: a Codex-only user may
+    # not have claude installed at all
+    if ($plan.Count -gt 0) {
+        Write-State @{ claude = (Resolve-ClaudeExe); pwsh = (Resolve-HostShell); appliedAt = (Get-Date).ToString('s') }
+    }
+    Remove-PreheatJobs "$TaskWkPrefix*"
+    try { Remove-StaleOnceJobs 'claude' } catch { }
+    if ($OnMac) { Limit-LaunchdErrLog }
+    Register-WeeklyPlan $plan @('fire') 'claude'
 }
 
 function Invoke-CodexApply($config) {
@@ -386,7 +442,7 @@ function Invoke-CodexApply($config) {
     Register-WeeklyPlan $plan @('fire', '-Provider', 'codex') 'codex'
 }
 
-function Wait-FireLock([int]$MaxSec = 90, [string]$Path = $FireLock, [switch]$LivePidOnly) {
+function Wait-FireLock([int]$MaxSec = 90, [string]$Path = $FireLock, [switch]$LivePidOnly, [string]$Label = 'Codex') {
     # apply/off rewrite or delete the very job a running fire lives inside - on
     # macOS bootout SIGTERMs that fire mid-ping, on Windows the re-register
     # races it. Wait the fire out instead of racing it.
@@ -403,7 +459,7 @@ function Wait-FireLock([int]$MaxSec = 90, [string]$Path = $FireLock, [switch]$Li
     # long - never spend it on a lock whose process is already gone
     if ($LivePidOnly) {
         if (-not (Get-FireLockHolder $Path)) { return }
-        Write-Host ('waiting for the running Codex fire to finish (up to {0} min)...' -f [Math]::Ceiling($MaxSec / 60))
+        Write-Host ('waiting for the running {0} fire to finish (up to {1} min)...' -f $Label, [Math]::Ceiling($MaxSec / 60))
     }
     $waited = 0
     while ((Test-Path $Path) -and ($waited -lt $MaxSec)) {
@@ -424,6 +480,26 @@ function Wait-FireLock([int]$MaxSec = 90, [string]$Path = $FireLock, [switch]$Li
         } catch { }
         throw ('a preheat fire is running right now (job {0}, started {1}) - try again in a minute' -f $job, $started)
     }
+}
+
+function Get-ProviderLockPath([string]$Provider) {
+    # claude/codex: the variables tests repoint, read at call time
+    $s = Get-ProviderSpec $Provider
+    if ($s.Name -eq 'claude') { return $FireLock }
+    if ($s.Name -eq 'codex') { return $CodexFireLock }
+    Join-Path $Root $s.LockFile
+}
+
+function Wait-ProviderLock([string]$Provider) {
+    $s = Get-ProviderSpec $Provider
+    if ($s.LongFire) { Wait-FireLock -Path (Get-ProviderLockPath $s.Name) -MaxSec 720 -LivePidOnly -Label $s.Label }
+    else { Wait-FireLock -Path (Get-ProviderLockPath $s.Name) }
+}
+
+function Add-RecordProvider($Entry, [string]$Provider) {
+    # tag a journal record; Claude's records carry no provider field
+    $t = (Get-ProviderSpec $Provider).JournalTag
+    if ($t) { $Entry.provider = $t }
 }
 
 function Get-TranscriptActivity($file) {
@@ -486,7 +562,7 @@ function Get-KnownWindowEnd([string]$path = $null) {
     # ping's rate_limit_event (Write-RateLimitCache).
     # $null when the tap is not installed or the file is unreadable.
     try {
-        if (-not $path) { $path = Join-Path $Root 'state-ratelimits.json' }
+        if (-not $path) { $path = Join-Path $Root $ProviderTable.claude.CacheFile }
         if (-not (Test-Path $path)) { return $null }
         $o = Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json
         $r = $o.rate_limits.five_hour.resets_at
@@ -577,7 +653,7 @@ function Write-RateLimitCache($windows, [string]$path = $null, [string]$source =
     # FILE_SHARE_DELETE) makes the replace fail: one retry, then this reading
     # waits for the next fire. Telemetry: never throws.
     if (-not $windows) { return }
-    if (-not $path) { $path = Join-Path $Root 'state-ratelimits.json' }
+    if (-not $path) { $path = Join-Path $Root $ProviderTable.claude.CacheFile }
     $tmp = $path + '.tmp-' + $PID
     try {
         $obj = [ordered]@{
@@ -658,7 +734,8 @@ function ConvertTo-LocalTime($v) {
 
 function Get-JournalEvents([string]$path, [int]$max = 200, [string]$Provider = 'claude') {
     # the journal records of one provider ('all' = every record), newest
-    # first; bad lines skipped; ts as local DateTime (or $null). Never throws.
+    # first; bad lines skipped; ts as local DateTime (or $null). Never throws on
+    # journal content (an unknown provider name does throw).
     $out = New-Object System.Collections.Generic.List[object]
     if ($path -and (Test-Path $path)) {
         $lines = @()
@@ -723,8 +800,7 @@ function Test-ChaseFire([string]$Self, [string]$path = $null, [string]$Provider 
     # 'schedule-once' record with a chase label carries that fireAt. Matching
     # the name, not a time window, also recognises a follow-up launchd ran
     # late after a sleep. -> $true / $false
-    $prefix = $TaskOncePrefix
-    if ($Provider -eq 'codex') { $prefix = $CodexOncePrefix }
+    $prefix = (Get-ProviderSpec $Provider).OncePrefix
     if ((-not $Self) -or ($Self -notlike ($prefix + '-*'))) { return $false }
     if (-not $path) { $path = $LogPath }
     foreach ($j in @(Get-JournalEvents $path 200 -Provider $Provider)) {
@@ -739,10 +815,12 @@ function Test-ChaseFire([string]$Self, [string]$path = $null, [string]$Provider 
 
 function Get-ProviderConfig($config, [string]$Provider) {
     # the part of schedule.json one provider plans from: the file itself for
-    # Claude (top-level rules/chase), the "codex" object for Codex. $null =
-    # that provider is off (no codex section).
-    if ($Provider -ne 'codex') { return $config }
-    if ($config -and $config.PSObject.Properties['codex'] -and $config.codex) { return $config.codex }
+    # Claude (top-level rules/chase, ConfigKey $null), the object under the
+    # row's ConfigKey for the others ("codex" for Codex). $null = that
+    # provider is off (no section). An unknown provider throws.
+    $key = (Get-ProviderSpec $Provider).ConfigKey
+    if (-not $key) { return $config }
+    if ($config -and $config.PSObject.Properties[$key] -and $config.$key) { return $config.$key }
     $null
 }
 
@@ -808,7 +886,7 @@ function Invoke-Chase([datetime]$FireStart, $LastAct, $KnownEnd, [string]$Provid
     try { $cfg = Get-ProviderConfig (Read-Config) $Provider } catch { }
     if ($cfg -and $cfg.PSObject.Properties['chase'] -and ($cfg.chase -eq $false)) {
         $skip = @{ ev = 'chase-skip'; reason = 'chase disabled in schedule.json' }
-        if ($Provider -eq 'codex') { $skip.provider = 'codex' }
+        Add-RecordProvider $skip $Provider
         Write-Log $skip
         return @{ skip = 'disabled' }
     }
@@ -818,7 +896,7 @@ function Invoke-Chase([datetime]$FireStart, $LastAct, $KnownEnd, [string]$Provid
         -IsChase (Test-ChaseFire $env:CLAUDE_PREHEAT_SELF $null $Provider)
     if ($plan.skip) {
         $skip = @{ ev = 'chase-skip'; reason = $plan.skip }
-        if ($Provider -eq 'codex') { $skip.provider = 'codex' }
+        Add-RecordProvider $skip $Provider
         Write-Log $skip
         return $plan
     }
@@ -835,7 +913,7 @@ function Test-SpentOnce($job, [datetime]$Now) {
     # "next" run that is behind us
     # Windows reports NO next run for a spent one-time trigger; macOS decodes
     # the past time from the name - both mean spent
-    (($job.name -like ($TaskOncePrefix + '-*')) -or ($job.name -like ($CodexOncePrefix + '-*'))) -and
+    (Test-OnceJobName $job.name) -and
         ((-not $job.next) -or ($job.next -lt $Now.AddMinutes(-3)))
 }
 
@@ -918,7 +996,7 @@ function Remove-OwnOncePlist {
     # out at the next fire/apply.
     $self = $env:CLAUDE_PREHEAT_SELF
     if ((-not $OnMac) -or (-not $self)) { return }
-    if (($self -notlike ($TaskOncePrefix + '-*')) -and ($self -notlike ($CodexOncePrefix + '-*'))) { return }
+    if (-not (Test-OnceJobName $self)) { return }
     try {
         Remove-Item (Join-Path $LaunchAgentDir ((ConvertTo-LaunchdLabel $self) + '.plist')) -Force -ErrorAction SilentlyContinue
     } catch { }
@@ -929,6 +1007,24 @@ function Invoke-Fire {
     try { Remove-StaleOnceJobs 'claude' } catch { }
     $ownLock = Enter-FireLock $FireLock
     try {
+        # Claude Code pointed at another vendor's Anthropic-compatible API: a ping
+        # there cannot open the Claude window - skip it, journal the host only
+        $tp = Get-ClaudeThirdPartyEndpoint
+        if ($tp) {
+            $prevKind = ''
+            foreach ($j in @(Get-JournalEvents $LogPath 200 -Provider 'claude')) {
+                if ($j.ev -ne 'fire') { continue }
+                if ($j.rec.PSObject.Properties['kind'] -and $j.rec.kind) { $prevKind = [string]$j.rec.kind }
+                break
+            }
+            Write-Log @{ ev = 'fire'; ok = $false; kind = 'third-party'; state = 'third-party'; attempts = 0; pinged = $false
+                         endpoint = $tp.host; endpoint_src = $tp.src
+                         err = ('Claude Code points at a third-party endpoint ({0}, from {1}) - no ping sent; set PREHEAT_CLAUDE_ANY_ENDPOINT=1 if it forwards to Anthropic' -f $tp.host, $tp.src) }
+            # one toast per streak, not one per fire
+            if ($prevKind -ne 'third-party') { Send-Toast $false $null 'third-party' $tp.host }
+            Remove-OwnOncePlist
+            return
+        }
         $proxy = Get-Proxy
         if ($proxy) { $env:HTTPS_PROXY = $proxy; $env:HTTP_PROXY = $proxy }
         if (-not (Test-Path $FirePit)) {
@@ -1059,19 +1155,21 @@ function Invoke-Fire {
 }
 
 function Invoke-Once($fireAt, $label, [switch]$NoWake, [string]$Provider = 'claude') {
+    $s = Get-ProviderSpec $Provider
     if ($fireAt -le (Get-Date)) { throw "fire time $fireAt is in the past" }
-    $prefix = $TaskOncePrefix
+    $prefix = $s.OncePrefix
+    # Claude's tasks have always run a bare `fire`; keep that argv
     $fireArgs = @('fire')
-    if ($Provider -eq 'codex') { $prefix = $CodexOncePrefix; $fireArgs = @('fire', '-Provider', 'codex') }
+    if ($s.Name -ne 'claude') { $fireArgs = @('fire', '-Provider', $s.Name) }
     # InvariantCulture: on macOS the name IS the schedule (Get-JobNextRun decodes
     # it with the invariant calendar), so a Buddhist year here would decode wrong
     $name = '{0}-{1}' -f $prefix, $fireAt.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)
     Register-PreheatJob -Name $name -At $fireAt -NoWake:$NoWake -ScriptArgs ($fireArgs + @('-Job', $name))
     $entry = @{ ev = 'schedule-once'; fireAt = $fireAt.ToString('s'); label = $label }
-    if ($Provider -eq 'codex') { $entry.provider = 'codex' }
+    Add-RecordProvider $entry $Provider
     Write-Log $entry
     $who = ''
-    if ($Provider -eq 'codex') { $who = 'Codex ' }
+    if ($s.Name -ne 'claude') { $who = $s.Label + ' ' }
     Write-Host ('{0}one-shot registered: fire at {1}  ({2})' -f $who, $fireAt.ToString('yyyy-MM-dd HH:mm'), $label)
 }
 
@@ -1546,13 +1644,9 @@ function Invoke-CodexStatus {
     }
     Write-Host ''
     Write-Host '-- codex tasks --'
-    $ct = @(Get-PreheatJobs 'ClaudePreheat-Codex-*')
+    $ct = @(Get-ProviderJobs 'codex')
     if ($ct.Count -eq 0) { Write-Host '(none - add a "codex" section to schedule.json, then: preheat apply -Provider codex)' }
-    foreach ($t in $ct) {
-        $nextTxt = '{0}' -f $t.next
-        if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
-        Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
-    }
+    Write-PreheatJobLines $ct
     Write-Host ''
     Write-Host '-- last codex fires --'
     $fires = @(Get-JournalEvents $LogPath 200 -Provider 'codex' | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 5)
@@ -1661,6 +1755,15 @@ function Get-NextOccurrence([string]$hhmm) {
     $cand
 }
 
+function Write-PreheatJobLines($Jobs) {
+    # one line per job: name, next run, and a spent one-shot says so
+    foreach ($t in @($Jobs)) {
+        $nextTxt = '{0}' -f $t.next
+        if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
+        Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
+    }
+}
+
 function Invoke-Status {
     Write-Host ''
     Write-Host '=== claude-preheat ==='
@@ -1675,17 +1778,19 @@ function Invoke-Status {
     } else {
         Write-Host 'activity : no local transcripts found'
     }
+    $tp = Get-ClaudeThirdPartyEndpoint
+    if ($tp) {
+        Write-Host ('! endpoint: Claude Code points at {0} (from {1}) - Claude preheats are skipped, no ping is sent' -f $tp.host, $tp.src) -ForegroundColor Yellow
+        Write-Host '  a gateway that forwards to Anthropic? set the user-level env var PREHEAT_CLAUDE_ANY_ENDPOINT=1' -ForegroundColor Yellow
+        if ($OnMac) { Write-Host '  macOS: launchd jobs get it only from preheat apply - re-run apply after setting it' -ForegroundColor Yellow }
+    }
     Write-Host ''
     Write-Host '-- scheduled preheats --'
-    # Claude's view: the Codex jobs get their own block below
+    # Claude's view: the other providers' jobs get their own blocks below
     $allTasks = @(Get-PreheatJobs)
-    $tasks = @($allTasks | Where-Object { (Get-JobProvider $_.name) -eq 'claude' })
+    $tasks = @(Get-ProviderJobs 'claude' $allTasks)
     if ($tasks.Count -gt 0) {
-        foreach ($t in $tasks) {
-            $nextTxt = '{0}' -f $t.next
-            if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
-            Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
-        }
+        Write-PreheatJobLines $tasks
         # a moved or renamed repo leaves the jobs registered and still showing a
         # next run, while every fire is a silent no-op - the one failure mode
         # status could not see before
@@ -1712,11 +1817,13 @@ function Invoke-Status {
     Write-Host ''
     Write-Host '-- recent events --'
     if (Test-Path $LogPath) {
-        # Claude's lines only: a Codex fire record read through the Claude
-        # vocabulary below would claim things about the wrong window
-        Get-Content $LogPath -Encoding UTF8 | Where-Object { $_ -notmatch '"provider"\s*:\s*"codex"' } | Select-Object -Last 8 | ForEach-Object {
+        # Claude's lines only: another provider's fire record read through the
+        # Claude vocabulary below would claim things about the wrong window
+        $evs = @(Get-JournalEvents $LogPath 8 -Provider 'claude')
+        [array]::Reverse($evs)
+        foreach ($j in $evs) {
             try {
-                $e = $_ | ConvertFrom-Json
+                $e = $j.rec
                 if ($e.ev -eq 'fire') {
                     $flag = if ($e.ok) { 'OK  ' } else { 'FAIL' }
                     $anch = ''
@@ -1758,8 +1865,17 @@ function Invoke-Status {
         Write-Host '(no log yet)'
     }
     Write-Host ''
+    # each other provider's short block (Codex: Write-CodexStatusSummary)
+    foreach ($ps in @(Get-ProviderSet 'all')) {
+        if ($ps.StatusSummary) { & $ps.StatusSummary $allTasks }
+    }
+    # same warning apply gives: a fire that cannot wake the PC is a silent no-show
+    Test-WakeTimers
+}
+
+function Write-CodexStatusSummary($AllTasks) {
     # a short Codex block, only for someone who uses Codex at all
-    $codexTasks = @($allTasks | Where-Object { (Get-JobProvider $_.name) -eq 'codex' })
+    $codexTasks = @(Get-ProviderJobs 'codex' $AllTasks)
     $codexCfg = $null
     try { $codexCfg = Get-ProviderConfig (Read-Config) 'codex' } catch { }
     if ($codexCfg -or ($codexTasks.Count -gt 0)) {
@@ -1771,18 +1887,12 @@ function Invoke-Status {
             Write-Host ('configured: {0} rule(s) in schedule.json' -f $nRules)
         }
         else { Write-Host 'configured: no "codex" section in schedule.json (preheat apply removes these tasks)' }
-        foreach ($t in $codexTasks) {
-            $nextTxt = '{0}' -f $t.next
-            if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
-            Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
-        }
+        Write-PreheatJobLines $codexTasks
         $lastCx = @(Get-FireEvents $LogPath 1 'codex')
         if ($lastCx.Count -gt 0) { Write-Host ('last fire: ' + (Format-CodexFireLine $lastCx[0])) }
         Write-Host 'details: preheat status -Codex'
         Write-Host ''
     }
-    # same warning apply gives: a fire that cannot wake the PC is a silent no-show
-    Test-WakeTimers
 }
 
 function Format-CodexFireLine($ev) {
@@ -1804,7 +1914,6 @@ function Invoke-StatusJson {
     $lastIso = $null
     if ($last) { $lastIso = $last.ToString('yyyy-MM-ddTHH:mm:ss') }
     $tasks = @()
-    $codexTasks = @()
     $broken = @()
     foreach ($t in @(Get-PreheatJobs)) {
         $next = $null
@@ -1812,14 +1921,19 @@ function Invoke-StatusJson {
         $prov = Get-JobProvider $t.name
         $row = @{ name = $t.name; next = $next; spent = [bool](Test-SpentOnce $t (Get-Date)); provider = $prov }
         $tasks += $row
-        if ($prov -eq 'codex') { $codexTasks += $row }
         if (($t.script -and (-not (Test-Path $t.script))) -or ($t.shell -and (-not (Test-Path $t.shell)))) { $broken += $t.name }
     }
-    $configured = $false
-    try { $configured = [bool](Get-ProviderConfig (Read-Config) 'codex') } catch { }
-    # lastActivity stays Claude's (transcripts); tasks lists both providers
-    $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken)
-              codex = @{ configured = $configured; tasks = @($codexTasks) } }
+    $cfg = $null
+    try { $cfg = Read-Config } catch { }
+    # lastActivity stays Claude's (transcripts); tasks lists every provider.
+    # Each provider with its own config section gets a key (today: codex).
+    $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken) }
+    foreach ($ps in @(Get-ProviderSet 'all')) {
+        if (-not $ps.ConfigKey) { continue }
+        $configured = $false
+        try { $configured = [bool](Get-ProviderConfig $cfg $ps.Name) } catch { }
+        $out[$ps.Name] = @{ configured = $configured; tasks = @($tasks | Where-Object { $_.provider -eq $ps.Name }) }
+    }
     ConvertTo-Json -InputObject $out -Compress -Depth 6
 }
 
@@ -2019,27 +2133,22 @@ function Invoke-Learn {
 }
 
 function Invoke-Off([string]$Provider = 'all') {
-    # plain off = every provider; -Codex / -Provider claude = that one only.
+    # plain off = every provider; -Codex / -Provider <name> = that one only.
     # Wait out the fire of each provider whose jobs go away.
-    if ($Provider -eq 'codex') {
-        Wait-FireLock -Path $CodexFireLock -MaxSec 720 -LivePidOnly
-        Remove-PreheatJobs 'ClaudePreheat-Codex-*'
-        Write-Log @{ ev = 'off'; provider = 'codex' }
-        Write-Host 'Codex preheat tasks removed'
+    if ((-not $Provider) -or ($Provider -eq 'all')) {
+        foreach ($s in @(Get-ProviderSet 'all')) { Wait-ProviderLock $s.Name }
+        Remove-PreheatJobs $AllJobsPattern
+        Write-Log @{ ev = 'off' }
+        Write-Host 'all preheat tasks removed'
         return
     }
-    Wait-FireLock
-    if ($Provider -eq 'claude') {
-        Remove-PreheatJobs "$TaskWkPrefix*"
-        Remove-PreheatJobs "$TaskOncePrefix*"
-        Write-Log @{ ev = 'off'; provider = 'claude' }
-        Write-Host 'Claude preheat tasks removed'
-        return
-    }
-    Wait-FireLock -Path $CodexFireLock -MaxSec 720 -LivePidOnly
-    Remove-PreheatJobs 'ClaudePreheat*'
-    Write-Log @{ ev = 'off' }
-    Write-Host 'all preheat tasks removed'
+    $s = Get-ProviderSpec $Provider
+    Wait-ProviderLock $s.Name
+    Remove-PreheatJobs ($s.WkPrefix + '*')
+    Remove-PreheatJobs ($s.OncePrefix + '*')
+    # every provider names itself here, Claude included (as it always has)
+    Write-Log @{ ev = 'off'; provider = $s.Name }
+    Write-Host ('{0} preheat tasks removed' -f $s.Label)
 }
 
 function ConvertTo-BashPath([string]$p) {
@@ -2182,33 +2291,38 @@ function Invoke-StatusLineSetup {
     Write-Host 'undo anytime: preheat statusline off'
 }
 
-# the provider a one-shot belongs to (at / reset / +Nh / +Nm)
-$OnceProvider = 'claude'
-if ($Provider -eq 'codex') { $OnceProvider = 'codex' }
+# the one provider a single-provider command acts on (fire, status -Provider,
+# learn, report, at / reset / +Nh / +Nm): none or 'all' = claude
+$OneProvider = 'claude'
+if ($Provider -and ($Provider -ne 'all')) { $OneProvider = $Provider }
+$OneSpec = Get-ProviderSpec $OneProvider
 
 switch -Regex ($Command) {
     '^apply$'  { Invoke-Apply $Provider; break }
-    '^fire$'   { if ($Provider -eq 'codex') { Invoke-CodexFire } else { Invoke-Fire }; break }
+    '^fire$'   { & $OneSpec.Fire; break }
     '^status$' {
-        if ($Provider -eq 'codex') { Invoke-CodexStatus }
-        elseif ($Json) { Invoke-StatusJson } else { Invoke-Status }
+        if ((-not $Provider) -or ($Provider -eq 'all')) {
+            if ($Json) { Invoke-StatusJson } else { Invoke-Status }
+        }
+        elseif ($Json) { & $OneSpec.StatusJson }
+        else { & $OneSpec.Status }
         break
     }
     '^learn$'  {
-        if ($Provider -eq 'codex') { Write-Host 'learn is Claude-only for now; Codex support is planned for beta.2'; break }
-        Invoke-Learn
+        if ($OneSpec.Learn) { & $OneSpec.Learn }
+        else { Write-Host ('learn is Claude-only for now; {0} support is planned for beta.2' -f $OneSpec.Label) }
         break
     }
     '^report$' {
-        if ($Provider -eq 'codex') { Invoke-CodexReport }
-        else { Write-Host 'usage: preheat report -Codex   (redacted Codex fire evidence to paste into a beta issue)' }
+        if ($OneSpec.Report) { & $OneSpec.Report }
+        else { Write-Host ('report is not available for {0}; usage: preheat report -Codex   (redacted Codex fire evidence to paste into a beta issue)' -f $OneSpec.Label) }
         break
     }
     '^off$'    { Invoke-Off $Provider; break }
     '^statusline$' { Invoke-StatusLineSetup; break }
     '^at$'     {
         if (-not $Arg) { throw 'usage: preheat at HH:mm' }
-        Invoke-Once (Get-NextOccurrence $Arg) ('at ' + $Arg) -Provider $OnceProvider
+        Invoke-Once (Get-NextOccurrence $Arg) ('at ' + $Arg) -Provider $OneProvider
         break
     }
     '^reset$'  {
@@ -2218,14 +2332,14 @@ switch -Regex ($Command) {
             Write-Host ('requested reset {0} unreachable today (fire time already past) - scheduling for tomorrow' -f $Arg)
             $t = $t.AddDays(1)
         }
-        Invoke-Once $t ('reset ' + $Arg) -Provider $OnceProvider
+        Invoke-Once $t ('reset ' + $Arg) -Provider $OneProvider
         break
     }
     '^\+\d+[hm]$' {
         $null = $Command -match '^\+(\d+)([hm])$'
         $n = [int]$Matches[1]
         $t = if ($Matches[2] -eq 'h') { (Get-Date).AddHours($n) } else { (Get-Date).AddMinutes($n) }
-        Invoke-Once $t $Command -Provider $OnceProvider
+        Invoke-Once $t $Command -Provider $OneProvider
         break
     }
     default {
