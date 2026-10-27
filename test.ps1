@@ -2094,7 +2094,7 @@ try {
         } catch {
             $code = 0
             if ($_.Exception.Response) { $code = $_.Exception.Response.StatusCode.value__ }
-            return @{ Code = $code; Body = '' }
+            return @{ Code = $code; Body = ''; Err = $_.Exception.Message }
         }
     }
     function Get-CxRootConfig { Get-Content (Join-Path $cxRoot 'schedule.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
@@ -2157,7 +2157,9 @@ try {
             [System.IO.File]::WriteAllText($sf, $keep)
             Remove-Item $lk -ErrorAction SilentlyContinue
         }
-        ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
+        $ok = ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
+        if (-not $ok) { Write-Host ('  debug: unparseable={0} untouched={1} busy={2} busyErr={3} pid={4} alive={5}' -f $u.Code, ($after -eq $broken), $b.Code, $b.Err, $PID, [bool](Get-Process -Id $PID -ErrorAction SilentlyContinue)) }
+        $ok
     }
     Test-Case 'POST once with provider codex hands -Codex to the backend' {
         Remove-Item $cxBackendLog -ErrorAction SilentlyContinue
@@ -2187,6 +2189,7 @@ try {
         $lock = Join-Path $cxRoot '.fire-codex.lock'
         ('{"pid":' + $PID + ',"job":"x","startedAt":"' + (Get-Date).ToString('s', $cxInv) + '"}') | Set-Content -Path $lock -Encoding UTF8
         $busy = Invoke-CxPost '/api/codex/refresh' '{}'
+        if ($busy.Code -ne 409) { Write-Host ('  debug: refresh-busy={0} err={1} lock={2}' -f $busy.Code, $busy.Err, (Get-Content $lock -Raw)) }
         Remove-Item $lock -ErrorAction SilentlyContinue
         Set-CodexStub @{ profile = 'free30d' }
         $r = Invoke-CxPost '/api/codex/refresh' '{}' 90
