@@ -649,6 +649,10 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
             (($r.reg[0].args -join ' ') -eq ('fire -Job ' + $r.reg[0].name)) -and
             ($r.toast -eq ('True|False|| - follow-up preheat at ' + $end.AddMinutes(2).ToString('HH:mm')))
     }
+    Test-Case 'fire integration: the ping temp files (dot files, hidden on macOS) are gone after the fire' {
+        $null = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
+        @(Get-ChildItem -Force -Path $Tmp -Filter '.fire-*.tmp' -ErrorAction SilentlyContinue).Count -eq 0
+    }
     Test-Case 'fire integration: a ping after 5h of quiet anchors a new window and books nothing' {
         $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
         $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
@@ -1661,7 +1665,7 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $lock = Join-Path $Tmp 'cx-int.lock'
         ('{"pid":' + $PID + ',"job":"ClaudePreheat-Codex-Once-20990101-0000","startedAt":"' + (Get-Date).ToString('s', $cxInv) + '"}') | Set-Content -Path $lock -Encoding UTF8
         $still = $false
-        try { $r = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) } } finally { $still = Test-Path $lock; Remove-Item $lock -ErrorAction SilentlyContinue }
+        try { $r = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) } } finally { $still = Test-Path $lock; Remove-Item $lock -Force -ErrorAction SilentlyContinue }
         $own = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) }
         $r.fire -and $still -and ($r.fire.kind -eq 'other') -and ([string]$r.fire.err -like '*another Codex fire*') -and ($r.calls.Count -eq 0) -and
             ($r.toast.Count -eq 0) -and $own.fire -and ($own.fire.kind -ne 'other') -and (-not (Test-Path $lock))
@@ -1675,7 +1679,7 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $StatePath     = Join-Path $Tmp 'cx-apply-state.json'
         $FireLock      = Join-Path $Tmp 'cx-apply-claude.lock'
         $CodexFireLock = Join-Path $Tmp 'cx-apply-codex.lock'
-        Remove-Item $FireLock, $CodexFireLock -ErrorAction SilentlyContinue
+        Remove-Item $FireLock, $CodexFireLock -Force -ErrorAction SilentlyContinue
         if ($FreshCodexLock) { ('{"pid":' + $LockPid + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $CodexFireLock -Encoding UTF8 }
         $script:AReg = @(); $script:ARemove = @(); $script:AClaude = 0
         function Start-Sleep { param($Seconds, $Milliseconds) }
@@ -1755,7 +1759,7 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $LogPath = Join-Path $Tmp 'cx-off.jsonl'
         $FireLock = Join-Path $Tmp 'cx-off-claude.lock'
         $CodexFireLock = Join-Path $Tmp 'cx-off-codex.lock'
-        Remove-Item $FireLock, $CodexFireLock -ErrorAction SilentlyContinue
+        Remove-Item $FireLock, $CodexFireLock -Force -ErrorAction SilentlyContinue
         $script:LRemove = @()
         function Start-Sleep { param($Seconds, $Milliseconds) }
         function Remove-PreheatJobs { param([string]$Pattern) $script:LRemove += $Pattern }
@@ -1768,11 +1772,11 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         $m2 = ''; try { Invoke-Off -Provider 'codex' 6>$null } catch { $m2 = $_.Exception.Message }
         $m3 = ''; try { Wait-FireLock -MaxSec 1 -Path $CodexFireLock } catch { $m3 = $_.Exception.Message }
         $blocked = $script:LRemove.Count
-        Remove-Item $CodexFireLock -ErrorAction SilentlyContinue
+        Remove-Item $CodexFireLock -Force -ErrorAction SilentlyContinue
         # a running CLAUDE fire does not hold up removing the Codex tasks
         $fresh | Set-Content -Path $FireLock -Encoding UTF8
         $m4 = ''; try { Invoke-Off -Provider 'codex' 6>$null } catch { $m4 = $_.Exception.Message }
-        Remove-Item $FireLock -ErrorAction SilentlyContinue
+        Remove-Item $FireLock -Force -ErrorAction SilentlyContinue
         $codexOnly = @($script:LRemove)
         $script:LRemove = @()
         Invoke-Off 6>$null
@@ -2168,7 +2172,7 @@ try {
             $b = Invoke-CxPost '/api/preheat/apply' '{"provider":"codex","rules":[{"days":["Fri"],"reset":"16:00"}]}'
         } finally {
             [System.IO.File]::WriteAllText($sf, $keep)
-            Remove-Item $lk -ErrorAction SilentlyContinue
+            Remove-Item $lk -Force -ErrorAction SilentlyContinue
         }
         ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
     }
@@ -2200,7 +2204,7 @@ try {
         $lock = Join-Path $cxRoot '.fire-codex.lock'
         ('{"pid":' + $PID + ',"job":"x","startedAt":"' + (Get-Date).ToString('s', $cxInv) + '"}') | Set-Content -Path $lock -Encoding UTF8
         $busy = Invoke-CxPost '/api/codex/refresh' '{}'
-        Remove-Item $lock -ErrorAction SilentlyContinue
+        Remove-Item $lock -Force -ErrorAction SilentlyContinue
         Set-CodexStub @{ profile = 'free30d' }
         $r = Invoke-CxPost '/api/codex/refresh' '{}' 90
         $j = $null

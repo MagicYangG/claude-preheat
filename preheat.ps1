@@ -984,7 +984,7 @@ function Invoke-Fire {
                 $v = Test-PingOutput 1 '' $_.Exception.Message
                 $errText = $v.err; $kind = $v.kind
             } finally {
-                Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+                Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
             }
             # neither an expired login nor a usage limit heals in 90s: two more
             # attempts only spend three minutes and log the same line thrice

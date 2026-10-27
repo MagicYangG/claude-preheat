@@ -148,7 +148,7 @@ function Invoke-BackendCommand {
         $stderr = ''; if (Test-Path $errFile) { $stderr = Get-Content $errFile -Raw -Encoding UTF8 }
         @{ ExitCode = $p.ExitCode; StdOut = $stdout; StdErr = $stderr }
     } finally {
-        Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
     }
 }
 
