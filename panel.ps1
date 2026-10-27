@@ -626,7 +626,8 @@ function Test-CodexFireRunning {
     $lk = Join-Path $Root '.fire-codex.lock'
     if (-not (Test-Path $lk)) { return $false }
     try {
-        if ((Get-Item $lk).LastWriteTime -lt (Get-Date).AddMinutes(-20)) { return $false }
+        # -Force: a dot file is hidden from a plain Get-Item on macOS
+        if ((Get-Item -Force $lk).LastWriteTime -lt (Get-Date).AddMinutes(-20)) { return $false }
         $l = Get-Content $lk -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
         if ($l -and $l.pid -and (Get-Process -Id ([int]$l.pid) -ErrorAction SilentlyContinue)) { return $true }
     } catch { }

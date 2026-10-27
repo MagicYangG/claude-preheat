@@ -766,6 +766,19 @@ $cxInv = [System.Globalization.CultureInfo]::InvariantCulture
         Wait-FireLock -MaxSec 1
         -not (Test-Path $FireLock)
     }
+    Test-Case 'a dot-named lock (hidden from a plain Get-Item on macOS) is read like any other: live holder seen, corpse cleared' {
+        # the real locks are .fire.lock / .fire-codex.lock; a holder check that
+        # cannot see a hidden file calls every lock stale and races the fire
+        $p = Join-Path $Tmp '.fire-dot.lock'
+        ('{"pid":' + $PID + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $p -Encoding UTF8
+        $held = Get-FireLockHolder $p
+        Set-Content -Path $p -Value '{}' -Encoding UTF8
+        (Get-Item -Force $p).LastWriteTime = (Get-Date).AddMinutes(-30)
+        Wait-FireLock -Path $p -MaxSec 1
+        $gone = -not (Test-Path $p)
+        Remove-Item $p -Force -ErrorAction SilentlyContinue
+        $held -and ([int]$held.pid -eq $PID) -and $gone
+    }
 
     Write-Host '-- preheat: activity detection --'
     Test-Case 'idle-session bookkeeping records do NOT count as activity' {
@@ -2094,7 +2107,7 @@ try {
         } catch {
             $code = 0
             if ($_.Exception.Response) { $code = $_.Exception.Response.StatusCode.value__ }
-            return @{ Code = $code; Body = ''; Err = $_.Exception.Message }
+            return @{ Code = $code; Body = '' }
         }
     }
     function Get-CxRootConfig { Get-Content (Join-Path $cxRoot 'schedule.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
@@ -2152,16 +2165,12 @@ try {
             $after = [System.IO.File]::ReadAllText($sf)
             [System.IO.File]::WriteAllText($sf, $keep)
             ('{"pid":' + $PID + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $lk -Encoding UTF8
-            $probe = '$p = ''' + $lk + '''; $l = Get-Content $p -Raw | ConvertFrom-Json; $gp = Get-Process -Id ([int]$l.pid) -ErrorAction SilentlyContinue; $e = $null; try { $null = [System.Diagnostics.Process]::GetProcessById([int]$l.pid) } catch { $e = $_.Exception.Message }; ''child: pid={0} gp={1} gpbid_err={2} lwt={3:o} now={4:o} fresh={5}'' -f $l.pid, [bool]$gp, $e, (Get-Item $p).LastWriteTime, (Get-Date), ((Get-Item $p).LastWriteTime -gt (Get-Date).AddMinutes(-20))'
-            Write-Host ('  debug: ' + ((& $cxShell -NoProfile -Command $probe 2>&1) | Out-String).Trim())
             $b = Invoke-CxPost '/api/preheat/apply' '{"provider":"codex","rules":[{"days":["Fri"],"reset":"16:00"}]}'
         } finally {
             [System.IO.File]::WriteAllText($sf, $keep)
             Remove-Item $lk -ErrorAction SilentlyContinue
         }
-        $ok = ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
-        if (-not $ok) { Write-Host ('  debug: unparseable={0} untouched={1} busy={2} busyErr={3} pid={4} alive={5}' -f $u.Code, ($after -eq $broken), $b.Code, $b.Err, $PID, [bool](Get-Process -Id $PID -ErrorAction SilentlyContinue)) }
-        $ok
+        ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
     }
     Test-Case 'POST once with provider codex hands -Codex to the backend' {
         Remove-Item $cxBackendLog -ErrorAction SilentlyContinue
@@ -2191,7 +2200,6 @@ try {
         $lock = Join-Path $cxRoot '.fire-codex.lock'
         ('{"pid":' + $PID + ',"job":"x","startedAt":"' + (Get-Date).ToString('s', $cxInv) + '"}') | Set-Content -Path $lock -Encoding UTF8
         $busy = Invoke-CxPost '/api/codex/refresh' '{}'
-        if ($busy.Code -ne 409) { Write-Host ('  debug: refresh-busy={0} err={1} lock={2}' -f $busy.Code, $busy.Err, (Get-Content $lock -Raw)) }
         Remove-Item $lock -ErrorAction SilentlyContinue
         Set-CodexStub @{ profile = 'free30d' }
         $r = Invoke-CxPost '/api/codex/refresh' '{}' 90

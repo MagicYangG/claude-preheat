@@ -394,7 +394,7 @@ function Wait-FireLock([int]$MaxSec = 90, [string]$Path = $FireLock, [switch]$Li
     try {
         # a fire cannot outlive 3 x 240s + 2 x 90s, so anything older is a
         # leftover from a killed process, not a live ping
-        if ((Get-Item $Path).LastWriteTime -lt (Get-Date).AddMinutes(-20)) {
+        if ((Get-Item -Force $Path).LastWriteTime -lt (Get-Date).AddMinutes(-20)) {
             Remove-Item $Path -Force -ErrorAction SilentlyContinue
             return
         }
@@ -885,7 +885,8 @@ function Get-FireLockHolder([string]$Path) {
     if (-not (Test-Path $Path)) { return $null }
     try {
         $prev = Get-Content $Path -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
-        if ($prev -and $prev.pid -and ((Get-Item $Path).LastWriteTime -gt (Get-Date).AddMinutes(-20)) -and
+        # -Force: the lock is a dot file, hidden from a plain Get-Item on macOS
+        if ($prev -and $prev.pid -and ((Get-Item -Force $Path).LastWriteTime -gt (Get-Date).AddMinutes(-20)) -and
             (Get-Process -Id ([int]$prev.pid) -ErrorAction SilentlyContinue)) { return $prev }
     } catch { }
     $null
@@ -1081,7 +1082,7 @@ function Get-AuthStamp {
     # fire refreshed the login token (every codex child may rotate it)
     try {
         $p = Join-Path (Get-CodexHome) 'auth.json'
-        if (Test-Path $p) { return (Get-Item $p).LastWriteTimeUtc.Ticks }
+        if (Test-Path $p) { return (Get-Item -Force $p).LastWriteTimeUtc.Ticks }
     } catch { }
     $null
 }
