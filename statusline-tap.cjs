@@ -71,11 +71,11 @@ function renderSolo(j) {
       const pct = (o.utilization != null) ? o.utilization : o.used_percentage;
       let s = label + ' ' + (pct != null ? Math.round(pct) + '%' : '?');
       const d = toDate(o.resets_at);
-      if (d) s += '→' + two(d.getHours()) + ':' + two(d.getMinutes());
+      if (d) s += '\u2192' + two(d.getHours()) + ':' + two(d.getMinutes());
       parts.push(s);
     };
     seg('5h', rl.five_hour);
     seg('wk', rl.seven_day);
-    return parts.join(' · ') || 'claude';
+    return parts.join(' \u00b7 ') || 'claude';
   } catch (e) { return 'claude'; }
 }

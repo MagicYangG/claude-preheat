@@ -21,6 +21,16 @@ Commands:
                  for the panel quota strip
   off            Unregister all preheat tasks
 
+Codex (beta): the same commands take -Codex (= -Provider codex) and work on
+the "codex" section of schedule.json instead:
+  apply [-Provider claude|codex|all]   (default all; one failing never stops the other)
+  at / reset / +Nh / +Nm -Codex        Codex one-shots
+  off -Codex                           remove the Codex tasks only
+  status -Codex [-Json]                live quota read: account, 5h + weekly window, rolling check
+  report -Codex                        redacted fire evidence to paste into an issue
+A Codex fire reads the quota first (free), skips the ping when a window is
+already running, and reads again after the ping to tell whether it anchored.
+
 Mechanism: the Max 5h usage window is anchored by the FIRST request when no
 window is active. A scheduled tiny headless ping (`claude -p "hi"`) anchors it
 at a chosen time with zero model involvement beforehand. Pinging while a
@@ -31,10 +41,19 @@ param(
     [Parameter(Position = 0)][string]$Command = 'status',
     [Parameter(Position = 1)][string]$Arg,
     [switch]$Json,
-    [string]$Job
+    [string]$Job,
+    [string]$Provider = '',
+    [switch]$Codex
 )
 
 $ErrorActionPreference = 'Stop'
+# -Codex is the short form the docs use; -Provider is what tasks and the panel pass
+if ($Codex) {
+    if ($Provider -and ($Provider -ne 'codex')) { throw ('usage: -Codex conflicts with -Provider {0}' -f $Provider) }
+    $Provider = 'codex'
+}
+$Provider = $Provider.ToLowerInvariant()
+if ($Provider -notin @('', 'claude', 'codex', 'all')) { throw ('usage: -Provider claude | codex | all (got: {0})' -f $Provider) }
 # A Windows task carries no environment block, so a one-shot passes its own
 # name as -Job; launchd sets CLAUDE_PREHEAT_SELF in the plist instead. The fire
 # needs it to know whether it is a follow-up (Test-ChaseFire).
@@ -49,6 +68,18 @@ $FireLock   = Join-Path $Root '.fire.lock'
 $TaskWkPrefix   = 'ClaudePreheat-Wk'
 $TaskOncePrefix = 'ClaudePreheat-Once'
 $WindowHours = 5
+# Codex twins of the above: its own lock (a Codex fire must not block or be
+# blocked by a Claude one), its own cache (the statusline tap overwrites
+# state-ratelimits.json whole), its own empty working dir for `codex exec -C`
+$CodexFireLock   = Join-Path $Root '.fire-codex.lock'
+$CodexCachePath  = Join-Path $Root 'state-ratelimits-codex.json'
+$CodexFirePit    = Join-Path $Root 'firepit-codex'
+$CodexWkPrefix   = 'ClaudePreheat-Codex-Wk'
+$CodexOncePrefix = 'ClaudePreheat-Codex-Once'
+# one Codex fire, start to finish (lock wait included): optional steps (a
+# retry, another candidate, the confirm read) run only while they still fit,
+# so the worst case stays near 11 min - inside the 20 min stale-lock line
+$CodexFireBudgetSec = 660
 
 $DayMap   = @{ Mon = 'Monday'; Tue = 'Tuesday'; Wed = 'Wednesday'; Thu = 'Thursday'; Fri = 'Friday'; Sat = 'Saturday'; Sun = 'Sunday' }
 $DayOrder = @('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
@@ -56,6 +87,8 @@ $DayOrder = @('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 
 # OS adapter: scheduling backends (Task Scheduler / launchd), wake warnings,
 # toasts, home-dir resolution. Shared with panel.ps1.
 . (Join-Path $Root 'platform.ps1')
+# Codex adapter: exe discovery, the read-only app-server client, verdicts
+. (Join-Path $Root 'codex.ps1')
 
 function Read-Config {
     if (-not (Test-Path $ConfigPath)) { throw "schedule.json not found at $ConfigPath" }
@@ -103,7 +136,22 @@ function Write-Log($obj) {
     }
 }
 
-function Get-FireEvents([string]$path, [int]$max = 60) {
+function Get-RecordProvider($e) {
+    # a journal record without a provider is Claude's: every line written
+    # before Codex support existed, and every Claude line since
+    if ($e -and $e.PSObject.Properties['provider'] -and $e.provider) { return ([string]$e.provider).ToLowerInvariant() }
+    'claude'
+}
+
+function Test-LineProvider([string]$line, [string]$Provider) {
+    # cheap text pre-filter, before any ConvertFrom-Json: a reader scanning
+    # 1000 lines for one provider skips the other's without parsing them.
+    # 'all' = every line. Callers still check Get-RecordProvider after parsing.
+    if ($Provider -eq 'all') { return $true }
+    ($Provider -eq 'codex') -eq ($line -match '"provider"\s*:\s*"codex"')
+}
+
+function Get-FireEvents([string]$path, [int]$max = 60, [string]$Provider = 'claude') {
     # the journal's fire records, newest first, trimmed to what a reader shows
     # (the panel's fire-history list). Pure in $path so a synthetic journal
     # exercises every record shape without spending a token. Never throws:
@@ -111,11 +159,16 @@ function Get-FireEvents([string]$path, [int]$max = 60) {
     $out = New-Object System.Collections.Generic.List[object]
     if ($path -and (Test-Path $path)) {
         $lines = @()
-        try { $lines = @(Get-Content $path -Tail 400 -Encoding UTF8) } catch { $lines = @() }
+        # 1000, not 400: two providers share the file, each needs its own history
+        try { $lines = @(Get-Content $path -Tail 1000 -Encoding UTF8) } catch { $lines = @() }
         $pendingChase = $null
         for ($i = $lines.Count - 1; ($i -ge 0) -and ($out.Count -lt $max); $i--) {
+            # filter BEFORE the chase pairing below: a Claude follow-up booked in
+            # the same minute as a Codex fire must not be attached to it
+            if (-not (Test-LineProvider $lines[$i] $Provider)) { continue }
             $e = $null
             try { $e = $lines[$i] | ConvertFrom-Json } catch { continue }
+            if ($e -and ($Provider -ne 'all') -and ((Get-RecordProvider $e) -ne $Provider)) { continue }
             if ((-not $e) -or ($e.ev -ne 'fire')) {
                 # a chase booking is written right after the fire that booked it
                 # (so it is the NEWER line): remember it for that fire's record
@@ -145,6 +198,11 @@ function Get-FireEvents([string]$path, [int]$max = 60) {
                 $s = [string]$e.err
                 $rec.err = $s.Substring(0, [Math]::Min(120, $s.Length))
             }
+            $rec.provider = Get-RecordProvider $e
+            # Codex fires say more than anchored yes/no (running, sliding, no5h...)
+            if ($e.PSObject.Properties['state'] -and $e.state) { $rec.state = [string]$e.state }
+            if ($e.PSObject.Properties['pinged'] -and ($null -ne $e.pinged)) { $rec.pinged = [bool]$e.pinged }
+            if ($e.PSObject.Properties['plan'] -and $e.plan) { $rec.plan = [string]$e.plan }
             [void]$out.Add($rec)
         }
     }
@@ -216,16 +274,13 @@ function Get-FireSpecs($config) {
     $specs
 }
 
-function Invoke-Apply {
-    Wait-FireLock
-    $config = Read-Config
+function Get-WeeklyPlan($ProviderConfig, [string]$Prefix) {
+    # every weekly task of one provider, computed BEFORE anything is deleted:
+    # a spec that throws here used to leave the machine with no weekly tasks
+    # at all and no way to know
     # @(): a single-rule schedule.json unrolls to a bare hashtable, whose .Count
     # is the hashtable's key count, not 1
-    $specs  = @(Get-FireSpecs $config)
-    # resolve claude path now, in an interactive shell where PATH is complete
-    Write-State @{ claude = (Resolve-ClaudeExe); pwsh = (Resolve-HostShell); appliedAt = (Get-Date).ToString('s') }
-    # compute every task BEFORE deleting the old ones: a spec that throws here
-    # used to leave the machine with no weekly tasks at all and no way to know
+    $specs = @(Get-FireSpecs $ProviderConfig)
     $plan = @()
     foreach ($s in $specs) {
         # StartBoundary must be in the future, else the scheduler's week alignment
@@ -234,57 +289,132 @@ function Invoke-Apply {
         if ($at -le (Get-Date)) { $at = $at.AddDays(1) }
         $dayTag = ($s.Days | ForEach-Object { $_.Substring(0, 3) }) -join ''
         $plan += @{
-            Name     = '{0}-{1}-{2}' -f $TaskWkPrefix, $s.FireTime.ToString('hhmm'), $dayTag
+            Name     = '{0}-{1}-{2}' -f $Prefix, $s.FireTime.ToString('hhmm'), $dayTag
             Days     = $s.Days
             At       = $at
             FireTime = $s.FireTime
             Reset    = $s.Reset
         }
     }
-    Remove-PreheatJobs "$TaskWkPrefix*"
-    try { Remove-StaleOnceJobs } catch { }
-    if ($OnMac) { Limit-LaunchdErrLog }
+    , $plan
+}
+
+function Register-WeeklyPlan($plan, [string[]]$ScriptArgs, [string]$Provider) {
+    # registers every task, journals one apply record, throws when any task
+    # was rejected - after trying the rest: one rejected task must not
+    # abandon them half-applied
     $failed = @()
     foreach ($job in $plan) {
         try {
-            Register-PreheatJob -Name $job.Name -Days $job.Days -At $job.At
+            Register-PreheatJob -Name $job.Name -Days $job.Days -At $job.At -ScriptArgs $ScriptArgs
             Write-Host ('registered  {0}  fire {1}  -> reset {2}  [{3}]' -f $job.Name, $job.FireTime.ToString('hh\:mm'), $job.Reset, ($job.Days -join ','))
         } catch {
-            # one rejected task must not abandon the rest half-applied
             $failed += ('{0}: {1}' -f $job.Name, $_.Exception.Message)
             Write-Host ('FAILED      {0}  {1}' -f $job.Name, $_.Exception.Message) -ForegroundColor Red
         }
     }
+    $entry = @{ ev = 'apply'; tasks = $plan.Count }
+    if ($Provider -eq 'codex') { $entry.provider = 'codex' }
+    if ($failed.Count -gt 0) { $entry.failed = $failed.Count }
+    Write-Log $entry
     if ($failed.Count -gt 0) {
-        Write-Log @{ ev = 'apply'; tasks = $plan.Count; failed = $failed.Count }
         throw ('apply registered {0} of {1} tasks - failed: {2}' -f ($plan.Count - $failed.Count), $plan.Count, ($failed -join '; '))
     }
-    Write-Log @{ ev = 'apply'; tasks = $plan.Count }
+}
+
+function Invoke-Apply([string]$Provider = 'all') {
+    # claude, codex or all (''). Each provider plans, sweeps and registers on
+    # its own: one failing never stops the other, and apply still fails when
+    # either did. Apply never spawns codex.
+    $doClaude = $Provider -in @('', 'all', 'claude')
+    $doCodex  = $Provider -in @('', 'all', 'codex')
+    $config = Read-Config
+    $errors = @()
+    if ($doClaude) {
+        try {
+            # each provider waits for its own fire inside its own try: a long
+            # Codex fire must not cost the Claude half
+            Wait-FireLock
+            $plan = Get-WeeklyPlan $config $TaskWkPrefix
+            # resolve claude path now, in an interactive shell where PATH is
+            # complete - unless there is nothing to fire: a Codex-only user may
+            # not have claude installed at all
+            if ($plan.Count -gt 0) {
+                Write-State @{ claude = (Resolve-ClaudeExe); pwsh = (Resolve-HostShell); appliedAt = (Get-Date).ToString('s') }
+            }
+            Remove-PreheatJobs "$TaskWkPrefix*"
+            try { Remove-StaleOnceJobs 'claude' } catch { }
+            if ($OnMac) { Limit-LaunchdErrLog }
+            Register-WeeklyPlan $plan @('fire') 'claude'
+        } catch { $errors += $_.Exception.Message }
+    }
+    if ($doCodex) {
+        try {
+            Wait-FireLock -Path $CodexFireLock -MaxSec 720 -LivePidOnly
+            Invoke-CodexApply $config
+        } catch { $errors += ('codex: ' + $_.Exception.Message) }
+    }
+    if ($errors.Count -gt 0) { throw ($errors -join ' | ') }
     Test-WakeTimers
 }
 
-function Wait-FireLock([int]$MaxSec = 90) {
+function Invoke-CodexApply($config) {
+    $cx = Get-ProviderConfig $config 'codex'
+    if (-not $cx) {
+        # no codex section = Codex off: whatever weekly tasks an earlier
+        # section left behind go, silently when there are none
+        if (@(Get-PreheatJobs "$CodexWkPrefix*").Count -gt 0) {
+            Remove-PreheatJobs "$CodexWkPrefix*"
+            Write-Host 'removed the Codex weekly tasks (no "codex" section in schedule.json)'
+        }
+        return
+    }
+    $plan = Get-WeeklyPlan $cx $CodexWkPrefix
+    # a scheduled task carries no shell environment: remember a CODEX_HOME the
+    # user set, so every fire talks to the same codex home this shell does
+    if ($env:CODEX_HOME -and ([string]$cx.home -ne $env:CODEX_HOME)) {
+        try {
+            $raw = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw.codex | Add-Member -NotePropertyName home -NotePropertyValue $env:CODEX_HOME -Force
+            $null = Backup-File $ConfigPath
+            Write-Utf8NoBom $ConfigPath (ConvertTo-Json -InputObject $raw -Depth 8)
+            Write-Host ('schedule.json: codex.home = {0} (from CODEX_HOME)' -f $env:CODEX_HOME)
+        } catch { Write-Host ('could not record CODEX_HOME in schedule.json: {0}' -f $_.Exception.Message) -ForegroundColor Yellow }
+    }
+    Remove-PreheatJobs "$CodexWkPrefix*"
+    try { Remove-StaleOnceJobs 'codex' } catch { }
+    Register-WeeklyPlan $plan @('fire', '-Provider', 'codex') 'codex'
+}
+
+function Wait-FireLock([int]$MaxSec = 90, [string]$Path = $FireLock, [switch]$LivePidOnly) {
     # apply/off rewrite or delete the very job a running fire lives inside - on
     # macOS bootout SIGTERMs that fire mid-ping, on Windows the re-register
     # races it. Wait the fire out instead of racing it.
-    if (-not (Test-Path $FireLock)) { return }
+    if (-not (Test-Path $Path)) { return }
     try {
         # a fire cannot outlive 3 x 240s + 2 x 90s, so anything older is a
         # leftover from a killed process, not a live ping
-        if ((Get-Item $FireLock).LastWriteTime -lt (Get-Date).AddMinutes(-20)) {
-            Remove-Item $FireLock -Force -ErrorAction SilentlyContinue
+        if ((Get-Item $Path).LastWriteTime -lt (Get-Date).AddMinutes(-20)) {
+            Remove-Item $Path -Force -ErrorAction SilentlyContinue
             return
         }
     } catch { return }
+    # -LivePidOnly (Codex): a Codex fire runs for minutes, so the wait is
+    # long - never spend it on a lock whose process is already gone
+    if ($LivePidOnly) {
+        if (-not (Get-FireLockHolder $Path)) { return }
+        Write-Host ('waiting for the running Codex fire to finish (up to {0} min)...' -f [Math]::Ceiling($MaxSec / 60))
+    }
     $waited = 0
-    while ((Test-Path $FireLock) -and ($waited -lt $MaxSec)) {
+    while ((Test-Path $Path) -and ($waited -lt $MaxSec)) {
         Start-Sleep -Seconds 3
         $waited += 3
+        if ($LivePidOnly -and -not (Get-FireLockHolder $Path)) { return }
     }
-    if (Test-Path $FireLock) {
+    if (Test-Path $Path) {
         $job = '?'; $started = '?'
         try {
-            $l = Get-Content $FireLock -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+            $l = Get-Content $Path -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
             if ($l) {
                 if ($l.job) { $job = [string]$l.job }
                 # ConvertFrom-Json may hand the ISO string back as a [datetime];
@@ -526,17 +656,19 @@ function ConvertTo-LocalTime($v) {
     try { return ([datetimeoffset]::Parse([string]$v, [System.Globalization.CultureInfo]::InvariantCulture)).LocalDateTime } catch { return $null }
 }
 
-function Get-JournalEvents([string]$path, [int]$max = 200) {
-    # every journal record, newest first; bad lines skipped; ts as local
-    # DateTime (or $null). Never throws.
+function Get-JournalEvents([string]$path, [int]$max = 200, [string]$Provider = 'claude') {
+    # the journal records of one provider ('all' = every record), newest
+    # first; bad lines skipped; ts as local DateTime (or $null). Never throws.
     $out = New-Object System.Collections.Generic.List[object]
     if ($path -and (Test-Path $path)) {
         $lines = @()
-        try { $lines = @(Get-Content $path -Tail 400 -Encoding UTF8) } catch { $lines = @() }
+        try { $lines = @(Get-Content $path -Tail 1000 -Encoding UTF8) } catch { $lines = @() }
         for ($i = $lines.Count - 1; ($i -ge 0) -and ($out.Count -lt $max); $i--) {
+            if (-not (Test-LineProvider $lines[$i] $Provider)) { continue }
             $e = $null
             try { $e = $lines[$i] | ConvertFrom-Json } catch { continue }
             if (-not $e) { continue }
+            if (($Provider -ne 'all') -and ((Get-RecordProvider $e) -ne $Provider)) { continue }
             $t = $null
             if ($e.PSObject.Properties['ts']) { $t = ConvertTo-LocalTime $e.ts }
             [void]$out.Add(@{ ev = [string]$e.ev; ts = $t; rec = $e })
@@ -545,18 +677,18 @@ function Get-JournalEvents([string]$path, [int]$max = 200) {
     $out.ToArray()
 }
 
-function Get-LastPreheatAnchor([string]$path = $null) {
+function Get-LastPreheatAnchor([string]$path = $null, [string]$Provider = 'claude') {
     # when did a preheat ping of our own last open a window? (newest journal
     # fire with ok + anchored). $null when none in the journal tail.
     if (-not $path) { $path = $LogPath }
-    foreach ($j in @(Get-JournalEvents $path 200)) {
+    foreach ($j in @(Get-JournalEvents $path 200 -Provider $Provider)) {
         $e = $j.rec
         if (($j.ev -eq 'fire') -and $j.ts -and $e.ok -and $e.PSObject.Properties['anchored'] -and ($e.anchored -eq $true)) { return $j.ts }
     }
     $null
 }
 
-function Test-RecentPreheatAnchor([datetime]$Before, [string]$path = $null) {
+function Test-RecentPreheatAnchor([datetime]$Before, [string]$path = $null, [string]$Provider = 'claude') {
     # true when a preheat ping opened the window that is running now (an
     # anchored fire inside the last 5h), or a chase for this very gap is
     # already on the books. This is what stops chase chains: a chase anchors
@@ -564,7 +696,7 @@ function Test-RecentPreheatAnchor([datetime]$Before, [string]$path = $null) {
     # chase again - or the tool would re-anchor every 5h forever.
     if (-not $path) { $path = $LogPath }
     $from = $Before.AddHours(-$WindowHours)
-    foreach ($j in @(Get-JournalEvents $path 200)) {
+    foreach ($j in @(Get-JournalEvents $path 200 -Provider $Provider)) {
         $e = $j.rec
         if ($j.ev -eq 'fire') {
             if ($j.ts -and ($j.ts -gt $from) -and ($j.ts -le $Before) -and $e.ok -and
@@ -585,31 +717,44 @@ function Test-RecentPreheatAnchor([datetime]$Before, [string]$path = $null) {
     $false
 }
 
-function Test-ChaseFire([string]$Self, [string]$path = $null) {
+function Test-ChaseFire([string]$Self, [string]$path = $null, [string]$Provider = 'claude') {
     # is this fire itself a follow-up? Its job name ($env:CLAUDE_PREHEAT_SELF)
     # is the one-shot Invoke-Once derived from fireAt, and the journal's
     # 'schedule-once' record with a chase label carries that fireAt. Matching
     # the name, not a time window, also recognises a follow-up launchd ran
     # late after a sleep. -> $true / $false
-    if ((-not $Self) -or ($Self -notlike ($TaskOncePrefix + '-*'))) { return $false }
+    $prefix = $TaskOncePrefix
+    if ($Provider -eq 'codex') { $prefix = $CodexOncePrefix }
+    if ((-not $Self) -or ($Self -notlike ($prefix + '-*'))) { return $false }
     if (-not $path) { $path = $LogPath }
-    foreach ($j in @(Get-JournalEvents $path 200)) {
+    foreach ($j in @(Get-JournalEvents $path 200 -Provider $Provider)) {
         $e = $j.rec
         if (($j.ev -ne 'schedule-once') -or (-not $e.PSObject.Properties['label']) -or ([string]$e.label -notlike 'chase*')) { continue }
         $at = $null
         if ($e.PSObject.Properties['fireAt']) { $at = ConvertTo-LocalTime $e.fireAt }
-        if ($at -and (($TaskOncePrefix + '-' + $at.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)) -eq $Self)) { return $true }
+        if ($at -and (($prefix + '-' + $at.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)) -eq $Self)) { return $true }
     }
     $false
 }
 
-function Get-NextWeeklyFire([datetime]$After) {
+function Get-ProviderConfig($config, [string]$Provider) {
+    # the part of schedule.json one provider plans from: the file itself for
+    # Claude (top-level rules/chase), the "codex" object for Codex. $null =
+    # that provider is off (no codex section).
+    if ($Provider -ne 'codex') { return $config }
+    if ($config -and $config.PSObject.Properties['codex'] -and $config.codex) { return $config.codex }
+    $null
+}
+
+function Get-NextWeeklyFire([datetime]$After, [string]$Provider = 'claude') {
     # the next weekly fire time after $After, from schedule.json (not from the
     # scheduler: the answer must not depend on which backend is registered).
     # $null when there is no usable schedule.
     $best = $null
     try {
-        foreach ($s in @(Get-FireSpecs (Read-Config))) {
+        $pc = Get-ProviderConfig (Read-Config) $Provider
+        if (-not $pc) { return $null }
+        foreach ($s in @(Get-FireSpecs $pc)) {
             foreach ($d in $s.Days) {
                 $cand = $After.Date + $s.FireTime
                 $guard = 0
@@ -656,22 +801,30 @@ function Get-ChasePlan {
     @{ at = $at; source = $src; end = $end }
 }
 
-function Invoke-Chase([datetime]$FireStart, $LastAct, $KnownEnd) {
-    # "chase": false in schedule.json turns follow-ups off (default on)
+function Invoke-Chase([datetime]$FireStart, $LastAct, $KnownEnd, [string]$Provider = 'claude') {
+    # "chase": false in schedule.json turns follow-ups off (default on); for
+    # Codex the "chase" inside the codex section
     $cfg = $null
-    try { $cfg = Read-Config } catch { }
+    try { $cfg = Get-ProviderConfig (Read-Config) $Provider } catch { }
     if ($cfg -and $cfg.PSObject.Properties['chase'] -and ($cfg.chase -eq $false)) {
-        Write-Log @{ ev = 'chase-skip'; reason = 'chase disabled in schedule.json' }
+        $skip = @{ ev = 'chase-skip'; reason = 'chase disabled in schedule.json' }
+        if ($Provider -eq 'codex') { $skip.provider = 'codex' }
+        Write-Log $skip
         return @{ skip = 'disabled' }
     }
     $now  = Get-Date
     $plan = Get-ChasePlan -FireStart $FireStart -LastAct $LastAct -KnownEnd $KnownEnd `
-        -NextWeekly (Get-NextWeeklyFire $now) -RecentAnchor (Test-RecentPreheatAnchor $FireStart) -Now $now `
-        -IsChase (Test-ChaseFire $env:CLAUDE_PREHEAT_SELF)
-    if ($plan.skip) { Write-Log @{ ev = 'chase-skip'; reason = $plan.skip }; return $plan }
+        -NextWeekly (Get-NextWeeklyFire $now $Provider) -RecentAnchor (Test-RecentPreheatAnchor $FireStart $null $Provider) -Now $now `
+        -IsChase (Test-ChaseFire $env:CLAUDE_PREHEAT_SELF $null $Provider)
+    if ($plan.skip) {
+        $skip = @{ ev = 'chase-skip'; reason = $plan.skip }
+        if ($Provider -eq 'codex') { $skip.provider = 'codex' }
+        Write-Log $skip
+        return $plan
+    }
     # -NoWake: a follow-up is best effort - it must never wake a sleeping PC at
     # a minute the user did not choose (the weekly fires keep their wake timers)
-    Invoke-Once $plan.at ('chase ' + $plan.source) -NoWake
+    Invoke-Once $plan.at ('chase ' + $plan.source) -NoWake -Provider $Provider
     $plan
 }
 
@@ -682,7 +835,8 @@ function Test-SpentOnce($job, [datetime]$Now) {
     # "next" run that is behind us
     # Windows reports NO next run for a spent one-time trigger; macOS decodes
     # the past time from the name - both mean spent
-    ($job.name -like ($TaskOncePrefix + '-*')) -and ((-not $job.next) -or ($job.next -lt $Now.AddMinutes(-3)))
+    (($job.name -like ($TaskOncePrefix + '-*')) -or ($job.name -like ($CodexOncePrefix + '-*'))) -and
+        ((-not $job.next) -or ($job.next -lt $Now.AddMinutes(-3)))
 }
 
 function Test-PingOutput([int]$ExitCode, [string]$StdOut, [string]$StdErr) {
@@ -726,31 +880,53 @@ function Test-PingOutput([int]$ExitCode, [string]$StdOut, [string]$StdErr) {
     $res
 }
 
-function Invoke-Fire {
-    # nothing before the ping may block the ping
-    try { Remove-StaleOnceJobs } catch { }
+function Get-FireLockHolder([string]$Path) {
+    # the lock's record when another LIVE process holds it fresh, else $null
+    if (-not (Test-Path $Path)) { return $null }
+    try {
+        $prev = Get-Content $Path -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+        if ($prev -and $prev.pid -and ((Get-Item $Path).LastWriteTime -gt (Get-Date).AddMinutes(-20)) -and
+            (Get-Process -Id ([int]$prev.pid) -ErrorAction SilentlyContinue)) { return $prev }
+    } catch { }
+    $null
+}
+
+function Enter-FireLock([string]$Path) {
     # claim this moment so apply/off wait instead of unregistering the job we
     # are running inside. Best effort in both directions: a lock we cannot
     # write, and a lock we cannot delete, must never cost the ping.
-    $ownLock = $false
+    # -> $true when this fire owns the lock (and must delete it when done)
     try {
         # a fresh lock held by another LIVE fire is theirs: leave it, and let
-        # the finally below skip the delete - a manual fire that finishes in
+        # the caller skip the delete - a manual fire that finishes in
         # 8s must not unlock a scheduled fire still on its retries
-        $other = $null
-        if (Test-Path $FireLock) {
-            try {
-                $prev = Get-Content $FireLock -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
-                if ($prev -and $prev.pid -and ((Get-Item $FireLock).LastWriteTime -gt (Get-Date).AddMinutes(-20)) -and
-                    (Get-Process -Id ([int]$prev.pid) -ErrorAction SilentlyContinue)) { $other = $prev }
-            } catch { }
-        }
+        $other = Get-FireLockHolder $Path
         if (-not $other) {
             @{ pid = $PID; job = $env:CLAUDE_PREHEAT_SELF; startedAt = (Get-Date).ToString('s') } |
-                ConvertTo-Json -Compress | Set-Content -Path $FireLock -Encoding UTF8
-            $ownLock = $true
+                ConvertTo-Json -Compress | Set-Content -Path $Path -Encoding UTF8
+            return $true
         }
     } catch { }
+    $false
+}
+
+function Remove-OwnOncePlist {
+    # macOS: a spent one-shot (either provider) must not survive to fire again
+    # next year. Delete only the plist here: bootout of our own label would
+    # SIGTERM this very process. Remove-StaleOnceJobs boots the orphaned label
+    # out at the next fire/apply.
+    $self = $env:CLAUDE_PREHEAT_SELF
+    if ((-not $OnMac) -or (-not $self)) { return }
+    if (($self -notlike ($TaskOncePrefix + '-*')) -and ($self -notlike ($CodexOncePrefix + '-*'))) { return }
+    try {
+        Remove-Item (Join-Path $LaunchAgentDir ((ConvertTo-LaunchdLabel $self) + '.plist')) -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
+function Invoke-Fire {
+    # nothing before the ping may block the ping
+    try { Remove-StaleOnceJobs 'claude' } catch { }
+    $ownLock = Enter-FireLock $FireLock
     try {
         $proxy = Get-Proxy
         if ($proxy) { $env:HTTPS_PROXY = $proxy; $env:HTTP_PROXY = $proxy }
@@ -875,29 +1051,606 @@ function Invoke-Fire {
         if ($chase -and $chase.at) { $extra = ' - follow-up preheat at ' + $chase.at.ToString('HH:mm') }
         Send-Toast $ok $anch $kind $extra
 
-        if ($OnMac -and $env:CLAUDE_PREHEAT_SELF -and ($env:CLAUDE_PREHEAT_SELF -like ($TaskOncePrefix + '-*'))) {
-            # a spent one-shot must not survive to fire again next year. Delete
-            # only the plist here: bootout of our own label would SIGTERM this
-            # very process. Remove-StaleOnceJobs boots the orphaned label out at
-            # the next fire/apply.
-            try {
-                Remove-Item (Join-Path $LaunchAgentDir ((ConvertTo-LaunchdLabel $env:CLAUDE_PREHEAT_SELF) + '.plist')) `
-                    -Force -ErrorAction SilentlyContinue
-            } catch { }
-        }
+        Remove-OwnOncePlist
     } finally {
         if ($ownLock) { Remove-Item $FireLock -Force -ErrorAction SilentlyContinue }
     }
 }
 
-function Invoke-Once($fireAt, $label, [switch]$NoWake) {
+function Invoke-Once($fireAt, $label, [switch]$NoWake, [string]$Provider = 'claude') {
     if ($fireAt -le (Get-Date)) { throw "fire time $fireAt is in the past" }
+    $prefix = $TaskOncePrefix
+    $fireArgs = @('fire')
+    if ($Provider -eq 'codex') { $prefix = $CodexOncePrefix; $fireArgs = @('fire', '-Provider', 'codex') }
     # InvariantCulture: on macOS the name IS the schedule (Get-JobNextRun decodes
     # it with the invariant calendar), so a Buddhist year here would decode wrong
-    $name = '{0}-{1}' -f $TaskOncePrefix, $fireAt.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)
-    Register-PreheatJob -Name $name -At $fireAt -NoWake:$NoWake -ScriptArgs @('fire', '-Job', $name)
-    Write-Log @{ ev = 'schedule-once'; fireAt = $fireAt.ToString('s'); label = $label }
-    Write-Host ('one-shot registered: fire at {0}  ({1})' -f $fireAt.ToString('yyyy-MM-dd HH:mm'), $label)
+    $name = '{0}-{1}' -f $prefix, $fireAt.ToString('yyyyMMdd-HHmm', [System.Globalization.CultureInfo]::InvariantCulture)
+    Register-PreheatJob -Name $name -At $fireAt -NoWake:$NoWake -ScriptArgs ($fireArgs + @('-Job', $name))
+    $entry = @{ ev = 'schedule-once'; fireAt = $fireAt.ToString('s'); label = $label }
+    if ($Provider -eq 'codex') { $entry.provider = 'codex' }
+    Write-Log $entry
+    $who = ''
+    if ($Provider -eq 'codex') { $who = 'Codex ' }
+    Write-Host ('{0}one-shot registered: fire at {1}  ({2})' -f $who, $fireAt.ToString('yyyy-MM-dd HH:mm'), $label)
+}
+
+# ---------- Codex (beta): fire, status, report ----------
+
+function Get-AuthStamp {
+    # auth.json's mtime, never its content: enough to tell which step of a
+    # fire refreshed the login token (every codex child may rotate it)
+    try {
+        $p = Join-Path (Get-CodexHome) 'auth.json'
+        if (Test-Path $p) { return (Get-Item $p).LastWriteTimeUtc.Ticks }
+    } catch { }
+    $null
+}
+
+function Get-AuthRotation([string]$Current, $Before, [string]$Step) {
+    # the first fire step after which auth.json moved ('none' until one did)
+    if ($Current -ne 'none') { return $Current }
+    if ((Get-AuthStamp) -ne $Before) { return $Step }
+    'none'
+}
+
+function ConvertTo-LocalStamp($Epoch) {
+    # epoch seconds -> local 'yyyy-MM-dd HH:mm' (the journal's resets_at format)
+    if (-not $Epoch) { return $null }
+    try { return [DateTimeOffset]::FromUnixTimeSeconds([long]$Epoch).LocalDateTime.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
+
+function Set-CodexResets($Entry, $Epoch) {
+    if (-not $Epoch) { return }
+    $Entry.resets_epoch = [long]$Epoch
+    $Entry.resets_at = ConvertTo-LocalStamp $Epoch
+}
+
+function Write-CodexRead($Read, $Windows, [string]$Src, $DriftSec = $null) {
+    # other5h: the other buckets' 5h windows - a ping that meters another
+    # bucket shows up there
+    # one journal line per quota read: the raw evidence the beta is for
+    # (anchored or rolling, which bucket, how far the clocks disagree)
+    $e = @{ ev = 'codex-read'; provider = 'codex'; src = $Src; plan = $null; bucket = $null
+            win_min = $null; used = $null; resets_epoch = $null; resets_in_s = $null }
+    if ($Windows) {
+        $e.plan = $Windows.plan; $e.bucket = $Windows.bucket
+        if ($Windows.five) {
+            $e.win_min = $Windows.five.mins; $e.used = $Windows.five.used
+            if ($Windows.five.resetsAt) {
+                $e.resets_epoch = [long]$Windows.five.resetsAt
+                $e.resets_in_s = [long]$Windows.five.resetsAt - [long]$Read.epoch
+            }
+        }
+        if ($Windows.weekly) {
+            $e.weekly_used = $Windows.weekly.used
+            if ($Windows.weekly.resetsAt) { $e.weekly_epoch = [long]$Windows.weekly.resetsAt }
+        }
+        $o5 = Format-CodexOtherWindows $Windows ([long]$Read.epoch)
+        if ($o5) { $e.other5h = $o5 }
+    }
+    if ($null -ne $DriftSec) { $e.drift_s = [long]$DriftSec }
+    Write-Log $e
+}
+
+function Test-CodexPaused($Events) {
+    # PURE over Get-JournalEvents -Provider codex (newest first): the last two
+    # Codex fires both pinged and started no window, and no Codex apply came
+    # after them. Paused records themselves do not count, or the pause would
+    # lift itself one fire later.
+    $n = 0
+    foreach ($j in @($Events)) {
+        if ($j.ev -eq 'apply') { return $false }
+        if ($j.ev -ne 'fire') { continue }
+        $e = $j.rec
+        if ($e.PSObject.Properties['kind'] -and ([string]$e.kind -eq 'paused')) { continue }
+        $slid = $e.PSObject.Properties['pinged'] -and ($e.pinged -eq $true) -and
+            $e.PSObject.Properties['state'] -and ([string]$e.state -eq 'sliding')
+        if (-not $slid) { return $false }
+        $n++
+        if ($n -ge 2) { return $true }
+    }
+    $false
+}
+
+function Complete-CodexFire($Entry, [string]$ToastKind, [switch]$Quiet, $ChaseEnd = $null, $FireStart = $null) {
+    # journal first, then the chase: the follow-up's schedule-once must be the
+    # NEWER line (Get-FireEvents pairs it with the fire before it)
+    Write-Log $Entry
+    $script:CodexFireLogged = $true
+    $extra = ''
+    if ($ChaseEnd) {
+        if (-not $FireStart) { $FireStart = Get-Date }
+        try {
+            $chase = Invoke-Chase $FireStart $null $ChaseEnd 'codex'
+            if ($chase -and $chase.at) { $extra = ' - follow-up preheat at ' + $chase.at.ToString('HH:mm') }
+        } catch { Write-Log @{ ev = 'chase-skip'; provider = 'codex'; reason = ('error: ' + $_.Exception.Message) } }
+    }
+    if (-not $Quiet) { Send-Toast ([bool]$Entry.ok) $null $ToastKind $extra -Provider 'codex' }
+}
+
+function Test-CodexBudget([datetime]$Deadline, [int]$Sec) {
+    # does a step that may take $Sec still end before the fire's deadline?
+    (Get-Date).AddSeconds($Sec) -le $Deadline
+}
+
+function Add-CodexWindowFields($Entry, $Windows) {
+    if (-not $Windows) { return }
+    if ($Windows.plan) { $Entry.plan = $Windows.plan }
+    if ($Windows.bucket) { $Entry.bucket = $Windows.bucket }
+    if ($Windows.five -and $Windows.five.mins) { $Entry.win_min = $Windows.five.mins }
+}
+
+function Invoke-CodexFire {
+    # nothing before the ping may block the ping
+    try { Remove-StaleOnceJobs 'codex' } catch { }
+    $deadline = (Get-Date).AddSeconds($CodexFireBudgetSec)
+    $script:CodexFireEntry = $null; $script:CodexFireLogged = $false
+    $ownLock = $false
+    try {
+        # one codex child per account at a time: two of ours refreshing a
+        # rotating login token at once can sign the user out
+        # (refresh_token_reused). A status read holds the lock for about a
+        # minute - wait that out; another fire runs for minutes and anchors
+        # the window itself, so this one stands down.
+        $waited = 0
+        while ((Get-FireLockHolder $CodexFireLock) -and ($waited -lt 90)) { Start-Sleep -Seconds 5; $waited += 5 }
+        if (Get-FireLockHolder $CodexFireLock) {
+            Complete-CodexFire @{ ev = 'fire'; provider = 'codex'; ok = $false; kind = 'other'; state = 'unknown'; pinged = $false; attempts = 0
+                                  auth_rot = 'none'; err = 'another Codex fire (or status read) was running - this one stood down' } 'other' -Quiet
+            return
+        }
+        $ownLock = Enter-FireLock $CodexFireLock
+        Invoke-CodexFireSteps $deadline
+    } catch {
+        # an unexpected shape anywhere must still leave a journal line - the
+        # partial record when there is one: a ping that spent quota must
+        # still show up as pinged (pause and report read that)
+        $m = [string]$_.Exception.Message
+        if (-not $script:CodexFireLogged) {
+            $e = $script:CodexFireEntry
+            if (-not $e) { $e = @{ ev = 'fire'; provider = 'codex'; pinged = $false; attempts = 0; auth_rot = 'none' } }
+            $e.ok = $false; $e.kind = 'other'; $e.state = 'unknown'; $e.err = $m.Substring(0, [Math]::Min(400, $m.Length))
+            Write-Log $e
+            Send-Toast $false $null 'other' -Provider 'codex'
+        }
+    } finally {
+        if ($ownLock) { Remove-Item $CodexFireLock -Force -ErrorAction SilentlyContinue }
+        # here, not on the happy path only: a spent one-shot must never fire again
+        Remove-OwnOncePlist
+    }
+}
+
+function Invoke-CodexFireSteps([datetime]$Deadline) {
+    # read (free) -> skip if a window runs -> ping -> read again and judge.
+    # Strictly serial, a fresh codex child per step: each step may refresh the
+    # login token, and only a new process reads the rotated one.
+    # Worst cases at the 30s RPC timeout: a read = initialize + account +
+    # rateLimits + one restart; the post step = its 60s wait + two reads 30s
+    # apart. Optional steps run only while they fit before $Deadline.
+    $readMax = 120; $pingMax = 120; $postMax = 270
+    $fireStart = Get-Date
+    $cfg = $null
+    try { $cfg = Read-Config } catch { }
+    Use-CodexEnvironment $cfg
+    # test-only (not in the README): spend a ping even when paused or no5h
+    $force = ($env:PREHEAT_CODEX_FORCE_PING -eq '1')
+    $hist = @(Get-JournalEvents $LogPath 200 -Provider 'codex')
+    $prevKind = ''
+    foreach ($j in $hist) {
+        if ($j.ev -ne 'fire') { continue }
+        if ($j.rec.PSObject.Properties['kind'] -and $j.rec.kind) { $prevKind = [string]$j.rec.kind }
+        break
+    }
+    $entry = @{ ev = 'fire'; provider = 'codex'; ok = $false; attempts = 0; ms = $null; pinged = $false; state = 'unknown'; auth_rot = 'none' }
+    $script:CodexFireEntry = $entry
+
+    # 2. two pings in a row started no window: stop spending until the user re-applies
+    if ((-not $force) -and (Test-CodexPaused $hist)) {
+        $entry.kind = 'paused'
+        Complete-CodexFire $entry 'paused' -Quiet:($prevKind -eq 'paused')
+        return
+    }
+
+    # 3. find codex now (a desktop update moves its exe), never from a cache
+    $cx = Resolve-CodexExe
+    if (-not $cx) {
+        $entry.kind = 'notfound'
+        $entry.err = 'codex not found - install the Codex CLI or app, or set PREHEAT_CODEX_EXE (user-level env var)'
+        Complete-CodexFire $entry 'notfound'
+        return
+    }
+    $entry.exe_kind = [string]$cx.kind
+    $ver = Get-CodexVersion $cx.path
+    if ($ver) { $entry.codex_ver = $ver }
+    $auth0 = Get-AuthStamp
+    $authRot = 'none'
+
+    # 4. pre-read: is a window running already?
+    $q = Read-CodexQuota $cx.path -Reads 1
+    $authRot = Get-AuthRotation $authRot $auth0 'pre'
+    $signedIn = [bool]$q.ok
+    if ($q.account -and $q.account.plan) { $entry.plan = $q.account.plan }
+    $win = $null; $preEpoch = $null; $lastQ = $null; $lastWin = $null
+    if ($q.ok -and (@($q.reads).Count -gt 0)) {
+        $rd = @($q.reads)[-1]
+        $win = Get-CodexWindows $rd.raw
+        # a reply without its own planType: account/read's plan decides no5h
+        if ((-not $win.plan) -and $q.account -and $q.account.plan) { $win.plan = $q.account.plan }
+        $preEpoch = [long]$rd.epoch
+        Write-CodexRead $rd $win 'pre'
+        $lastQ = $q; $lastWin = $win
+        Add-CodexWindowFields $entry $win
+    }
+    if ((-not $q.ok) -and ($q.kind -in @('auth', 'apikey'))) {
+        # no retry: neither a lost login nor an API-key account heals in a minute
+        $entry.kind = [string]$q.kind; $entry.err = [string]$q.err; $entry.auth_rot = $authRot
+        Complete-CodexFire $entry ([string]$q.kind)
+        return
+    }
+    # a read that failed otherwise: ping blind, the post-read decides
+    $blind = @{ action = 'ping'; resetsAt = $null; idleValue = $null; skewSec = $null; windowUnknown = $true }
+    $pre = $blind
+    if ($win) { $pre = Get-CodexPreVerdict $win $preEpoch }
+    if (($pre.action -eq 'skip-no5h') -and $force) { $pre = $blind }
+    if ($null -ne $pre.skewSec) { $entry.skew_s = $pre.skewSec }
+    if ($pre.windowUnknown) { $entry.window_unknown = $true }
+
+    # 5. nothing to ping for
+    if ($pre.action -eq 'skip-no5h') {
+        $entry.kind = 'no5h'; $entry.state = 'no5h'; $entry.auth_rot = $authRot
+        Write-CodexCache $CodexCachePath $q $win 'fire'
+        # said once: an account without the window stays without it every fire
+        Complete-CodexFire $entry 'no5h' -Quiet:($prevKind -eq 'no5h')
+        return
+    }
+    if ($pre.action -eq 'skip-running') {
+        $entry.ok = $true; $entry.state = 'running'; $entry.anchored = $false; $entry.anchor_src = 'ratelimit'; $entry.auth_rot = $authRot
+        Set-CodexResets $entry $pre.resetsAt
+        Write-CodexCache $CodexCachePath $q $win 'fire'
+        $end = $null
+        if ($pre.resetsAt) { $end = [DateTimeOffset]::FromUnixTimeSeconds([long]$pre.resetsAt).LocalDateTime }
+        Complete-CodexFire $entry 'running' -ChaseEnd $end -FireStart $fireStart
+        return
+    }
+
+    # 6. ping: up to 2 attempts, each re-resolving the exe
+    if (-not (Test-Path $CodexFirePit)) {
+        New-Item -ItemType Directory -Path $CodexFirePit -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    $exe = $cx; $ping = $null; $metered = $false; $attempts = 0; $firstStart = $null
+    while ($attempts -lt 2) {
+        $attempts++
+        $fresh = Resolve-CodexExe
+        if ($fresh) { $exe = $fresh }
+        $passArgs = @(Get-CodexConfigPassthrough (Get-CodexHome))
+        $ping = Invoke-CodexPing $exe.path $CodexFirePit $passArgs
+        # a failed attempt can still have metered (a hang killed after the
+        # server counted it): the post-verdict window spans every attempt,
+        # or that window reads as 'moved' and books a chase on our own window.
+        # A child that never started (exe gone mid-update) has no start time.
+        if (($null -eq $firstStart) -and ($null -ne $ping.startEpoch)) { $firstStart = [long]$ping.startEpoch }
+        # an old npm codex on PATH can shadow a newer desktop one that knows the
+        # flags: try the later candidates, same attempt. Not past an explicit
+        # PREHEAT_CODEX_EXE - the user chose that exe.
+        if (($ping.kind -eq 'usage-error') -and ($exe.kind -ne 'env')) {
+            $past = $false
+            foreach ($c in @(Get-CodexCandidates)) {
+                if (-not $past) { if ($c.path -eq $exe.path) { $past = $true }; continue }
+                if (-not (Test-CodexBudget $Deadline ($pingMax + $postMax))) { break }
+                $exe = $c
+                $ping = Invoke-CodexPing $exe.path $CodexFirePit $passArgs
+                if (($null -eq $firstStart) -and ($null -ne $ping.startEpoch)) { $firstStart = [long]$ping.startEpoch }
+                if ($ping.kind -ne 'usage-error') { break }
+            }
+        }
+        if ($ping.ok) { break }
+        # neither a lost login nor a usage limit heals in a minute
+        if ($ping.kind -in @('auth', 'limit')) { break }
+        if ($attempts -lt 2) {
+            # a retry only while all of it still fits: its read, the wait,
+            # the ping and the post step
+            if (-not (Test-CodexBudget $Deadline ($readMax + 60 + $pingMax + $postMax))) { break }
+            # did that attempt meter after all? Then a second ping would only
+            # spend quota inside the window it opened
+            $rq = Read-CodexQuota $exe.path -Reads 1
+            if ($rq.ok -and (@($rq.reads).Count -gt 0)) {
+                $rr = @($rq.reads)[-1]
+                $rw = Get-CodexWindows $rr.raw
+                Write-CodexRead $rr $rw 'retry'
+                $lastQ = $rq; $lastWin = $rw
+                if (Test-CodexMetered $pre ([long]$preEpoch) $rw ([long]$rr.epoch)) { $metered = $true; break }
+            }
+            Start-Sleep -Seconds 60
+        }
+    }
+    $authRot = Get-AuthRotation $authRot $auth0 'ping'
+    $entry.attempts = $attempts; $entry.pinged = $true; $entry.ms = $ping.ms
+    $entry.exe_kind = [string]$exe.kind
+    if ($exe.path -ne $cx.path) {
+        $v2 = Get-CodexVersion $exe.path
+        if ($v2) { $entry.codex_ver = $v2 }
+    }
+    if ($ping.stream -and $ping.stream.sawTokens -and $ping.stream.tokens) {
+        $tok = $ping.stream.tokens
+        if ($null -ne $tok.input) { $entry.tokens_in = $tok.input }
+        if ($null -ne $tok.cached) { $entry.tokens_cached = $tok.cached }
+        if ($null -ne $tok.output) { $entry.tokens_out = $tok.output }
+        if ($null -ne $tok.reasoning) { $entry.tokens_reasoning = $tok.reasoning }
+    }
+    if ((-not $ping.ok) -and (-not $metered)) {
+        $k = [string]$ping.kind
+        # the pre-read was signed in, the ping was not: the ping's config
+        # (--ignore-user-config) lost what the login needs - not "log in again".
+        # Not for a token that was rotated or revoked meanwhile: that one IS
+        # "sign in again", config or not.
+        if (($k -eq 'auth') -and $signedIn -and ($authRot -eq 'none') -and
+            ([string]$ping.err -notmatch 'refresh_token_reused|token_invalidated|token expired')) { $k = 'config-mismatch' }
+        elseif ($k -notin @('auth', 'limit')) { $k = 'other' }
+        $entry.kind = $k; $entry.err = [string]$ping.err; $entry.auth_rot = $authRot
+        if ($lastQ) { Write-CodexCache $CodexCachePath $lastQ $lastWin 'fire' }
+        Complete-CodexFire $entry $k
+        return
+    }
+
+    # 7. post-read: 60s after the ping, two reads 30s apart; still sliding ->
+    # one more read 120s later. Server times only: the local clock cancels out.
+    if ($null -eq $firstStart) { $firstStart = [long](Get-CodexEpoch) }
+    $pingEnd = $firstStart
+    if ($null -ne $ping.endEpoch) { $pingEnd = [long]$ping.endEpoch }
+    Start-Sleep -Seconds 60
+    $postReads = @()
+    $pq = Read-CodexQuota $exe.path -Reads 2 -IntervalSec 30
+    foreach ($rd in @($pq.reads)) {
+        $w = Get-CodexWindows $rd.raw
+        Write-CodexRead $rd $w 'post'
+        $postReads += @{ epoch = [long]$rd.epoch; windows = $w }
+        $lastQ = $pq; $lastWin = $w
+    }
+    $pe = $preEpoch
+    if (-not $pe) { $pe = $firstStart }
+    $pv = @{ state = 'unknown'; resetsAt = $null; lagSec = $null }
+    if ($postReads.Count -ge 2) { $pv = Get-CodexPostVerdict $pre $pe $firstStart $pingEnd $postReads }
+    # out of budget: the state stays 'sliding' without the confirm read
+    if (($pv.state -eq 'sliding') -and (Test-CodexBudget $Deadline (120 + $readMax))) {
+        Start-Sleep -Seconds 120
+        $cq = Read-CodexQuota $exe.path -Reads 1
+        foreach ($rd in @($cq.reads)) {
+            $w = Get-CodexWindows $rd.raw
+            Write-CodexRead $rd $w 'post'
+            $postReads += @{ epoch = [long]$rd.epoch; windows = $w }
+            $lastQ = $cq; $lastWin = $w
+        }
+        $pv = Get-CodexPostVerdict $pre $pe $firstStart $pingEnd $postReads
+    }
+    $authRot = Get-AuthRotation $authRot $auth0 'post'
+
+    # 8. journal, cache, chase, toast
+    $entry.ok = $true
+    $entry.state = [string]$pv.state
+    $entry.anchor_src = 'ratelimit'
+    $entry.auth_rot = $authRot
+    if ($pv.state -eq 'anchored') { $entry.anchored = $true }
+    elseif ($pv.state -in @('moved', 'sliding')) { $entry.anchored = $false }
+    if ($pv.state -in @('anchored', 'moved')) { Set-CodexResets $entry $pv.resetsAt }
+    # the window opened this long after the ping returned (metering lag)
+    if ($null -ne $pv.lagSec) { $entry.lag_s = [long]$pv.lagSec }
+    Add-CodexWindowFields $entry $lastWin
+    if ($lastQ) { Write-CodexCache $CodexCachePath $lastQ $lastWin 'fire' }
+    $end = $null
+    if (($pv.state -eq 'moved') -and $pv.resetsAt) { $end = [DateTimeOffset]::FromUnixTimeSeconds([long]$pv.resetsAt).LocalDateTime }
+    Complete-CodexFire $entry ([string]$pv.state) -ChaseEnd $end -FireStart $fireStart
+}
+
+function Get-CodexRollingCheck($Events, $Windows, [long]$NowEpoch) {
+    # PURE - anchored or rolling? The newest Codex fire that anchored a window
+    # still running recorded when that window ends; the current read says when
+    # it ends now. Same -> anchored; later -> the window rolls with use.
+    # -> $null (nothing to compare) | @{ delta (s); text }
+    if ((-not $Windows) -or (-not $Windows.five) -or (-not $Windows.five.resetsAt)) { return $null }
+    foreach ($j in @($Events)) {
+        if ($j.ev -ne 'fire') { continue }
+        $e = $j.rec
+        if (-not ($e.PSObject.Properties['anchored'] -and ($e.anchored -eq $true))) { continue }
+        if (-not ($e.PSObject.Properties['resets_epoch'] -and $e.resets_epoch)) { continue }
+        if ([long]$e.resets_epoch -le $NowEpoch) { continue }
+        $d = [long]$Windows.five.resetsAt - [long]$e.resets_epoch
+        $text = 'same window, reset unchanged (anchored)'
+        if ($d -gt 60) { $text = 'reset moved later by {0} min (rolling?)' -f [Math]::Round($d / 60) }
+        elseif ($d -lt -60) { $text = 'reset is {0} min earlier than the anchored fire recorded (a different window?)' -f [Math]::Round(-$d / 60) }
+        return @{ delta = $d; text = $text }
+    }
+    $null
+}
+
+function Invoke-CodexStatus {
+    # a live read (free: account + rate limits only, no ping), journaled and
+    # cached like a fire's - the panel's Refresh button runs this with -Json
+    $cfg = $null
+    try { $cfg = Read-Config } catch { }
+    Use-CodexEnvironment $cfg -KeepEnv
+    $cx = Resolve-CodexExe
+    $ver = $null; $q = $null; $win = $null; $roll = $null; $busy = $false; $other5 = $null
+    if ($cx) {
+        $ver = Get-CodexVersion $cx.path
+        # one codex per account at a time (Invoke-CodexFire): a fire in flight
+        # owns it; our read holds the lock so a fire starting now waits for it
+        if (Get-FireLockHolder $CodexFireLock) { $busy = $true }
+        else {
+            $ownLock = Enter-FireLock $CodexFireLock
+            try { $q = Read-CodexQuota $cx.path -Reads 1 }
+            finally { if ($ownLock) { Remove-Item $CodexFireLock -Force -ErrorAction SilentlyContinue } }
+        }
+        if ($q -and $q.ok -and (@($q.reads).Count -gt 0)) {
+            $rd = @($q.reads)[-1]
+            $win = Get-CodexWindows $rd.raw
+            if ((-not $win.plan) -and $q.account -and $q.account.plan) { $win.plan = $q.account.plan }
+            $other5 = Format-CodexOtherWindows $win ([long]$rd.epoch)
+            $roll = Get-CodexRollingCheck @(Get-JournalEvents $LogPath 200 -Provider 'codex') $win ([long]$rd.epoch)
+            $drift = $null
+            if ($roll -and ($roll.delta -gt 60)) { $drift = $roll.delta }
+            Write-CodexRead $rd $win 'status' $drift
+            Write-CodexCache $CodexCachePath $q $win 'status'
+        }
+    }
+    $busyMsg = 'a Codex fire is running right now - try again in a few minutes'
+    if ($Json) {
+        $obj = [pscustomobject]@{}
+        if (Test-Path $CodexCachePath) {
+            try { $c = Get-Content $CodexCachePath -Raw -Encoding UTF8 | ConvertFrom-Json; if ($c) { $obj = $c } } catch { }
+        }
+        $kind = $null; $err = $null
+        if (-not $cx) { $kind = 'notfound' }
+        elseif ($busy) { $kind = 'busy'; $err = $busyMsg }
+        elseif ($q -and (-not $q.ok)) { $kind = $q.kind; $err = $q.err }
+        $exeKind = $null
+        if ($cx) { $exeKind = [string]$cx.kind }
+        $add = [ordered]@{ installed = [bool]$cx; exeKind = $exeKind; version = $ver; signedIn = [bool]($q -and $q.ok); kind = $kind; err = $err }
+        foreach ($k in $add.Keys) { $obj | Add-Member -NotePropertyName $k -NotePropertyValue $add[$k] -Force }
+        ConvertTo-Json -InputObject $obj -Compress -Depth 8
+        return
+    }
+    Write-Host ''
+    Write-Host '=== claude-preheat: codex (beta) ==='
+    if (-not $cx) {
+        Write-Host 'codex    : not found - install the Codex CLI or app, or set PREHEAT_CODEX_EXE'
+    } else {
+        $v = $ver
+        if (-not $v) { $v = '(version unknown)' }
+        Write-Host ('codex    : {0} ({1})' -f $v, $cx.kind)
+        if ($busy) {
+            Write-Host ('account  : not read - ' + $busyMsg) -ForegroundColor Yellow
+        } elseif (-not $q.ok) {
+            Write-Host ('account  : read failed ({0}): {1}' -f $q.kind, (Protect-ReportText ([string]$q.err))) -ForegroundColor Yellow
+        } else {
+            $plan = $null
+            if ($win -and $win.plan) { $plan = $win.plan } elseif ($q.account) { $plan = $q.account.plan }
+            Write-Host ('account  : {0}  plan {1}' -f $q.account.emailMasked, $plan)
+            if ($win -and $win.five) {
+                $r = ConvertTo-LocalStamp $win.five.resetsAt
+                if (-not $r) { $r = '(idle - next request opens a window)' }
+                Write-Host ('5h window: {0}% used, resets {1}  ({2} min window, bucket {3})' -f $win.five.used, $r, $win.five.mins, $win.bucket)
+            } elseif (Test-CodexNo5hPlan ([string]$plan)) {
+                Write-Host ('5h window: no 5h window readable (plan: {0}) - preheat cannot help this account until OpenAI adds one' -f $plan)
+            } else {
+                # what the fire does too: only free/go/pro are skipped
+                Write-Host ('5h window: no 5h window readable (plan: {0}) - fires still ping and journal window_unknown' -f $plan) -ForegroundColor Yellow
+            }
+            if ($other5) { Write-Host ('other 5h : ' + $other5) }
+            if ($win -and $win.weekly) {
+                Write-Host ('weekly   : {0}% used, resets {1}' -f $win.weekly.used, (ConvertTo-LocalStamp $win.weekly.resetsAt))
+            }
+            if ($roll) { Write-Host ('rolling  : ' + $roll.text) }
+            else { Write-Host 'rolling  : no anchored preheat window running to compare with' }
+        }
+    }
+    Write-Host ''
+    Write-Host '-- codex tasks --'
+    $ct = @(Get-PreheatJobs 'ClaudePreheat-Codex-*')
+    if ($ct.Count -eq 0) { Write-Host '(none - add a "codex" section to schedule.json, then: preheat apply -Provider codex)' }
+    foreach ($t in $ct) {
+        $nextTxt = '{0}' -f $t.next
+        if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
+        Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
+    }
+    Write-Host ''
+    Write-Host '-- last codex fires --'
+    $fires = @(Get-JournalEvents $LogPath 200 -Provider 'codex' | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 5)
+    if ($fires.Count -eq 0) { Write-Host '(none yet)' }
+    foreach ($f in $fires) {
+        $e = $f.rec
+        $ts = ''
+        if ($f.ts) { $ts = $f.ts.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $what = [string]$e.state
+        if (-not $e.ok) { $what = 'FAIL ' + [string]$e.kind }
+        $s = '[{0}] {1}' -f $ts, $what
+        if ($e.PSObject.Properties['pinged']) { if ($e.pinged) { $s += ', pinged' } else { $s += ', no ping' } }
+        if ($e.PSObject.Properties['resets_at'] -and $e.resets_at) { $s += ', resets ' + [string]$e.resets_at }
+        if ($e.PSObject.Properties['tokens_in']) { $s += (', tokens in {0} out {1}' -f $e.tokens_in, $e.tokens_out) }
+        if ((-not $e.ok) -and $e.PSObject.Properties['err'] -and $e.err) {
+            # redacted like report: status output gets pasted into issues too
+            $m = Protect-ReportText ([string]$e.err)
+            $s += ' - ' + $m.Substring(0, [Math]::Min(100, $m.Length))
+        }
+        Write-Host $s
+    }
+    Write-Host ''
+}
+
+function Format-ReportLine($j, [string[]]$Fields, [string[]]$EpochFields) {
+    # one journal record -> 'yyyy-MM-dd HH:mm k=v ...' with the allow-listed
+    # fields only; epoch fields as local minutes (seconds add nothing but routine detail)
+    $ts = '(no time)'
+    if ($j.ts) { $ts = $j.ts.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
+    $parts = @($ts)
+    $e = $j.rec
+    foreach ($f in $Fields) {
+        if (-not $e.PSObject.Properties[$f]) { continue }
+        $v = $e.$f
+        if ($null -eq $v) { continue }
+        $name = $f
+        if ($EpochFields -contains $f) {
+            $v = ConvertTo-LocalStamp $v
+            if (-not $v) { continue }
+            $v = '"' + $v + '"'; $name = $f -replace '_epoch$', '_at'
+        }
+        elseif ($v -is [bool]) { if ($v) { $v = 'true' } else { $v = 'false' } }
+        elseif ($f -in @('err', 'other5h')) { $s = ([string]$v) -replace '\s+', ' '; $v = '"' + $s.Substring(0, [Math]::Min(200, $s.Length)) + '"' }
+        else { $v = [string]$v }
+        $parts += ('{0}={1}' -f $name, $v)
+    }
+    $parts -join ' '
+}
+
+function Invoke-CodexReport {
+    # paste-back text for beta testers: zero cost (no quota read), every line
+    # through Protect-ReportText, account named by hash only
+    $cfg = $null
+    try { $cfg = Read-Config } catch { }
+    try { Use-CodexEnvironment $cfg -KeepEnv } catch { }
+    $ver = 'unknown'
+    try {
+        $g = & git -C $Root describe --tags --always 2>$null
+        if (($LASTEXITCODE -eq 0) -and $g) { $ver = ([string]@($g)[0]).Trim() }
+    } catch { }
+    $os = $null
+    try { $os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription } catch { }
+    if (-not $os) { $os = [System.Environment]::OSVersion.VersionString }
+    $out = New-Object System.Collections.Generic.List[string]
+    [void]$out.Add('claude-preheat codex report')
+    [void]$out.Add('preheat   : ' + $ver)
+    [void]$out.Add('os        : ' + $os)
+    [void]$out.Add('powershell: ' + $PSVersionTable.PSVersion.ToString() + ' ' + [string]$PSVersionTable.PSEdition)
+    $cx = Resolve-CodexExe
+    if ($cx) {
+        $cv = Get-CodexVersion $cx.path
+        if (-not $cv) { $cv = 'unknown' }
+        [void]$out.Add('codex     : ' + $cv + ' (' + $cx.kind + ')')
+    } else { [void]$out.Add('codex     : not found') }
+    $plan = 'unknown'; $hash = 'unknown'
+    try {
+        if (Test-Path $CodexCachePath) {
+            $c = Get-Content $CodexCachePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($c.plan) { $plan = [string]$c.plan }
+            if ($c.account -and $c.account.hash) { $hash = [string]$c.account.hash }
+        }
+    } catch { }
+    [void]$out.Add('account   : plan ' + $plan + ', id ' + $hash)
+    $ev = @(Get-JournalEvents $LogPath 1000 -Provider 'codex')
+    $fires = @($ev | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 10)
+    $reads = @($ev | Where-Object { $_.ev -eq 'codex-read' } | Select-Object -First 20)
+    [void]$out.Add('')
+    [void]$out.Add(('-- last {0} codex fires (oldest first) --' -f $fires.Count))
+    $fireFields = @('ok', 'state', 'kind', 'pinged', 'anchored', 'anchor_src', 'attempts', 'ms', 'plan', 'bucket', 'win_min',
+        'resets_epoch', 'skew_s', 'window_unknown', 'tokens_in', 'tokens_cached', 'tokens_out', 'tokens_reasoning',
+        'lag_s', 'codex_ver', 'exe_kind', 'auth_rot', 'err')
+    for ($i = $fires.Count - 1; $i -ge 0; $i--) { [void]$out.Add((Format-ReportLine $fires[$i] $fireFields @('resets_epoch'))) }
+    [void]$out.Add('')
+    [void]$out.Add(('-- last {0} codex reads (oldest first) --' -f $reads.Count))
+    $readFields = @('src', 'plan', 'bucket', 'win_min', 'used', 'resets_epoch', 'resets_in_s', 'weekly_used', 'weekly_epoch', 'drift_s', 'other5h')
+    for ($i = $reads.Count - 1; $i -ge 0; $i--) { [void]$out.Add((Format-ReportLine $reads[$i] $readFields @('resets_epoch', 'weekly_epoch'))) }
+    [void]$out.Add('')
+    [void]$out.Add('note: these times show when you start work each day - round them or drop lines before posting if you prefer.')
+    Protect-ReportText ($out -join "`n")
 }
 
 function Get-NextOccurrence([string]$hhmm) {
@@ -923,7 +1676,9 @@ function Invoke-Status {
     }
     Write-Host ''
     Write-Host '-- scheduled preheats --'
-    $tasks = @(Get-PreheatJobs)
+    # Claude's view: the Codex jobs get their own block below
+    $allTasks = @(Get-PreheatJobs)
+    $tasks = @($allTasks | Where-Object { (Get-JobProvider $_.name) -eq 'claude' })
     if ($tasks.Count -gt 0) {
         foreach ($t in $tasks) {
             $nextTxt = '{0}' -f $t.next
@@ -956,7 +1711,9 @@ function Invoke-Status {
     Write-Host ''
     Write-Host '-- recent events --'
     if (Test-Path $LogPath) {
-        Get-Content $LogPath -Encoding UTF8 | Select-Object -Last 8 | ForEach-Object {
+        # Claude's lines only: a Codex fire record read through the Claude
+        # vocabulary below would claim things about the wrong window
+        Get-Content $LogPath -Encoding UTF8 | Where-Object { $_ -notmatch '"provider"\s*:\s*"codex"' } | Select-Object -Last 8 | ForEach-Object {
             try {
                 $e = $_ | ConvertFrom-Json
                 if ($e.ev -eq 'fire') {
@@ -1000,8 +1757,44 @@ function Invoke-Status {
         Write-Host '(no log yet)'
     }
     Write-Host ''
+    # a short Codex block, only for someone who uses Codex at all
+    $codexTasks = @($allTasks | Where-Object { (Get-JobProvider $_.name) -eq 'codex' })
+    $codexCfg = $null
+    try { $codexCfg = Get-ProviderConfig (Read-Config) 'codex' } catch { }
+    if ($codexCfg -or ($codexTasks.Count -gt 0)) {
+        Write-Host '-- codex (beta) --'
+        if ($codexCfg) {
+            # @($null) has one element: an absent rules key is zero rules
+            $nRules = 0
+            if ($null -ne $codexCfg.rules) { $nRules = @($codexCfg.rules).Count }
+            Write-Host ('configured: {0} rule(s) in schedule.json' -f $nRules)
+        }
+        else { Write-Host 'configured: no "codex" section in schedule.json (preheat apply removes these tasks)' }
+        foreach ($t in $codexTasks) {
+            $nextTxt = '{0}' -f $t.next
+            if (Test-SpentOnce $t (Get-Date)) { $nextTxt += '  (spent - removed at the next fire or apply)' }
+            Write-Host ('{0}  next: {1}' -f $t.name.PadRight(40), $nextTxt)
+        }
+        $lastCx = @(Get-FireEvents $LogPath 1 'codex')
+        if ($lastCx.Count -gt 0) { Write-Host ('last fire: ' + (Format-CodexFireLine $lastCx[0])) }
+        Write-Host 'details: preheat status -Codex'
+        Write-Host ''
+    }
     # same warning apply gives: a fire that cannot wake the PC is a silent no-show
     Test-WakeTimers
+}
+
+function Format-CodexFireLine($ev) {
+    # one Get-FireEvents record of a Codex fire -> one human line
+    $what = $ev.state
+    if (-not $what) { $what = 'unknown' }
+    if (-not $ev.ok) { $what = 'FAIL ' + $ev.kind }
+    $s = '[{0}] {1}' -f $ev.ts, $what
+    if ($null -ne $ev.pinged) { if ($ev.pinged) { $s += ', pinged' } else { $s += ', no ping' } }
+    if ($ev.resets_at) { $s += ', resets ' + $ev.resets_at }
+    if ($ev.chase_at) { $s += ', follow-up ' + $ev.chase_at }
+    if ((-not $ev.ok) -and $ev.err) { $s += ' - ' + (Protect-ReportText ([string]$ev.err)) }
+    $s
 }
 
 function Invoke-StatusJson {
@@ -1010,14 +1803,22 @@ function Invoke-StatusJson {
     $lastIso = $null
     if ($last) { $lastIso = $last.ToString('yyyy-MM-ddTHH:mm:ss') }
     $tasks = @()
+    $codexTasks = @()
     $broken = @()
     foreach ($t in @(Get-PreheatJobs)) {
         $next = $null
         if ($t.next) { $next = $t.next.ToString('yyyy-MM-ddTHH:mm:ss') }
-        $tasks += @{ name = $t.name; next = $next; spent = [bool](Test-SpentOnce $t (Get-Date)) }
+        $prov = Get-JobProvider $t.name
+        $row = @{ name = $t.name; next = $next; spent = [bool](Test-SpentOnce $t (Get-Date)); provider = $prov }
+        $tasks += $row
+        if ($prov -eq 'codex') { $codexTasks += $row }
         if (($t.script -and (-not (Test-Path $t.script))) -or ($t.shell -and (-not (Test-Path $t.shell)))) { $broken += $t.name }
     }
-    $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken) }
+    $configured = $false
+    try { $configured = [bool](Get-ProviderConfig (Read-Config) 'codex') } catch { }
+    # lastActivity stays Claude's (transcripts); tasks lists both providers
+    $out = @{ lastActivity = $lastIso; tasks = $tasks; brokenTasks = @($broken)
+              codex = @{ configured = $configured; tasks = @($codexTasks) } }
     ConvertTo-Json -InputObject $out -Compress -Depth 6
 }
 
@@ -1212,11 +2013,29 @@ function Invoke-Learn {
     Write-Host ''
     if ($bak) { Write-Host ('schedule.json written (previous copy saved as {0}) - applying:' -f (Split-Path $bak -Leaf)) }
     else { Write-Host 'schedule.json written - applying:' }
-    Invoke-Apply
+    # only the rules learn just rewrote: the Codex tasks are not its business
+    Invoke-Apply 'claude'
 }
 
-function Invoke-Off {
+function Invoke-Off([string]$Provider = 'all') {
+    # plain off = every provider; -Codex / -Provider claude = that one only.
+    # Wait out the fire of each provider whose jobs go away.
+    if ($Provider -eq 'codex') {
+        Wait-FireLock -Path $CodexFireLock -MaxSec 720 -LivePidOnly
+        Remove-PreheatJobs 'ClaudePreheat-Codex-*'
+        Write-Log @{ ev = 'off'; provider = 'codex' }
+        Write-Host 'Codex preheat tasks removed'
+        return
+    }
     Wait-FireLock
+    if ($Provider -eq 'claude') {
+        Remove-PreheatJobs "$TaskWkPrefix*"
+        Remove-PreheatJobs "$TaskOncePrefix*"
+        Write-Log @{ ev = 'off'; provider = 'claude' }
+        Write-Host 'Claude preheat tasks removed'
+        return
+    }
+    Wait-FireLock -Path $CodexFireLock -MaxSec 720 -LivePidOnly
     Remove-PreheatJobs 'ClaudePreheat*'
     Write-Log @{ ev = 'off' }
     Write-Host 'all preheat tasks removed'
@@ -1362,16 +2181,33 @@ function Invoke-StatusLineSetup {
     Write-Host 'undo anytime: preheat statusline off'
 }
 
+# the provider a one-shot belongs to (at / reset / +Nh / +Nm)
+$OnceProvider = 'claude'
+if ($Provider -eq 'codex') { $OnceProvider = 'codex' }
+
 switch -Regex ($Command) {
-    '^apply$'  { Invoke-Apply; break }
-    '^fire$'   { Invoke-Fire; break }
-    '^status$' { if ($Json) { Invoke-StatusJson } else { Invoke-Status }; break }
-    '^learn$'  { Invoke-Learn; break }
-    '^off$'    { Invoke-Off; break }
+    '^apply$'  { Invoke-Apply $Provider; break }
+    '^fire$'   { if ($Provider -eq 'codex') { Invoke-CodexFire } else { Invoke-Fire }; break }
+    '^status$' {
+        if ($Provider -eq 'codex') { Invoke-CodexStatus }
+        elseif ($Json) { Invoke-StatusJson } else { Invoke-Status }
+        break
+    }
+    '^learn$'  {
+        if ($Provider -eq 'codex') { Write-Host 'learn is Claude-only for now; Codex support is planned for beta.2'; break }
+        Invoke-Learn
+        break
+    }
+    '^report$' {
+        if ($Provider -eq 'codex') { Invoke-CodexReport }
+        else { Write-Host 'usage: preheat report -Codex   (redacted Codex fire evidence to paste into a beta issue)' }
+        break
+    }
+    '^off$'    { Invoke-Off $Provider; break }
     '^statusline$' { Invoke-StatusLineSetup; break }
     '^at$'     {
         if (-not $Arg) { throw 'usage: preheat at HH:mm' }
-        Invoke-Once (Get-NextOccurrence $Arg) ('at ' + $Arg)
+        Invoke-Once (Get-NextOccurrence $Arg) ('at ' + $Arg) -Provider $OnceProvider
         break
     }
     '^reset$'  {
@@ -1381,17 +2217,18 @@ switch -Regex ($Command) {
             Write-Host ('requested reset {0} unreachable today (fire time already past) - scheduling for tomorrow' -f $Arg)
             $t = $t.AddDays(1)
         }
-        Invoke-Once $t ('reset ' + $Arg)
+        Invoke-Once $t ('reset ' + $Arg) -Provider $OnceProvider
         break
     }
     '^\+\d+[hm]$' {
         $null = $Command -match '^\+(\d+)([hm])$'
         $n = [int]$Matches[1]
         $t = if ($Matches[2] -eq 'h') { (Get-Date).AddHours($n) } else { (Get-Date).AddMinutes($n) }
-        Invoke-Once $t $Command
+        Invoke-Once $t $Command -Provider $OnceProvider
         break
     }
     default {
         Write-Host 'usage: preheat apply | status [-Json] | learn [auto] | at HH:mm | reset HH:mm | +Nh | +Nm | fire | statusline on|off | off'
+        Write-Host '       Codex (beta): add -Codex to apply/at/reset/+Nh/+Nm/off, plus status -Codex [-Json] | report -Codex'
     }
 }

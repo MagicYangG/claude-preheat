@@ -6,6 +6,10 @@ state-ratelimits.json
 statusline-original.json
 firepit/
 .fire.lock
+# Codex (beta) runtime files; no trailing slash on the dir, see the promo note below
+firepit-codex
+.fire-codex.lock
+state-ratelimits-codex.json
 *.tmp
 *.bak*
 

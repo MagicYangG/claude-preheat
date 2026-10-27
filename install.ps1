@@ -207,6 +207,20 @@ if (-not $OnMac) {
     } catch { }
 }
 
+# 6) Codex (beta): one informational line - finding it changes nothing, a
+# "codex" section in schedule.json is what turns Codex preheat on. Looking
+# never runs codex, and a broken codex.ps1 must not fail the install.
+$codexExe = $null
+try {
+    . (Join-Path $repoDir 'codex.ps1')
+    $codexExe = Resolve-CodexExe
+} catch { }
+if ($codexExe) {
+    Write-Host ("[info] Codex found ({0}) - see preheat status -Codex" -f $codexExe.kind)
+} else {
+    Write-Host "[info] Codex not found - Codex preheat stays off"
+}
+
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Cyan
 Write-Host "  1. Edit schedule.json to your own weekly rules"

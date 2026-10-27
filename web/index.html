@@ -161,6 +161,7 @@ select{
 .evtag.ok{color:var(--ok2);border-color:var(--ok-b);background:var(--ok-bg)}
 .evtag.noeff{color:var(--accfg);border-color:var(--acc-b);background:var(--acc-bg)}
 .evtag.bad{color:var(--bad);border-color:var(--bad-b);background:var(--bad-bg)}
+.evtag.skip{color:var(--dim);border-color:var(--line);background:transparent}
 .evempty{padding:4px 0 2px;font-size:12.5px;color:var(--dim)}
 @media (max-width:560px){.evrow{grid-template-columns:92px 1fr}.evrow .evtxt{grid-column:1 / -1}}
 
@@ -188,6 +189,17 @@ select{
 .rl.stale .rlfill{background:var(--dim2)}
 .rl.stale .rlhead{color:var(--dim)}
 
+/* ---- provider tabs (Claude | Codex) + the Codex account line ---- */
+.ptabs{display:flex;gap:6px;margin:0 0 14px}
+.ptab{padding:4px 15px;font-size:13px;background:transparent;color:var(--dim);border:1px solid var(--line2);border-radius:999px}
+.ptab:hover:not(:disabled){color:var(--fg2);border-color:var(--dim)}
+.ptab.on{color:var(--accfg);border-color:var(--acc-b);background:var(--acc-bg)}
+.cxhead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 12px;font-size:13px;color:var(--fg2)}
+.cxhead .cxinfo{flex:1;min-width:0;word-break:break-word}
+.cxhead .cxdim{color:var(--dim)}
+.cxban{background:var(--acc-bg);border:1px solid var(--acc-b);color:var(--accfg);border-radius:10px;padding:9px 13px;font-size:13px;margin:0 0 12px;line-height:1.55;word-break:break-word}
+.cxban.bad{background:var(--bad-bg);border-color:var(--bad-b);color:var(--bad)}
+
 @media (max-width:560px){
   .wrap{padding:0 14px}
   .card{padding-left:16px;padding-right:16px}
@@ -214,8 +226,16 @@ select{
 
 <!-- 1. preheat -->
 <section class="card" id="schedBox">
+  <div class="ptabs" id="ptabs">
+    <button class="ptab" data-prov="claude">Claude</button>
+    <button class="ptab" data-prov="codex">Codex</button>
+  </div>
   <h2 data-i18n="sched_h2"></h2>
   <p class="lead" data-i18n="sched_lead"></p>
+  <div id="cxbox" style="display:none">
+    <div class="cxhead"><span class="cxinfo" id="cxinfo"></span><button class="mini" id="cxRefresh" data-i18n="cx_refresh"></button></div>
+    <div id="cxban"></div>
+  </div>
   <div id="rlbox" style="display:none"></div>
   <div id="learnbox" class="rlage" style="display:none;margin:-4px 0 14px"></div>
   <div class="rowhead"><div class="t" data-i18n="sched_scheduled"></div></div>
@@ -297,12 +317,28 @@ var I18N = {
     op_failed:'操作失败', not_json:'后端返回的不是 JSON', no_backend:'没连上后端：',
     no_times:'一个时刻都没有；想全部清掉请用命令行 preheat off',
     ev_h:'点火历史', ev_last:'上次 ', ev_kind_all:'全部', ev_days_pre:'近', ev_days_post:'天', ev_max_pre:'最多', ev_max_post:'条',
-    ev_ok:'窗口预热成功', ev_noeff:'窗口预热无效', ev_fail:'窗口预热失败',
+    ev_ok:'窗口预热成功', ev_noeff:'窗口预热无效', ev_fail:'窗口预热失败', ev_skip:'已跳过',
     ev_ok_line:'于 {a} 预热成功，将于 {b} 重置', ev_ok_line_na:'于 {a} 预热成功（当时未记录窗口状态）',
     ev_noeff_line:'探查到 {a} 有使用，预热窗口时，原 5 小时额度未结束', ev_noeff_line_na:'预热窗口时，原 5 小时额度未结束', ev_noeff_chase:'，已补排 {b} 的跟进预热',
     ev_fail_limit:'用量已达限额', ev_fail_auth:'登录已过期', ev_fail_other:'其他错误：{e}', ev_fail_unknown:'原因未记录',
     ev_retry:'重试 {n} 次', ev_none:'近 {d} 天没有点火记录', ev_none_kind:'近 {d} 天没有「{k}」的记录', ev_none_all:'还没有点火记录',
-    bad_hours:'小时数填个 1 以上的整数', bad_time:'时刻格式要是 HH:mm', langBtn:'EN'
+    bad_hours:'小时数填个 1 以上的整数', bad_time:'时刻格式要是 HH:mm', langBtn:'EN',
+    cx_refresh:'刷新额度', cx_refreshing:'读取中…', cx_read_done:'已读取 Codex 额度',
+    cx_busy:'Codex 正在点火，过几分钟再读',
+    cx_account:'账号 {e}', cx_plan:'套餐 {p}', cx_5h_run:'5 小时窗进行中，{t} 重置', cx_5h_idle:'5 小时窗空闲', cx_5h_none:'读不到 5 小时窗',
+    cx_ban_noinst:'没找到 Codex（命令行或桌面端）。装好并用 ChatGPT 账号登录后，点「刷新额度」。',
+    cx_ban_no5h:'这个账号（套餐：{plan}）目前读不到 5 小时额度窗，预热帮不上；OpenAI 调整后会自动生效',
+    cx_ban_never:'还没读过 Codex 额度 —— 点「刷新额度」读一次（只读，不发 ping）。',
+    cx_ban_auth:'Codex 没登录或登录已过期 —— 在终端运行 codex login，再点「刷新额度」。',
+    cx_ban_apikey:'Codex 现在用 API key 登录，没有 5 小时窗；预热只对 ChatGPT 账号登录有效。',
+    cx_ban_err:'读取 Codex 额度失败：{e}',
+    cx_src:'来自 Codex 读数 · ', cx_gone:'上次读数以来窗口都已重置 —— 点「刷新额度」再读一次。',
+    cx_running:'5 小时窗已在进行中（{b} 重置），没发 ping，不耗额度',
+    cx_moved:'已发 ping，但窗口没落在预期时刻（{b} 重置）',
+    cx_sliding:'已发 ping，但没开出新的 5 小时窗', cx_unknown:'已发 ping，但没读到点火后的额度，结果未知',
+    cx_fail_no5h:'账号读不到 5 小时窗，没发 ping', cx_fail_apikey:'Codex 用 API key 登录，没有 5 小时窗',
+    cx_fail_notfound:'没找到 codex 程序', cx_fail_mismatch:'读额度时已登录，但 ping 时登录失败（两边配置不一致）',
+    cx_fail_paused:'已暂停：连续两次 ping 都没开出新窗口。终端运行 preheat apply -Provider codex 恢复'
   },
   en: {
     title:'Claude-Preheat Control Desk', desk:'Control Desk', refresh:'Refresh',
@@ -329,12 +365,28 @@ var I18N = {
     op_failed:'Operation failed', not_json:'Backend did not return JSON', no_backend:'Backend not reachable: ',
     no_times:'No times set; to clear everything use preheat off on the command line',
     ev_h:'Fire history', ev_last:'last ', ev_kind_all:'all', ev_days_pre:'last', ev_days_post:'days', ev_max_pre:'up to', ev_max_post:'entries',
-    ev_ok:'Preheat succeeded', ev_noeff:'Preheat had no effect', ev_fail:'Preheat failed',
+    ev_ok:'Preheat succeeded', ev_noeff:'Preheat had no effect', ev_fail:'Preheat failed', ev_skip:'Skipped',
     ev_ok_line:'fired at {a}, resets at {b}', ev_ok_line_na:'fired at {a} (window state was not recorded back then)',
     ev_noeff_line:'activity seen at {a}, the previous 5-hour window was still running', ev_noeff_line_na:'the previous 5-hour window was still running', ev_noeff_chase:' - follow-up preheat booked for {b}',
     ev_fail_limit:'usage limit reached', ev_fail_auth:'login expired', ev_fail_other:'other error: {e}', ev_fail_unknown:'no reason recorded',
     ev_retry:'retried {n}\u00d7', ev_none:'No fires in the last {d} days', ev_none_kind:'No \u201c{k}\u201d in the last {d} days', ev_none_all:'No fires yet',
-    bad_hours:'Enter a whole number of hours ≥ 1', bad_time:'Time must be HH:mm', langBtn:'中文'
+    bad_hours:'Enter a whole number of hours ≥ 1', bad_time:'Time must be HH:mm', langBtn:'中文',
+    cx_refresh:'Refresh quota', cx_refreshing:'Reading…', cx_read_done:'Codex quota read',
+    cx_busy:'A Codex fire is running - read again in a few minutes',
+    cx_account:'account {e}', cx_plan:'plan {p}', cx_5h_run:'5-hour window running, resets {t}', cx_5h_idle:'5-hour window idle', cx_5h_none:'no 5-hour window readable',
+    cx_ban_noinst:'Codex not found (CLI or desktop app). Install it, sign in with ChatGPT, then press Refresh quota.',
+    cx_ban_no5h:'This account (plan: {plan}) has no readable 5-hour window right now, so preheating cannot help; it starts working on its own once OpenAI changes that',
+    cx_ban_never:'Codex quota has not been read yet - press Refresh quota once (read-only, no ping).',
+    cx_ban_auth:'Codex is signed out or its login expired - run codex login in a terminal, then press Refresh quota.',
+    cx_ban_apikey:'Codex is signed in with an API key, which has no 5-hour window; preheating only works with a ChatGPT sign-in.',
+    cx_ban_err:'Reading the Codex quota failed: {e}',
+    cx_src:'from Codex read · ', cx_gone:'Both windows have reset since the last read - press Refresh quota to read again.',
+    cx_running:'the 5-hour window was already running (resets {b}) - no ping sent, no quota used',
+    cx_moved:'pinged, but the window did not land at the expected time (resets {b})',
+    cx_sliding:'pinged, but no new 5-hour window opened', cx_unknown:'pinged, but the quota could not be read afterwards - result unknown',
+    cx_fail_no5h:'no 5-hour window readable on this account - no ping sent', cx_fail_apikey:'Codex is signed in with an API key - no 5-hour window',
+    cx_fail_notfound:'codex executable not found', cx_fail_mismatch:'signed in for the quota read, but the ping failed to sign in (config mismatch)',
+    cx_fail_paused:'paused: two pings in a row opened no new window. Run preheat apply -Provider codex to resume'
   }
 };
 function t(k){ var d = I18N[LANG] || I18N.zh; return (k in d) ? d[k] : (I18N.zh[k] != null ? I18N.zh[k] : k); }
@@ -342,7 +394,29 @@ function t(k){ var d = I18N[LANG] || I18N.zh; return (k in d) ? d[k] : (I18N.zh[
 var DAYS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 var DAYCN = {Mon:'一',Tue:'二',Wed:'三',Thu:'四',Fri:'五',Sat:'六',Sun:'日'};
 function dayShort(d){ return LANG === 'en' ? d : DAYCN[d]; }
-var state = { status:null, busy:false, stamp:null, schedLoaded:false, rl:null, learn:null, schedMtime:null, events:null };
+var state = { status:null, busy:false, stamp:null, learn:null };
+
+/* ---------- provider tabs: everything below the tabs is per provider ---------- */
+// each side keeps its own editor model, saved shape, lock token and caches,
+// so switching tabs never loses unsaved edits or carries them across. Async
+// work captures the provider it started for and writes into that slot only.
+function newSlot(){
+  var w = {}; DAYS.forEach(function(d){ w[d] = []; });
+  return { week:w, savedKey:'[]', schedMtime:null, schedLoaded:false, derived:false, rl:null, events:null, live:null, refreshing:false };
+}
+var PROV = { claude:newSlot(), codex:newSlot() };
+var provPinned = false;   // the user picked a tab (remembered) - never auto-switch then
+var cur = (function(){
+  try { var v = localStorage.getItem('clr_provider'); if (v === 'claude' || v === 'codex') { provPinned = true; return v; } } catch(e){ }
+  return 'claude';
+})();
+function P(p){ return PROV[p || cur]; }
+function q(path, p){ return path + '?provider=' + encodeURIComponent(p || cur); }
+function taskProvider(tk){ return tk.provider || (/^ClaudePreheat-Codex-/.test(String(tk.name || '')) ? 'codex' : 'claude'); }
+function provTasks(p){
+  var ig = (state.status && state.status.preheat) ? state.status.preheat : {};
+  return (ig.tasks || []).filter(function(tk){ return taskProvider(tk) === (p || cur); });
+}
 
 /* ---------- utils ---------- */
 function $(id){ return document.getElementById(id); }
@@ -447,7 +521,7 @@ function taskLabel(task){
   // registered task names encode the FIRE time (ClaudePreheat-Wk-0400-MonTue);
   // the grid below speaks in RESET times - translate so the two blocks
   // visibly correspond (raw name stays in the row tooltip)
-  var m = /^ClaudePreheat-Wk-(\d{2})(\d{2})-(.+)$/.exec(String(task.name || ''));
+  var m = /^ClaudePreheat-(?:Codex-)?Wk-(\d{2})(\d{2})-(.+)$/.exec(String(task.name || ''));
   if (m) {
     var days = String(m[3]).match(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/g) || [];
     var mins = parseInt(m[1],10) * 60 + parseInt(m[2],10);
@@ -463,12 +537,11 @@ function taskLabel(task){
     return '<span class="tt">' + resetHM + '</span> ' + t('reset_word') +
       '<span class="tdim">（' + fireHM + ' 预热）</span> · 周' + dn.join('·');
   }
-  if (/^ClaudePreheat-Once-/.test(String(task.name || ''))) return t('once_task');
+  if (/^ClaudePreheat-(?:Codex-)?Once-/.test(String(task.name || ''))) return t('once_task');
   return esc(task.name);
 }
 function renderTasks(){
-  var ig = (state.status && state.status.preheat) ? state.status.preheat : {};
-  var tasks = ig.tasks || [];
+  var tasks = provTasks();
   if (!tasks.length) {
     $('tasks').innerHTML = '<div class="empty">' + t('no_tasks') + '</div>';
   } else {
@@ -494,15 +567,18 @@ function bindAll(box, attr, fn){
 // matter how many rules exist (a row-per-rule editor grew without bound).
 // week{} is the working model; collectRules() folds identical times across
 // days back into {days, reset} rules, so the payload preheat apply takes is
-// unchanged.
-var week = {};
-DAYS.forEach(function(d){ week[d] = []; });
-var savedKey = '[]';   // last saved shape; apply greys out until something differs
+// unchanged. The model and the last saved shape (apply greys out until
+// something differs) live in the provider slot: P().week / P().savedKey.
 
-function keyOf(){ return JSON.stringify(collectRules()); }
-function updateApplyState(){ $('btnApply').disabled = state.busy || (keyOf() === savedKey); }
+function keyOf(p){ return JSON.stringify(collectRules(p)); }
+function updateApplyState(){
+  // a Refresh holds the single-threaded backend for up to a minute
+  $('btnApply').disabled = state.busy || PROV.codex.refreshing || (keyOf() === P().savedKey);
+  $('cxRefresh').disabled = state.busy || PROV.codex.refreshing;
+}
 
 function addTime(day, val){
+  var week = P().week;
   if (!/^\d{2}:\d{2}$/.test(val)) { renderWeek(); return; }
   if (week[day].indexOf(val) < 0) { week[day].push(val); week[day].sort(); }
   renderWeek();
@@ -518,7 +594,7 @@ function timeEditor(day, oldVal){
   var done = false;
   function commit(){
     if (done) return; done = true;
-    var v = inp.value;
+    var v = inp.value, week = P().week;
     if (/^\d{2}:\d{2}$/.test(v) && v !== oldVal) {
       if (oldVal) week[day] = week[day].filter(function(tm){ return tm !== oldVal; });
       addTime(day, v);   // dedupes, sorts, re-renders, refreshes the dirty gate
@@ -538,6 +614,7 @@ function openTimeEditor(day, oldVal, replaceNode){
   try { inp.showPicker(); } catch (e) { }   // pop the clock picker right away
 }
 function renderWeek(){
+  var week = P().week;
   var host = $('wkgrid');
   var todayIdx = (new Date().getDay() + 6) % 7;   // Mon=0 .. Sun=6
   var html = '';
@@ -562,7 +639,7 @@ function renderWeek(){
     });
   }
   bindAll(host, 'data-del', function(v){
-    var p = v.split('|');
+    var p = v.split('|'), week = P().week;
     week[p[0]] = week[p[0]].filter(function(tm){ return tm !== p[1]; });
     renderWeek();
   });
@@ -575,8 +652,8 @@ function renderWeek(){
   }
   updateApplyState();
 }
-function collectRules(){
-  var byTime = {};
+function collectRules(p){
+  var byTime = {}, week = P(p).week;
   DAYS.forEach(function(d){
     week[d].forEach(function(tm){ (byTime[tm] = byTime[tm] || []).push(d); });
   });
@@ -584,20 +661,22 @@ function collectRules(){
     return { days: byTime[tm], reset: tm };
   });
 }
-function seedRules(rules){
+function seedRules(rules, p){
+  var week = P(p).week;
   (rules || []).forEach(function(r){
     (r.days || []).forEach(function(d){
       if (week[d] && /^\d{2}:\d{2}$/.test(r.reset) && week[d].indexOf(r.reset) < 0) week[d].push(r.reset);
     });
   });
   DAYS.forEach(function(d){ week[d].sort(); });
-  savedKey = keyOf();
+  P(p).savedKey = keyOf(p);
   renderWeek();
 }
 function rulesFromTasks(tasks){
+  // callers pass one provider's tasks (provTasks), so both prefixes parse here
   var out = [];
   (tasks || []).forEach(function(tk){
-    var m = /ClaudePreheat-Wk-(\d{2})(\d{2})-(.+)$/.exec(String(tk.name || ''));
+    var m = /ClaudePreheat-(?:Codex-)?Wk-(\d{2})(\d{2})-(.+)$/.exec(String(tk.name || ''));
     if (!m) return;
     var days = String(m[3]).match(/Mon|Tue|Wed|Thu|Fri|Sat|Sun/g);
     if (!days || !days.length) return;
@@ -610,28 +689,36 @@ function rulesFromTasks(tasks){
   });
   return out;
 }
-function seedScheduleFallback(){
-  var ig = (state.status && state.status.preheat) ? state.status.preheat : {};
-  var rules = rulesFromTasks(ig.tasks);
-  seedRules(rules);
-  $('schedNote').textContent = rules.length ? t('schednote_derived') : '';
+function renderNote(){
+  $('schedNote').textContent = P().derived ? t('schednote_derived') : '';
 }
-function seedSchedule(force){
-  if (state.schedLoaded && !force) return Promise.resolve();
-  state.schedLoaded = true;
-  return getJSON('/api/schedule').then(function(sched){
-    state.schedMtime = (sched && sched.mtime != null) ? sched.mtime : null;
+function seedScheduleFallback(p){
+  var rules = rulesFromTasks(provTasks(p));
+  seedRules(rules, p);
+  P(p).derived = rules.length > 0;
+  renderNote();
+}
+function seedSchedule(force, p){
+  p = p || cur;
+  var s = P(p);
+  // a second caller while the first load is in flight waits for it
+  if (s.schedLoaded && !force) return s.schedP || Promise.resolve();
+  s.schedLoaded = true;
+  return s.schedP = getJSON(q('/api/schedule', p)).then(function(sched){
+    s.schedMtime = (sched && sched.mtime != null) ? sched.mtime : null;
     var rules = (sched && Array.isArray(sched.rules)) ? sched.rules : [];
     // force = resync of a stale tab: seedRules MERGES, so the old working
     // model has to go first or the times we just replaced come back
-    if (force) DAYS.forEach(function(d){ week[d] = []; });
+    if (force) DAYS.forEach(function(d){ s.week[d] = []; });
     if (rules.length) {
-      seedRules(rules);
+      s.derived = false;
+      seedRules(rules, p);
+      renderNote();
     } else {
-      seedScheduleFallback();
+      seedScheduleFallback(p);
     }
   }).catch(function(){
-    if (!force) seedScheduleFallback();
+    if (!force) seedScheduleFallback(p);
   });
 }
 
@@ -646,14 +733,17 @@ function rlDate(v){
 }
 function renderRateLimits(){
   var box = $('rlbox');
-  var r = state.rl;
+  var cx = cur === 'codex';
+  var r = P().rl;
+  if (cx) renderCodexHead();
   function note(key){
     // an empty strip used to just vanish, which reads as "you have no quota"
     // rather than "nothing is feeding this yet"
     box.className = 'rlage'; box.style.display = '';
     box.textContent = t(key);
   }
-  if (!r || !r.rate_limits) { note('rl_hint'); return; }
+  // Codex: the banner above already says why there is nothing to draw
+  if (!r || !r.rate_limits) { if (cx) { box.style.display = 'none'; return; } note('rl_hint'); return; }
   var rl = r.rate_limits;
   var now = Date.now();
   var shown = 0, expired = 0;
@@ -673,31 +763,104 @@ function renderRateLimits(){
     '</div>';
   }
   var inner = item('rl_5h', rl.five_hour) + item('rl_wk', rl.seven_day);
-  if (!shown) { note(expired ? 'rl_expired' : 'rl_hint'); return; }
+  if (!shown) {
+    if (cx) { if (expired) note('cx_gone'); else box.style.display = 'none'; return; }
+    note(expired ? 'rl_expired' : 'rl_hint'); return;
+  }
   var cap = parseDate(r.capturedAt);
   var stale = !!(cap && (now - cap.getTime() > 30 * 60 * 1000));
   box.className = stale ? 'rl stale' : 'rl';
   box.style.display = '';
   box.innerHTML = inner + '<div class="rlage">' + (stale ? esc(t('rl_stale')) : '') +
-    t('rl_src') + (r.capturedAt ? ago(r.capturedAt) : '') + '</div>';
+    t(cx ? 'cx_src' : 'rl_src') + (r.capturedAt ? ago(r.capturedAt) : '') + '</div>';
 }
 function refreshRateLimits(){
-  return getJSON('/api/ratelimits').then(function(r){
-    state.rl = (r && r.rate_limits) ? r : null;
-    renderRateLimits();
+  var p = cur;
+  return getJSON(q('/api/ratelimits', p)).then(function(r){
+    // the Codex cache matters even without windows (account, plan, has5h)
+    if (p === 'codex') P(p).rl = (r && r.capturedAt) ? r : null;
+    else P(p).rl = (r && r.rate_limits) ? r : null;
+    if (p === cur) renderRateLimits();
   }).catch(function(){ /* the panel works fine without the tap */ });
+}
+
+/* ---------- Codex account line, banners and the Refresh button ---------- */
+// The panel never starts codex by itself: this line reads the cache that
+// fires, `preheat status -Codex` and the Refresh button write. Refresh is the
+// only live read and runs one `status -Codex -Json` on the backend.
+function codexInstalled(){
+  var live = PROV.codex.live;
+  if (live && live.installed != null) return !!live.installed;
+  return !!(state.status && state.status.codex && state.status.codex.installed);
+}
+function renderCodexHead(){
+  var c = PROV.codex.rl || {}, live = PROV.codex.live || {};
+  // a cache written after the last Refresh (a fire since) outranks what
+  // that Refresh said, banners included
+  var capd = parseDate(c.capturedAt);
+  if (capd && PROV.codex.liveAt && capd.getTime() > PROV.codex.liveAt) live = {};
+  var acct = c.account || live.account || {};
+  var plan = c.plan || live.plan || '';
+  var has5h = (c.has5h != null) ? c.has5h : live.has5h;
+  var bits = [];
+  if (acct.emailMasked) bits.push(esc(t('cx_account').replace('{e}', function(){ return acct.emailMasked; })));
+  if (plan) bits.push(esc(t('cx_plan').replace('{p}', function(){ return plan; })));
+  if (c.capturedAt || live.capturedAt) {
+    var five = ((live.rate_limits || c.rate_limits) || {}).five_hour;
+    var rd = (five && five.resets_at) ? parseDate(rlDate(five.resets_at)) : null;
+    if (has5h === false) bits.push(esc(t('cx_5h_none')));
+    else if (rd && rd.getTime() > Date.now()) bits.push(esc(t('cx_5h_run').replace('{t}', hm(rd))));
+    else bits.push(esc(t('cx_5h_idle')));
+  }
+  $('cxinfo').innerHTML = bits.join(' <span class="cxdim">·</span> ');
+  $('cxRefresh').textContent = PROV.codex.refreshing ? t('cx_refreshing') : t('cx_refresh');
+  // one banner, most blocking reason first
+  var ban = '', bad = false;
+  if (!codexInstalled()) ban = esc(t('cx_ban_noinst'));
+  else if (live.kind === 'auth') { ban = esc(t('cx_ban_auth')); bad = true; }
+  else if (live.kind === 'apikey') ban = esc(t('cx_ban_apikey'));
+  else if (live.kind && live.err) { ban = esc(t('cx_ban_err').replace('{e}', function(){ return live.err; })); bad = true; }
+  else if (live.ok === false && live.message) { ban = esc(t('cx_ban_err').replace('{e}', function(){ return live.message; })); bad = true; }
+  else if (!c.capturedAt && !live.capturedAt) ban = esc(t('cx_ban_never'));
+  else if (has5h === false) ban = esc(t('cx_ban_no5h').replace('{plan}', function(){ return plan || '?'; }));
+  $('cxban').innerHTML = ban ? '<div class="cxban' + (bad ? ' bad' : '') + '">' + ban + '</div>' : '';
+}
+function refreshCodexLive(){
+  var s = PROV.codex;
+  if (s.refreshing || state.busy) return;
+  s.refreshing = true; updateApplyState(); renderCodexHead();
+  postJSON('/api/codex/refresh', {}).then(function(res){
+    s.liveAt = Date.now();
+    if (res && res.installed != null) {
+      s.live = res;
+      if (!res.kind) toast(true, t('cx_read_done'));   // a failed read speaks through the banner
+    } else if (res && res.code === 'busy') {
+      toast(false, t('cx_busy'));
+    } else {
+      s.live = { ok:false, message: (res && res.message) ? res.message : t('op_failed') };
+      toast(false, s.live.message);
+    }
+  }).catch(function(e){
+    toast(false, t('no_backend') + e.message);
+  }).then(function(){
+    s.refreshing = false; updateApplyState();
+    // the status run rewrote the cache file: read it back the normal way
+    if (cur === 'codex') refreshRateLimits().then(renderCodexHead);
+    else renderCodexHead();
+  });
 }
 
 /* ---------- learn line (7-day window utilization) ---------- */
 function renderLearn(){
   var box = $('learnbox');
   var w = state.learn && state.learn.waste;
-  if (!w || !w.windows || w.usedPct == null) { box.style.display = 'none'; box.textContent = ''; return; }
+  // learn reads Claude's prompt history only - nothing to say on the Codex tab
+  if (cur !== 'claude' || !w || !w.windows || w.usedPct == null) { box.style.display = 'none'; box.textContent = ''; return; }
   box.style.display = '';
   box.textContent = t('learn_waste').replace('{n}', w.windows).replace('{p}', w.usedPct);
 }
 function refreshLearn(){
-  return getJSON('/api/learn').then(function(r){
+  return getJSON(q('/api/learn', 'claude')).then(function(r){
     state.learn = r || null;
     renderLearn();
   }).catch(function(){ /* optional */ });
@@ -721,11 +884,31 @@ function evInputs(){
   return { days:d, max:m };
 }
 function hm(d){ return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
-function evVerdict(e){ return !e.ok ? 'bad' : (e.anchored === false ? 'noeff' : 'ok'); }
+// a Codex fire that chose not to ping (no window / API key / paused) spent nothing - not a failure
+var CX_SKIP = { no5h:1, apikey:1, paused:1 };
+function evVerdict(e){ return !e.ok ? ((e.provider === 'codex' && CX_SKIP[e.kind]) ? 'skip' : 'bad') : (e.anchored === false ? 'noeff' : 'ok'); }
 function evTag(v){
-  return '<span class="evtag ' + v + '">' + t(v === 'ok' ? 'ev_ok' : (v === 'noeff' ? 'ev_noeff' : 'ev_fail')) + '</span>';
+  return '<span class="evtag ' + v + '">' + t(v === 'ok' ? 'ev_ok' : (v === 'noeff' ? 'ev_noeff' : (v === 'skip' ? 'ev_skip' : 'ev_fail'))) + '</span>';
+}
+function cxLine(e, v, d){
+  // Codex records carry the fire's own verdict (state) - say what happened in
+  // Codex terms; the tag beside it is the same three-way verdict as Claude's
+  var r = e.resets_at ? parseDate(e.resets_at) : null;
+  var b = r ? hm(r) : '?';
+  var ca = e.chase_at ? parseDate(e.chase_at) : null;
+  var tail = ca ? t('ev_noeff_chase').replace('{b}', hm(ca)) : '';
+  if (e.ok) {
+    if (e.state === 'running') return t('cx_running').replace('{b}', b) + tail;
+    if (e.state === 'moved') return t('cx_moved').replace('{b}', b) + tail;
+    if (e.state === 'sliding') return t('cx_sliding');
+    if (e.state === 'unknown') return t('cx_unknown');
+    return null;   // anchored: the Claude wording fits as is
+  }
+  var k = { no5h:'cx_fail_no5h', apikey:'cx_fail_apikey', notfound:'cx_fail_notfound', 'config-mismatch':'cx_fail_mismatch', paused:'cx_fail_paused' }[e.kind];
+  return k ? t(k) : null;
 }
 function evLine(e, v, d){
+  if (e.provider === 'codex') { var cl = cxLine(e, v, d); if (cl != null) return cl; }
   if (v === 'ok') {
     // records older than the anchored flag cannot say whether a window opened
     if (e.anchored !== true) return t('ev_ok_line_na').replace('{a}', hm(d));
@@ -750,7 +933,7 @@ function evLine(e, v, d){
   return t('ev_fail_other').replace('{e}', function(){ return esc(e.err); });
 }
 function renderEvents(){
-  var all = state.events || [];
+  var all = P().events || [];
   var p = evInputs();
   var kind = $('evKind').value || 'all';
   var cut = Date.now() - p.days * 86400 * 1000;
@@ -772,18 +955,33 @@ function renderEvents(){
   $('evlast').innerHTML = (last && ld) ? (esc(t('ev_last') + fmtDT(ld)) + ' ' + evTag(evVerdict(last))) : '';
 }
 function refreshEvents(){
-  return getJSON('/api/events').then(function(r){
-    state.events = (r && r.events) ? r.events : [];
-    renderEvents();
+  var pv = cur;
+  return getJSON(q('/api/events', pv)).then(function(r){
+    P(pv).events = (r && r.events) ? r.events : [];
+    if (pv === cur) renderEvents();
   }).catch(function(){ /* the list just keeps what it had */ });
 }
 
 /* ---------- refresh loops ---------- */
+var provDecided = false;
 function applyStatus(s){
   state.status = s; state.stamp = new Date(); setOnline(true);
-  renderTasks(); seedSchedule(); tickStamp();
+  renderTasks(); tickStamp();
+  if (cur === 'codex') renderCodexHead();
+  var sp = seedSchedule();
+  if (!provPinned && !provDecided) {
+    // first visit, no remembered tab: a Codex-only user lands on Codex
+    provDecided = true;
+    seedSchedule(false, 'claude').then(function(){
+      if (!provPinned && cur === 'claude' && !collectRules('claude').length && s.codex && s.codex.installed) setProvider('codex', false);
+    });
+  }
+  return sp;
 }
 function refreshStatus(){
+  // a Refresh in flight holds the backend: a poll now would time out and
+  // read as "offline". Its own end re-reads what it changed.
+  if (PROV.codex.refreshing) return Promise.resolve();
   refreshRateLimits();
   refreshEvents();
   // one miss is not "offline": the single-threaded backend is unreachable for
@@ -819,12 +1017,24 @@ function applyStatic(){
 function rerenderDynamic(){
   renderWeek();
   renderTasks(); renderRateLimits(); renderLearn(); renderEvents();
-  if (state.status && state.status.preheat) {
-    var ig = state.status.preheat;
-    var rules = rulesFromTasks(ig.tasks);
-    if ($('schedNote').textContent) $('schedNote').textContent = rules.length ? t('schednote_derived') : '';
-  }
+  renderNote();
   tickStamp();
+}
+function renderTabs(){
+  var tabs = document.querySelectorAll('[data-prov]');
+  for (var i = 0; i < tabs.length; i++) tabs[i].className = 'ptab' + (tabs[i].getAttribute('data-prov') === cur ? ' on' : '');
+  $('cxbox').style.display = (cur === 'codex') ? '' : 'none';
+}
+function setProvider(p, remember){
+  if (p !== 'claude' && p !== 'codex') return;
+  if (remember) { provPinned = true; try { localStorage.setItem('clr_provider', p); } catch (e) { } }
+  if (p === cur) return;
+  cur = p;
+  renderTabs();
+  rerenderDynamic();   // draws what this side already holds, edits included
+  seedSchedule();      // first visit to this side only
+  refreshRateLimits();
+  refreshEvents();
 }
 function setLang(lang){
   LANG = (lang === 'en') ? 'en' : 'zh';
@@ -837,20 +1047,24 @@ function setLang(lang){
 $('btnLang').addEventListener('click', function(){ setLang(LANG === 'en' ? 'zh' : 'en'); });
 $('btnRefresh').addEventListener('click', function(){ refreshStatus(); });
 $('btnApply').addEventListener('click', function(){
-  var rules = collectRules();
-  if (!rules.length) { toast(false, t('no_times')); return; }
-  var body = { rules: rules };
+  var pv = cur, s = P(pv);
+  var rules = collectRules(pv);
+  // Claude: clearing everything stays `preheat off`. Codex: an empty grid is
+  // a valid save (no weekly Codex preheats).
+  if (!rules.length && pv === 'claude') { toast(false, t('no_times')); return; }
+  var body = { provider: pv, rules: rules };
   // omit the lock token when we never got one - better to write than to 409 forever
-  if (state.schedMtime !== null) body.baseMtime = state.schedMtime;
+  if (s.schedMtime !== null) body.baseMtime = s.schedMtime;
   act('/api/preheat/apply', body, t('m_saved')).then(function(res){
     if (res && res.ok) {
-      savedKey = keyOf();
-      if (res.mtime != null) state.schedMtime = res.mtime;
+      s.savedKey = JSON.stringify(rules);
+      if (res.mtime != null) s.schedMtime = res.mtime;
     } else if (res && res.code === 'stale') {
       // reload what is on disk, then lay the user's unsaved times back on top:
       // nothing they typed is lost and Save & apply stays enabled for the retry
-      var mine = collectRules();
-      seedSchedule(true).then(function(){
+      var mine = collectRules(pv);
+      seedSchedule(true, pv).then(function(){
+        var week = s.week;
         mine.forEach(function(r){
           (r.days || []).forEach(function(d){ if (week[d] && week[d].indexOf(r.reset) < 0) week[d].push(r.reset); });
         });
@@ -864,10 +1078,11 @@ $('btnApply').addEventListener('click', function(){
 document.addEventListener('visibilitychange', function(){
   // a tab parked overnight shows a schedule the CLI may have rewritten since;
   // resync on re-focus, but never throw away edits the user has not applied
-  if (document.hidden || keyOf() !== savedKey) return;
-  getJSON('/api/schedule').then(function(sched){
+  var pv = cur;
+  if (document.hidden || keyOf(pv) !== P(pv).savedKey) return;
+  getJSON(q('/api/schedule', pv)).then(function(sched){
     var m = (sched && sched.mtime != null) ? sched.mtime : null;
-    if (m !== state.schedMtime) seedSchedule(true);
+    if (m !== P(pv).schedMtime) seedSchedule(true, pv);
   }).catch(function(){ });
 });
 var onceBtns = document.querySelectorAll('[data-once]');
@@ -883,9 +1098,14 @@ for (var k = 0; k < onceBtns.length; k++) {
       value = n + 'h';
     }
     if (kind !== 'plus' && !/^\d{2}:\d{2}$/.test(value)) { toast(false, t('bad_time')); return; }
-    act('/api/preheat/once', { kind: kind, value: value }, t('m_scheduled'));
+    act('/api/preheat/once', { provider: cur, kind: kind, value: value }, t('m_scheduled'));
   });
 }
+var provBtns = document.querySelectorAll('[data-prov]');
+for (var pb = 0; pb < provBtns.length; pb++) {
+  provBtns[pb].addEventListener('click', function(){ setProvider(this.getAttribute('data-prov'), true); });
+}
+$('cxRefresh').addEventListener('click', refreshCodexLive);
 
 $('evDays').value = evPref('days', 7);
 $('evMax').value = evPref('max', 10);
@@ -900,6 +1120,7 @@ $('evKind').addEventListener('change', renderEvents);
 
 /* ---------- boot ---------- */
 applyStatic();
+renderTabs();
 renderWeek();
 refreshStatus();
 refreshLearn();

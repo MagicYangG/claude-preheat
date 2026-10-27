@@ -55,7 +55,32 @@ $stubBody = @(
 ) -join "`n"
 [System.IO.File]::WriteAllText($stub, $stubBody, (New-Object System.Text.UTF8Encoding($false)))
 & chmod +x $stub
+
+# stub codex in the same PATH dir: the shared test stub (app-server + exec)
+# behind a bash launcher. The launchd child sees no STUB_* env, so the stub
+# reads stub-config.json next to itself; plus5h + anchor = an idle 5h window
+# that the ping freezes, which the post-read should call anchored.
+Copy-Item (Join-Path $PSScriptRoot 'stub-codex.ps1') $stubDir -Force
+$cxConfig = Join-Path $stubDir 'stub-config.json'
+$cxCalls  = Join-Path $env:RUNNER_TEMP 'stub-codex-calls.txt'
+$cxState  = Join-Path $env:RUNNER_TEMP 'stub-codex-state.json'
+function Set-StubCodex([string]$StubProfile) {
+    $c = [ordered]@{ profile = $StubProfile; r5 = $null; anchor = $true; exec = 'ok'; rpc = 'ok'; callsLog = $cxCalls; state = $cxState }
+    Remove-Item $cxState -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($cxConfig, (ConvertTo-Json -InputObject $c -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+}
+Set-StubCodex 'plus5h'
+$cxStub = Join-Path $stubDir 'codex'
+$cxBody = @(
+    '#!/bin/bash',
+    ('exec "' + (Get-Process -Id $PID).Path + '" -NoProfile -NonInteractive -File "$(dirname "$0")/stub-codex.ps1" "$@"'),
+    ''
+) -join "`n"
+[System.IO.File]::WriteAllText($cxStub, $cxBody, (New-Object System.Text.UTF8Encoding($false)))
+& chmod +x $cxStub
 $env:PATH = "$stubDir" + ':' + $env:PATH
+# anything this session itself asks of codex goes to the stub as well
+$env:PREHEAT_CODEX_EXE = $cxStub
 
 Write-Host '--- register a one-shot preheat (+2m) through launchd ---'
 # journal baseline BEFORE scheduling: only lines written after this count as
@@ -64,37 +89,74 @@ $log = Join-Path $repo 'preheat-log.jsonl'
 $baseLines = 0
 if (Test-Path $log) { $baseLines = @(Get-Content $log).Count }
 
-# everything from here on is torn down in the finally, including on a throw:
-# a job left registered would keep firing on the runner and, worse, a local
-# misfire of this script would leave the machine armed
-try {
-    ./preheat.ps1 +2m
-
-    $st = ./preheat.ps1 status -Json | ConvertFrom-Json
-    if (@($st.tasks).Count -lt 1) { throw 'once job not visible in status -Json' }
-    Write-Host ('scheduled: {0}  next={1}' -f $st.tasks[0].name, $st.tasks[0].next)
-
-    Write-Host '--- wait for launchd to fire (up to 200s) ---'
-    $deadline = (Get-Date).AddSeconds(200)
-    $fired = $null
+function Wait-FireLine([int]$From, [scriptblock]$Match, [int]$Sec) {
+    # the newest journal fire line after line $From that $Match accepts, or $null
+    $deadline = (Get-Date).AddSeconds($Sec)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 5
         if (Test-Path $log) {
             $all = @(Get-Content $log)
-            if ($all.Count -gt $baseLines) {
-                $line = $all[$baseLines..($all.Count - 1)] | Where-Object { $_ -like '*"ev":"fire"*' } | Select-Object -Last 1
-                if ($line) { $fired = $line; break }
+            if ($all.Count -gt $From) {
+                $line = $all[$From..($all.Count - 1)] | Where-Object { ($_ -like '*"ev":"fire"*') -and (& $Match $_) } | Select-Object -Last 1
+                if ($line) { return $line }
             }
         }
     }
-    if (-not $fired) {
-        $errLog = Join-Path $repo 'launchd-err.log'
-        if (Test-Path $errLog) { Write-Host '--- launchd-err.log ---'; Get-Content $errLog }
-        & launchctl print ('gui/' + $uid) 2>&1 | Select-String 'claude-preheat' | ForEach-Object { Write-Host $_.Line }
-        throw 'launchd never fired the preheat within 200s'
-    }
+    $null
+}
+function Show-LaunchdState {
+    $errLog = Join-Path $repo 'launchd-err.log'
+    if (Test-Path $errLog) { Write-Host '--- launchd-err.log ---'; Get-Content $errLog }
+    & launchctl print ('gui/' + $uid) 2>&1 | Select-String 'claude-preheat' | ForEach-Object { Write-Host $_.Line }
+}
+
+# everything from here on is torn down in the finally, including on a throw:
+# a job left registered would keep firing on the runner and, worse, a local
+# misfire of this script would leave the machine armed
+try {
+    # a Claude and a Codex one-shot in the same minute: both must fire
+    ./preheat.ps1 +2m
+    ./preheat.ps1 +2m -Codex
+
+    $st = ./preheat.ps1 status -Json | ConvertFrom-Json
+    if (@($st.tasks).Count -lt 2) { throw 'the two one-shots are not both visible in status -Json' }
+    if (@($st.tasks | Where-Object { $_.provider -eq 'codex' }).Count -ne 1) { throw 'the Codex one-shot is not tagged provider codex in status -Json' }
+    foreach ($t in @($st.tasks)) { Write-Host ('scheduled: {0}  next={1}  provider={2}' -f $t.name, $t.next, $t.provider) }
+
+    Write-Host '--- wait for launchd to fire both (the Codex verdict reads ~2 min after its ping) ---'
+    $fired = Wait-FireLine $baseLines { param($l) $l -notlike '*"provider":"codex"*' } 200
+    if (-not $fired) { Show-LaunchdState; throw 'launchd never fired the Claude preheat within 200s' }
     Write-Host "fire journal: $fired"
     if ($fired -notlike '*"ok":true*') { throw 'fire ran but the (stubbed) ping failed' }
+    $cxFired = Wait-FireLine $baseLines { param($l) $l -like '*"provider":"codex"*' } 300
+    if (-not $cxFired) { Show-LaunchdState; throw 'launchd never fired the Codex preheat within 200s + 300s' }
+    Write-Host "codex fire journal: $cxFired"
+    if (($cxFired -notlike '*"ok":true*') -or ($cxFired -notlike '*"pinged":true*')) { throw 'the Codex fire ran but did not ping successfully' }
+    # the stub is deterministic (idle window, an exec that anchors it): any
+    # other verdict is a regression in the judging, not runner noise
+    if ($cxFired -notlike '*"state":"anchored"*') { throw 'the Codex verdict was not anchored' }
+    # no plist check for the spent one-shot here: the launchd child runs with
+    # the runner's real HOME (the plist bakes PATH only), so its self-delete
+    # looks in the real LaunchAgents dir, not $e2eHome - test.ps1 covers it
+    $execRuns = @(Get-Content $cxCalls -ErrorAction SilentlyContinue | Where-Object { $_ -like 'exec stdin=*' }).Count
+    if ($execRuns -lt 1) { throw 'the Codex fire journaled a ping but the stub calls log has no exec line (a different codex ran?)' }
+
+    Write-Host '--- an account with no 5h window (free 30d): the Codex fire must refuse to ping ---'
+    Set-StubCodex 'free30d'
+    $base2 = @(Get-Content $log).Count
+    ./preheat.ps1 +2m -Codex
+    $noFire = Wait-FireLine $base2 { param($l) $l -like '*"provider":"codex"*' } 200
+    if (-not $noFire) { Show-LaunchdState; throw 'launchd never fired the free30d Codex preheat within 200s' }
+    Write-Host "codex no5h journal: $noFire"
+    if (($noFire -notlike '*"kind":"no5h"*') -or ($noFire -notlike '*"pinged":false*')) { throw 'a free 30d account was not refused with kind no5h / pinged false' }
+    if (@(Get-Content $cxCalls | Where-Object { $_ -like 'exec stdin=*' }).Count -ne $execRuns) { throw 'the free 30d fire ran codex exec' }
+
+    # the read-only allow-list held across every launchd-spawned codex child
+    $allowed = @('initialize', 'initialized', 'account/read', 'account/rateLimits/read')
+    if (-not (Test-Path $cxCalls)) { throw 'the stub calls log was never written' }
+    foreach ($l in @(Get-Content $cxCalls | Where-Object { $_ -like 'rpc *' })) {
+        if ($allowed -notcontains ($l.Split(' ')[1])) { throw ('a non-allow-listed RPC reached codex: ' + $l) }
+    }
 } finally {
     Write-Host '--- cleanup: preheat off, then bootout whatever launchd still holds ---'
     try { ./preheat.ps1 off } catch { Write-Host ('preheat off failed: ' + $_.Exception.Message) }
@@ -115,4 +177,4 @@ if ($left.Count -ne 0) { throw ('leftover plists: ' + ($left.Name -join ', ')) }
 # dropped the label, else the agent keeps firing until logout
 $loaded = & launchctl print ('gui/' + $uid) 2>&1 | Select-String 'com\.claude-preheat'
 if ($loaded) { throw ('launchd still holds: ' + (($loaded | ForEach-Object Line) -join ', ')) }
-Write-Host 'E2E PASS: schedule -> launchd fire -> journal -> clean removal'
+Write-Host 'E2E PASS: schedule -> launchd fire (Claude + Codex) -> journal -> clean removal'

@@ -89,6 +89,108 @@ function Rec-Bookkeeping([string]$subtype, [string]$tsUtc) {
 Write-Host ''
 Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
 
+# ---------------------------------------------------------------- stub codex
+# one script plays both halves of the real binary (.github/workflows/
+# stub-codex.ps1, shared with the macOS e2e): `app-server --stdio` and
+# `exec --json`, driven by a config file. The product is pinned to it through
+# PREHEAT_CODEX_EXE for this whole run - in-process cases, the panel child and
+# the CLI children all inherit it - so no case can reach a real codex (a dev
+# box has one signed in; CI has none at all).
+$cxDir = Join-Path $Tmp 'codex-stub'
+New-Item -ItemType Directory -Path $cxDir -Force | Out-Null
+Copy-Item (Join-Path $Repo (Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1'))) $cxDir -Force
+$cxConfig = Join-Path $cxDir 'stub-config.json'
+$cxCalls  = Join-Path $cxDir 'calls.txt'
+$cxState  = Join-Path $cxDir 'state.json'
+# the engine running this suite hosts the stub too: the 5.1 job stubs with 5.1
+$cxShell  = (Get-Process -Id $PID).Path
+$cxOnWin  = $true
+try { if ($PSVersionTable.PSEdition -eq 'Core' -and -not $IsWindows) { $cxOnWin = $false } } catch { }
+if ($cxOnWin) {
+    $cxStub = Join-Path $cxDir 'codex.cmd'
+    Set-Content -Path $cxStub -Encoding ASCII -Value @(
+        ('@if not defined STUB_CODEX_SHELL set "STUB_CODEX_SHELL=' + $cxShell + '"'),
+        '@"%STUB_CODEX_SHELL%" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0stub-codex.ps1" %*',
+        '@exit /b %ERRORLEVEL%')
+} else {
+    $cxStub = Join-Path $cxDir 'codex'
+    [System.IO.File]::WriteAllText($cxStub, (@(
+        '#!/bin/bash',
+        ('exec "' + $cxShell + '" -NoProfile -NonInteractive -File "$(dirname "$0")/stub-codex.ps1" "$@"'),
+        '') -join "`n"))
+    & chmod +x $cxStub
+    if ($LASTEXITCODE -ne 0) { throw 'chmod on the stub codex failed' }
+}
+# a missing stub must abort the run: a missing PREHEAT_CODEX_EXE target makes
+# Resolve-CodexExe fall through to the real candidates
+if (-not ((Test-Path -LiteralPath $cxStub -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $cxDir 'stub-codex.ps1') -PathType Leaf))) {
+    throw "stub codex was not set up in $cxDir"
+}
+$cxEnvPrev = @{}
+foreach ($n in @('PREHEAT_CODEX_EXE', 'STUB_CODEX_CONFIG', 'STUB_CODEX_SHELL', 'PREHEAT_CODEX_FORCE_PING')) {
+    $cxEnvPrev[$n] = [Environment]::GetEnvironmentVariable($n)
+}
+$env:PREHEAT_CODEX_EXE = $cxStub
+$env:STUB_CODEX_CONFIG = $cxConfig
+$env:STUB_CODEX_SHELL  = $cxShell
+Remove-Item Env:PREHEAT_CODEX_FORCE_PING -ErrorAction SilentlyContinue
+
+function Set-CodexStub([hashtable]$Over = @{}) {
+    # fresh stub state for one case: config rewritten, calls log and the
+    # anchored-window state cleared
+    $c = [ordered]@{ profile = 'plus5h'; r5 = $null; anchor = $false; exec = 'ok'; rpc = 'ok'; callsLog = $cxCalls; state = $cxState }
+    foreach ($k in $Over.Keys) { $c[$k] = $Over[$k] }
+    Remove-Item $cxCalls, $cxState -ErrorAction SilentlyContinue
+    [System.IO.File]::WriteAllText($cxConfig, (ConvertTo-Json -InputObject $c -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+}
+function Get-CodexStubCalls {
+    if (Test-Path $cxCalls) { return @(Get-Content $cxCalls -Encoding UTF8) }
+    @()
+}
+function Get-CodexStubExecCount { @(Get-CodexStubCalls | Where-Object { $_ -like 'exec stdin=*' }).Count }
+function Test-CodexAllowList {
+    # every JSON-RPC method that reached the stub is one of the four read-only ones
+    $ok = @('initialize', 'initialized', 'account/read', 'account/rateLimits/read')
+    foreach ($l in @(Get-CodexStubCalls | Where-Object { $_ -like 'rpc *' })) {
+        if ($ok -notcontains ($l.Split(' ')[1])) { return $false }
+    }
+    $true
+}
+function Wait-StubPidsGone([int]$Sec = 8) {
+    # -> number of stub processes still alive after up to $Sec seconds
+    $ids = @(Get-CodexStubCalls | ForEach-Object { if ($_ -match '^start pid=(\d+)') { [int]$Matches[1] } })
+    $alive = $ids.Count
+    for ($i = 0; $i -lt ($Sec * 4); $i++) {
+        $alive = @($ids | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count
+        if ($alive -eq 0) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $alive
+}
+function Get-CxEnvSnapshot {
+    # Use-CodexEnvironment writes these into THIS process: every case that can
+    # reach it puts them back afterwards
+    $s = @{}
+    foreach ($n in @('HTTPS_PROXY', 'HTTP_PROXY', 'CODEX_HOME', 'CLAUDE_PREHEAT_SELF', 'PREHEAT_CODEX_FORCE_PING')) { $s[$n] = [Environment]::GetEnvironmentVariable($n) }
+    $s
+}
+function Restore-CxEnvSnapshot($s) {
+    foreach ($n in $s.Keys) {
+        if ($null -eq $s[$n]) { Remove-Item ('Env:' + $n) -ErrorAction SilentlyContinue }
+        else { [Environment]::SetEnvironmentVariable($n, $s[$n]) }
+    }
+}
+function Read-JsonLines([string]$Path) {
+    # every parseable record, oldest first
+    $out = @()
+    if (Test-Path $Path) {
+        foreach ($l in @(Get-Content $Path -Encoding UTF8)) { try { $o = $l | ConvertFrom-Json; if ($o) { $out += $o } } catch { } }
+    }
+    $out
+}
+function Test-Prop($o, [string]$Name) { [bool]($o -and $o.PSObject.Properties[$Name]) }
+$cxInv = [System.Globalization.CultureInfo]::InvariantCulture
+
 # ---------------------------------------------------------------- preheat.ps1
 # dot-source inside its own scope so its helpers stay out of the top scope;
 # '__selftest__' falls through to the usage branch
@@ -505,7 +607,7 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         function Start-Sleep { param($Seconds, $Milliseconds) }
         function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:IntReg += @{ name = $Name; at = $At; nowake = [bool]$NoWake; args = @($ScriptArgs) } }
         function Remove-StaleOnceJobs { }
-        function Send-Toast { param($Ok, $Anchored, $Kind, $Extra) $script:IntToast = ('{0}|{1}|{2}|{3}' -f $Ok, $Anchored, $Kind, $Extra) }
+        function Send-Toast { param($Ok, $Anchored, $Kind, $Extra, [string]$Provider, [string]$Text) $script:IntToast = ('{0}|{1}|{2}|{3}' -f $Ok, $Anchored, $Kind, $Extra) }
         function Get-Proxy { $null }
         function Get-LastLocalActivity { & $LastActivity }
         function Get-KnownWindowEnd([string]$path = $null) { & $KnownEnd }
@@ -613,6 +715,11 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
         $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
         $fire -and ($fire.rec.anchored -eq $true) -and ([string]$fire.rec.anchor_src -eq 'activity') -and (-not $fire.rec.PSObject.Properties['resets_at'])
+    }
+    Test-Case 'fire integration: a Claude fire record stays provider-less (old journals, old panels read it unchanged)' {
+        $r = Invoke-FireInt { (Get-Date).AddHours(-10) } { $null } '{"rules":[{"days":["Mon"],"reset":"11:07"}]}'
+        $fire = $r.journal | Where-Object { $_.ev -eq 'fire' } | Select-Object -First 1
+        $fire -and $fire.rec.ok -and (-not $fire.rec.PSObject.Properties['provider'])
     }
 
     Test-Case 'a white ping wires the chase, and a chase failure can never cost the toast' {
@@ -981,6 +1088,702 @@ Write-Host '=== claude-preheat self-test ===' -ForegroundColor Cyan
         if (-not $p -or ($p.Source -notmatch '\\WindowsApps\\Microsoft\.PowerShell_[^\\]*__')) { return $true }
         $r -notmatch '\\WindowsApps\\Microsoft\.PowerShell_[^\\]*__'
     }
+
+    # ======================================================== Codex (beta)
+    Write-Host '-- codex: windows + verdicts (pure, codex.ps1) --'
+    # rateLimits/read payloads in the app-server's camelCase shape
+    $cxW  = { param([int]$Mins, [long]$Reset, $Used = 12) '{"usedPercent":' + $Used + ',"windowDurationMins":' + $Mins + ',"resetsAt":' + $Reset + '}' }
+    $cxRl = {
+        param([string]$Primary, [string]$Secondary, [string]$Plan = 'plus', [switch]$NoById)
+        $snap = '{"limitId":"codex","planType":"' + $Plan + '"'
+        if ($Primary) { $snap += ',"primary":' + $Primary }
+        if ($Secondary) { $snap += ',"secondary":' + $Secondary }
+        $snap += '}'
+        $j = '{"rateLimits":' + $snap
+        if (-not $NoById) { $j += ',"rateLimitsByLimitId":{"codex":' + $snap + '}' }
+        ($j + '}') | ConvertFrom-Json
+    }
+    $N0 = [long]1790000000
+    Test-Case 'Get-CodexWindows: the 300-min window is the 5h one, the 10080-min one weekly; plan and bucket read through' {
+        $w = Get-CodexWindows (& $cxRl (& $cxW 300 ($N0 + 3600)) (& $cxW 10080 ($N0 + 86400) 40))
+        $w.five -and ($w.five.mins -eq 300) -and ([long]$w.five.resetsAt -eq ($N0 + 3600)) -and ($w.five.used -eq 12) -and
+            $w.weekly -and ($w.weekly.mins -eq 10080) -and ($w.plan -eq 'plus') -and ($w.bucket -eq 'codex')
+    }
+    Test-Case 'Get-CodexWindows: classified by duration only - swapped slots, 302 min inside the tolerance, 330 outside, planType ignored' {
+        $sw   = Get-CodexWindows (& $cxRl (& $cxW 10080 ($N0 + 86400)) (& $cxW 300 ($N0 + 3600)))
+        $near = Get-CodexWindows (& $cxRl (& $cxW 302 ($N0 + 3600)) '')
+        $far  = Get-CodexWindows (& $cxRl (& $cxW 330 ($N0 + 3600)) '')
+        $plusNo  = Get-CodexWindows (& $cxRl (& $cxW 10080 ($N0 + 86400)) '' 'plus')
+        $freeYes = Get-CodexWindows (& $cxRl (& $cxW 300 ($N0 + 3600)) '' 'free')
+        $sw.five -and ([long]$sw.five.resetsAt -eq ($N0 + 3600)) -and $sw.weekly -and $near.five -and (-not $far.five) -and
+            (-not $plusNo.five) -and $freeYes.five
+    }
+    Test-Case 'Get-CodexWindows: a free 30-day window is NOT a 5h window, no windows at all (pro) gives neither, every window still listed' {
+        $free = Get-CodexWindows (& $cxRl (& $cxW 43200 ($N0 + 864000) 5) '' 'free')
+        $pro  = Get-CodexWindows (& $cxRl '' '' 'pro')
+        (-not $free.five) -and (-not $free.weekly) -and ($free.plan -eq 'free') -and
+            (@($free.all | Where-Object { $_.mins -eq 43200 }).Count -ge 1) -and
+            (-not $pro.five) -and (-not $pro.weekly) -and ($pro.plan -eq 'pro')
+    }
+    Test-Case 'Get-CodexWindows: prefers rateLimitsByLimitId.codex, falls back to the single-bucket rateLimits of an older binary' {
+        $both = ('{"rateLimits":{"planType":"plus","primary":' + (& $cxW 300 ($N0 + 100)) + '},"rateLimitsByLimitId":{"codex":{"planType":"plus","primary":' + (& $cxW 300 ($N0 + 200)) + '}}}') | ConvertFrom-Json
+        $old  = & $cxRl (& $cxW 300 ($N0 + 300)) '' 'plus' -NoById
+        ([long](Get-CodexWindows $both).five.resetsAt -eq ($N0 + 200)) -and ([long](Get-CodexWindows $old).five.resetsAt -eq ($N0 + 300))
+    }
+    $cxFive = { param($Reset, $Used = 12) @{ plan = 'plus'; bucket = 'codex'; five = @{ used = $Used; resetsAt = $Reset; mins = 300 }; weekly = $null; all = @() } }
+    $cxNone = { param([string]$Plan) @{ plan = $Plan; bucket = 'codex'; five = $null; weekly = $null; all = @() } }
+    Test-Case 'Get-CodexPreVerdict: idle (no reset, a past reset, or >= 290 min left) pings with the skew; 0 < left < 290 min is a running window' {
+        $a = Get-CodexPreVerdict (& $cxFive $null) $N0
+        $b = Get-CodexPreVerdict (& $cxFive ($N0 - 10)) $N0
+        $c = Get-CodexPreVerdict (& $cxFive ($N0 + 18000 - 5)) $N0
+        $d = Get-CodexPreVerdict (& $cxFive ($N0 + 17400)) $N0
+        $e = Get-CodexPreVerdict (& $cxFive ($N0 + 17399)) $N0
+        $f = Get-CodexPreVerdict (& $cxFive ($N0 + 1800)) $N0
+        ($a.action -eq 'ping') -and (-not $a.windowUnknown) -and ($b.action -eq 'ping') -and
+            ($c.action -eq 'ping') -and ([long]$c.idleValue -eq ($N0 + 17995)) -and ([long]$c.skewSec -eq -5) -and
+            ($d.action -eq 'ping') -and ($e.action -eq 'skip-running') -and
+            ($f.action -eq 'skip-running') -and ([long]$f.resetsAt -eq ($N0 + 1800)) -and ($null -eq $f.idleValue)
+    }
+    Test-Case 'Get-CodexPreVerdict: a used-up window skips; no 5h window skips on free/go/pro only, any other plan pings blind' {
+        $g    = Get-CodexPreVerdict (& $cxFive ($N0 + 3600) 100) $N0
+        $free = Get-CodexPreVerdict (& $cxNone 'free') $N0
+        $go   = Get-CodexPreVerdict (& $cxNone 'go') $N0
+        $pro  = Get-CodexPreVerdict (& $cxNone 'pro') $N0
+        $plus = Get-CodexPreVerdict (& $cxNone 'plus') $N0
+        $team = Get-CodexPreVerdict (& $cxNone 'team') $N0
+        ($g.action -eq 'skip-running') -and ($free.action -eq 'skip-no5h') -and ($go.action -eq 'skip-no5h') -and ($pro.action -eq 'skip-no5h') -and
+            ($plus.action -eq 'ping') -and ($plus.windowUnknown -eq $true) -and ($team.action -eq 'ping') -and ($team.windowUnknown -eq $true)
+    }
+    Test-Case 'Get-CodexPreVerdict: a weekly limit (rateLimitReachedType) on an idle 5h window still pings; plan ids match whole (pro_x yes, prolite no)' {
+        $wk = & $cxFive ($N0 + 18000)
+        $wk.reached = 'secondary'
+        $a = Get-CodexPreVerdict $wk $N0
+        ($a.action -eq 'ping') -and ($null -ne $a.idleValue) -and
+            ((Get-CodexPreVerdict (& $cxNone 'pro_x') $N0).action -eq 'skip-no5h') -and
+            ((Get-CodexPreVerdict (& $cxNone 'prolite') $N0).action -eq 'ping') -and
+            ((Get-CodexPreVerdict (& $cxNone 'gopher') $N0).action -eq 'ping')
+    }
+    $cxRd  = { param([long]$Epoch, [long]$Reset) @{ epoch = $Epoch; windows = @{ plan = 'plus'; bucket = 'codex'; five = @{ used = 1; resetsAt = $Reset; mins = 300 }; weekly = $null; all = @() } } }
+    $cxPre = @{ action = 'ping'; resetsAt = ($N0 + 18000); idleValue = ($N0 + 18000); skewSec = 0; windowUnknown = $false }
+    Test-Case 'Get-CodexPostVerdict: frozen at pre-read + elapsed = anchored; frozen earlier = moved; frozen later = unknown; still sliding = sliding' {
+        # ping 5..25s after the pre-read: expected freeze E = N0+18005, accepted [E-30, E+20+30]
+        $anch  = Get-CodexPostVerdict $cxPre $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 18010)), (& $cxRd ($N0 + 115) ($N0 + 18010)))
+        $moved = Get-CodexPostVerdict $cxPre $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 17000)), (& $cxRd ($N0 + 115) ($N0 + 17000)))
+        $high  = Get-CodexPostVerdict $cxPre $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 18200)), (& $cxRd ($N0 + 115) ($N0 + 18200)))
+        $slide = Get-CodexPostVerdict $cxPre $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 18085)), (& $cxRd ($N0 + 115) ($N0 + 18115)), (& $cxRd ($N0 + 235) ($N0 + 18235)))
+        ($anch.state -eq 'anchored') -and ([long]$anch.resetsAt -eq ($N0 + 18010)) -and
+            ($moved.state -eq 'moved') -and ([long]$moved.resetsAt -eq ($N0 + 17000)) -and
+            ($high.state -eq 'unknown') -and ($slide.state -eq 'sliding') -and ($null -eq $anch.lagSec)
+    }
+    Test-Case 'Get-CodexPostVerdict: a window that opens between two post reads (slid, then froze) is anchored with its lag, not unknown' {
+        # idle pre-read at N0 (N0+18000), ping 5..25: the window opens at N0+100 (between the 60s and 90s reads)...
+        $a = Get-CodexPostVerdict $cxPre $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 18085)), (& $cxRd ($N0 + 115) ($N0 + 18100)))
+        # ...or at N0+200, between the second read and the confirm read
+        $b = Get-CodexPostVerdict $cxPre $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 18085)), (& $cxRd ($N0 + 115) ($N0 + 18115)), (& $cxRd ($N0 + 235) ($N0 + 18200)))
+        ($a.state -eq 'anchored') -and ([long]$a.resetsAt -eq ($N0 + 18100)) -and ([long]$a.lagSec -eq 75) -and
+            ($b.state -eq 'anchored') -and ([long]$b.resetsAt -eq ($N0 + 18200)) -and ([long]$b.lagSec -eq 175)
+    }
+    Test-Case 'Test-CodexMetered: a window that opened ~3 min ago (still > 290 min left) counts as metered after an idle pre-read' {
+        $frozen = & $cxFive ($N0 + 18010)
+        $idle   = & $cxFive ($N0 + 18180)
+        $blind  = @{ action = 'ping'; resetsAt = $null; idleValue = $null; skewSec = $null; windowUnknown = $true }
+        (Test-CodexMetered $cxPre $N0 $frozen ($N0 + 180)) -and (-not (Test-CodexMetered $cxPre $N0 $idle ($N0 + 180))) -and
+            (-not (Test-CodexMetered $blind $N0 $frozen ($N0 + 180))) -and (Test-CodexMetered $blind $N0 (& $cxFive ($N0 + 3600)) ($N0 + 180))
+    }
+    Test-Case 'Get-CodexPostVerdict: only the confirm read froze (late metering) -> the last pair decides and the lag is reported' {
+        # no idle value from the pre-read: expected E = ping start + 5h, accepted +-600s
+        $preU = @{ action = 'ping'; resetsAt = $null; idleValue = $null; skewSec = $null; windowUnknown = $false }
+        $lag = Get-CodexPostVerdict $preU $N0 ($N0 + 5) ($N0 + 25) @((& $cxRd ($N0 + 85) ($N0 + 18085)), (& $cxRd ($N0 + 115) ($N0 + 18115)), (& $cxRd ($N0 + 235) ($N0 + 18115)))
+        ($lag.state -eq 'anchored') -and ([long]$lag.resetsAt -eq ($N0 + 18115)) -and ($lag.lagSec -gt 0)
+    }
+    $cxStreamOk = @(
+        '{"type":"thread.started","thread_id":"stub-thread-1"}',
+        '{"type":"turn.started"}',
+        'not json at all',
+        '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hi"}}',
+        '{"type":"turn.completed","usage":{"input_tokens":16900,"cached_input_tokens":12000,"output_tokens":5,"reasoning_output_tokens":0}}'
+    ) -join "`n"
+    Test-Case 'ConvertFrom-CodexExecStream: thread id, the four token counts apart, agent_message text, junk lines skipped' {
+        $s = ConvertFrom-CodexExecStream $cxStreamOk
+        ($s.threadId -eq 'stub-thread-1') -and $s.sawTokens -and ($s.tokens.input -eq 16900) -and ($s.tokens.cached -eq 12000) -and
+            ($s.tokens.output -eq 5) -and ($s.tokens.reasoning -eq 0) -and $s.agentText -and (@($s.errors).Count -eq 0)
+    }
+    Test-Case 'ConvertFrom-CodexExecStream: a failed turn carries its errors and no tokens; empty output is nothing' {
+        $bad = ConvertFrom-CodexExecStream (@(
+            '{"type":"thread.started","thread_id":"t2"}',
+            '{"type":"error","message":"You have hit your usage limit. Try again later."}',
+            '{"type":"turn.failed","error":{"message":"usage limit reached"}}') -join "`r`n")
+        $none = ConvertFrom-CodexExecStream ''
+        (-not $bad.sawTokens) -and (@($bad.errors).Count -ge 1) -and (-not $bad.agentText) -and (-not $none.sawTokens) -and (-not $none.agentText)
+    }
+    Test-Case 'Get-CodexFailureKind: login trouble -> auth, a hit limit -> limit, clap usage -> usage-error, the rest -> other' {
+        ((Get-CodexFailureKind 'Error: Not logged in' 1) -eq 'auth') -and
+            ((Get-CodexFailureKind '{"error":"refresh_token_reused"}' 1) -eq 'auth') -and
+            ((Get-CodexFailureKind 'HTTP 401 Unauthorized' 1) -eq 'auth') -and
+            ((Get-CodexFailureKind 'You have hit your usage limit. Try again later.' 1) -eq 'limit') -and
+            ((Get-CodexFailureKind ("error: unexpected argument '--ignore-rules' found`n`nUsage: codex exec [OPTIONS] [PROMPT]") 2) -eq 'usage-error') -and
+            ((Get-CodexFailureKind 'connection reset by peer' 1) -eq 'other')
+    }
+    Test-Case 'Get-MaskedEmail / Protect-ReportText: no email, token, key, home path (any spelling) or user name survives' {
+        $homeP = [Environment]::GetFolderPath('UserProfile')
+        $user  = [Environment]::UserName
+        $fwd   = $homeP -replace '\\', '/'
+        $jsonP = $homeP -replace '\\', '\\'
+        $txt = 'mail bob.smith@corp.example | jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.c2lnbmF0dXJlLXN0dWZm | key sk-proj-ABCDEFGHIJKLMNOPQRST123456 | ' +
+            'path ' + $homeP + '\.codex\x | fwd ' + $fwd + '/.codex | json ' + $jsonP + '\\.codex | user ' + $user + ' | done'
+        $o = Protect-ReportText $txt
+        $ok = ((Get-MaskedEmail 'alice@example.com') -eq 'a***@example.com') -and
+            ($o -notmatch 'bob\.smith') -and ($o -notmatch 'eyJhbGci') -and ($o -notmatch 'sk-proj-ABCDEF') -and
+            (-not $o.Contains($homeP)) -and (-not $o.Contains($fwd)) -and (-not $o.Contains($jsonP)) -and ($o -like '*done*')
+        if (($user.Length -ge 4) -and ($user -notmatch '^\d+$')) { $ok = $ok -and ($o -notmatch ('\b' + [regex]::Escape($user) + '\b')) }
+        # an all-digit user name must not rewrite ordinary numbers (ms=, drift_s=)
+        $prevU = $env:USERNAME; $prevV = $env:USER
+        try { $env:USERNAME = '24680'; $env:USER = '24680'; $d = Protect-ReportText 'ms=24680 drift_s=24680 D:\Users\24680\x' }
+        finally { $env:USERNAME = $prevU; $env:USER = $prevV }
+        $ok -and ($d -eq ('ms=24680 drift_s=24680 D:\Users\<user>\x'))
+    }
+    Test-Case 'Invoke-CodexRpc: a method outside the allow-list throws BLOCKED before a single byte is written' {
+        $w = New-Object System.IO.StringWriter
+        $s = [pscustomobject]@{ In = $w; Proc = $null; NextId = 0; TimeoutSec = 1; Restarting = $false }
+        $m = ''
+        try { $null = Invoke-CodexRpc $s 'account/rateLimitResetCredit/consume' @{} } catch { $m = $_.Exception.Message }
+        ($m -like 'BLOCKED*') -and ($w.ToString() -eq '') -and ($s.NextId -eq 0)
+    }
+    Test-Case 'Get-CodexConfigPassthrough: only the four login keys, only from the top level of config.toml; no file -> nothing' {
+        $ch = Join-Path $Tmp 'cx-config-home'
+        New-Item -ItemType Directory -Path $ch -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $ch 'config.toml'), (@(
+            'model = "gpt-5"', 'cli_auth_credentials_store = "keyring"', 'forced_login_method = "chatgpt"',
+            'chatgpt_base_url = "https://proxy.example/backend-api/"', '', '[profiles.work]', 'forced_chatgpt_workspace_id = "ws-in-a-table"', '') -join "`n"))
+        $p = @(Get-CodexConfigPassthrough $ch)
+        $flat = $p -join ' '
+        ($p.Count -eq 6) -and (@($p | Where-Object { $_ -ceq '-c' }).Count -eq 3) -and
+            ($flat -match 'cli_auth_credentials_store=') -and ($flat -match 'forced_login_method=') -and ($flat -match 'chatgpt_base_url=') -and
+            ($flat -notmatch 'model=') -and ($flat -notmatch 'ws-in-a-table') -and
+            (@(Get-CodexConfigPassthrough (Join-Path $Tmp 'no-codex-home')).Count -eq 0)
+    }
+    Test-Case 'Get-CodexHome / Use-CodexEnvironment: CODEX_HOME wins over ~/.codex; the proxy and codex.home from schedule.json reach the env children inherit' {
+        $snap = Get-CxEnvSnapshot
+        try {
+            $env:CODEX_HOME = Join-Path $Tmp 'cxh'
+            $a = Get-CodexHome
+            Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
+            $b = Get-CodexHome
+            $h2 = Join-Path $Tmp 'cxh2'
+            Use-CodexEnvironment ([pscustomobject]@{ proxy = 'http://127.0.0.1:9'; rules = @(); codex = [pscustomobject]@{ rules = @(); home = $h2 } })
+            ($a -eq (Join-Path $Tmp 'cxh')) -and ((Split-Path $b -Leaf) -eq '.codex') -and
+                ($env:HTTPS_PROXY -eq 'http://127.0.0.1:9') -and ($env:HTTP_PROXY -eq 'http://127.0.0.1:9') -and ($env:CODEX_HOME -eq $h2)
+        } finally { Restore-CxEnvSnapshot $snap }
+    }
+
+    Write-Host '-- codex: job names, journal, chase (pure) --'
+    Test-Case 'Codex job names: own provider, decode like their Claude twins, launchd round-trip, spent check' {
+        $now = & $D '2026-09-13 15:00'
+        $n = Get-JobNextRun 'ClaudePreheat-Codex-Wk-0745-TueWedThu'
+        ((Get-JobProvider 'ClaudePreheat-Codex-Wk-0400-Mon') -eq 'codex') -and ((Get-JobProvider 'ClaudePreheat-Codex-Once-20261231-1530') -eq 'codex') -and
+            ((Get-JobProvider 'ClaudePreheat-Wk-0400-Mon') -eq 'claude') -and ((Get-JobProvider 'ClaudePreheat-Once-20261231-1530') -eq 'claude') -and
+            ((Get-JobNextRun 'ClaudePreheat-Codex-Once-20261231-1530') -eq ([datetime]::new(2026, 12, 31, 15, 30, 0))) -and
+            $n -and ($n.Hour -eq 7) -and ($n.Minute -eq 45) -and
+            ((ConvertTo-LaunchdLabel 'ClaudePreheat-Codex-Wk-0400-Sat') -eq 'com.claude-preheat.Codex-Wk-0400-Sat') -and
+            ((ConvertFrom-LaunchdLabel 'com.claude-preheat.Codex-Once-20261231-1530') -eq 'ClaudePreheat-Codex-Once-20261231-1530') -and
+            (Test-SpentOnce @{ name = 'ClaudePreheat-Codex-Once-20260913-1400'; next = $null } $now) -and
+            (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Codex-Once-20260913-1638'; next = (& $D '2026-09-13 16:38') } $now)) -and
+            (-not (Test-SpentOnce @{ name = 'ClaudePreheat-Codex-Wk-0330-MonTue'; next = $null } $now))
+    }
+    Test-Case 'a Codex weekly job runs "fire -Provider codex" and bakes no codex binary path (the exe is resolved per fire)' {
+        $x = Build-LaunchdPlist -Name 'ClaudePreheat-Codex-Wk-0400-Sat' -Days @('Saturday') -At ([datetime]::new(2026, 1, 1, 4, 0, 0)) `
+            -HostShell '/p' -ScriptPath '/repo/preheat.ps1' -PathEnv '/b' -ScriptArgs @('fire', '-Provider', 'codex')
+        $a = Get-PreheatActionArgument 'C:\r\run-hidden.vbs' 'C:\pw\pwsh.exe' 'C:\r\preheat.ps1' @('fire', '-Provider', 'codex', '-Job', 'ClaudePreheat-Codex-Once-20990101-0000')
+        ($x -match '<string>/repo/preheat.ps1</string>\s*<string>fire</string>\s*<string>-Provider</string>\s*<string>codex</string>\s*</array>') -and
+            ($x -like '*com.claude-preheat.Codex-Wk-0400-Sat*') -and ($x -notmatch 'codex(\.exe|\.cmd)') -and
+            ($a -like '* "fire" "-Provider" "codex" "-Job" "ClaudePreheat-Codex-Once-20990101-0000"')
+    }
+    Test-Case 'a Codex one-shot is named for Codex, runs fire -Provider codex -Job <name>, and journals provider codex' {
+        $LogPath = Join-Path $Tmp 'cx-once-job.jsonl'
+        $script:OnceReg = $null
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:OnceReg = @{ name = $Name; args = @($ScriptArgs) } }
+        Invoke-Once ((Get-Date).AddHours(2)) 'test' -Provider 'codex' 6>$null
+        $r = $script:OnceReg
+        $rec = @(Read-JsonLines $LogPath | Where-Object { $_.ev -eq 'schedule-once' })
+        ($r.name -like 'ClaudePreheat-Codex-Once-*') -and (($r.args -join ' ') -eq ('fire -Provider codex -Job ' + $r.name)) -and
+            ($rec.Count -eq 1) -and ($rec[0].provider -eq 'codex')
+    }
+    $cxStamp = { param($s) (& $D $s).ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) }
+    Test-Case 'Get-FireEvents filters by provider BEFORE pairing: a same-minute Claude follow-up never lands on a Codex fire' {
+        $j = Join-Path $Tmp 'events-providers.jsonl'
+        @(
+            ('{"ev":"fire","ok":true,"anchored":false,"attempts":1,"ts":"' + (& $cxStamp '2026-09-12 15:00') + '"}'),
+            ('{"ev":"fire","provider":"codex","ok":true,"pinged":false,"state":"running","anchored":false,"plan":"plus","resets_at":"2026-09-12 16:30","attempts":0,"ts":"' + (& $cxStamp '2026-09-12 15:00') + '"}'),
+            ('{"ev":"schedule-once","fireAt":"2026-09-12T16:39:00","label":"chase ratelimits","ts":"' + (& $cxStamp '2026-09-12 15:00') + '"}'),
+            ('{"ev":"schedule-once","provider":"codex","fireAt":"2026-09-12T16:32:00","label":"chase ratelimits","ts":"' + (& $cxStamp '2026-09-12 15:00') + '"}'),
+            ('{"ev":"fire","provider":"codex","ok":false,"kind":"no5h","pinged":false,"state":"no5h","attempts":0,"ts":"' + (& $cxStamp '2026-09-12 15:30') + '"}')
+        ) | Set-Content -Path $j -Encoding UTF8
+        $cl = @(Get-FireEvents $j 60)
+        $cx = @(Get-FireEvents $j 60 -Provider 'codex')
+        ($cl.Count -eq 1) -and ($cl[0].chase_at -eq '2026-09-12 16:39') -and ($cl[0].provider -eq 'claude') -and
+            ($cx.Count -eq 2) -and ($cx[0].provider -eq 'codex') -and ($cx[0].kind -eq 'no5h') -and
+            ($cx[1].chase_at -eq '2026-09-12 16:32') -and ($cx[1].state -eq 'running') -and ($cx[1].pinged -eq $false) -and ($cx[1].plan -eq 'plus')
+    }
+    Test-Case 'an old journal with Codex lines mixed in reads exactly as before for Claude (count, order, fields)' {
+        $j = Join-Path $Tmp 'events-mixed.jsonl'
+        $lines = @(Get-Content (Join-Path $Tmp 'events.jsonl') -Encoding UTF8)
+        $mixed = @()
+        foreach ($l in $lines) {
+            $mixed += $l
+            $mixed += '{"ev":"fire","provider":"codex","ok":true,"pinged":true,"state":"anchored","anchored":true,"attempts":1,"ts":"2026-09-12T10:00:00-07:00"}'
+        }
+        $mixed | Set-Content -Path $j -Encoding UTF8
+        $all = @(Get-FireEvents $j 60)
+        ($all.Count -eq 3) -and ($all[0].kind -eq 'limit') -and ($all[1].anchored -eq $false) -and ($all[2].anchored -eq $true)
+    }
+    Test-Case 'the anchor and chase gates read only their own provider (a Codex anchor never blocks a Claude chase, and back)' {
+        $j1 = Join-Path $Tmp 'gate-codex.jsonl'
+        $before = & $D '2026-09-13 15:00'
+        @(
+            ('{"ev":"fire","provider":"codex","ok":true,"anchored":true,"ts":"' + (& $cxStamp '2026-09-13 12:30') + '"}'),
+            ('{"ev":"schedule-once","provider":"codex","fireAt":"2026-09-13T16:39:00","label":"chase ratelimits","ts":"' + (& $cxStamp '2026-09-13 14:00') + '"}')
+        ) | Set-Content -Path $j1 -Encoding UTF8
+        $j2 = Join-Path $Tmp 'gate-claude.jsonl'
+        @(
+            ('{"ev":"fire","ok":true,"anchored":true,"ts":"' + (& $cxStamp '2026-09-13 12:30') + '"}'),
+            ('{"ev":"schedule-once","fireAt":"2026-09-13T16:38:00","label":"chase ratelimits","ts":"' + (& $cxStamp '2026-09-13 14:00') + '"}')
+        ) | Set-Content -Path $j2 -Encoding UTF8
+        (-not (Test-RecentPreheatAnchor $before $j1)) -and (Test-RecentPreheatAnchor $before $j1 -Provider 'codex') -and
+            (Test-RecentPreheatAnchor $before $j2) -and (-not (Test-RecentPreheatAnchor $before $j2 -Provider 'codex')) -and
+            ($null -eq (Get-LastPreheatAnchor $j1)) -and ($null -ne (Get-LastPreheatAnchor $j1 -Provider 'codex')) -and
+            (Test-ChaseFire 'ClaudePreheat-Codex-Once-20260913-1639' $j1 -Provider 'codex') -and
+            (-not (Test-ChaseFire 'ClaudePreheat-Once-20260913-1639' $j1)) -and
+            (-not (Test-ChaseFire 'ClaudePreheat-Once-20260913-1638' $j2 -Provider 'codex'))
+    }
+    Test-Case 'the journal readers look 1000 lines back (two providers share the tail)' {
+        $j = Join-Path $Tmp 'tail-1000.jsonl'
+        $lines = @('{"ev":"fire","ok":true,"anchored":true,"ts":"2026-09-12T04:00:12-07:00"}') + @(@('{"ev":"x"}') * 700)
+        $lines | Set-Content -Path $j -Encoding UTF8
+        @(Get-JournalEvents $j 5000).Count -eq 701
+    }
+    Test-Case 'next weekly fire per provider: Codex reads codex.rules, Claude the top-level rules' {
+        $ConfigPath = New-Fixture 'sched-cx.json' @('{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"11:07"}],"codex":{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"13:21"}]}}')
+        ((Get-NextWeeklyFire (& $D '2026-09-13 15:00')) -eq (& $D '2026-09-14 06:07')) -and
+            ((Get-NextWeeklyFire (& $D '2026-09-13 15:00') -Provider 'codex') -eq (& $D '2026-09-14 08:21'))
+    }
+
+    Write-Host '-- codex: stub app-server + exec (spawns the stub codex only) --'
+    Test-Case 'Resolve-CodexExe honors PREHEAT_CODEX_EXE first (kind env); Get-CodexVersion asks it for --version' {
+        $r = Resolve-CodexExe
+        $r -and ($r.path -eq $cxStub) -and ($r.kind -eq 'env') -and ((Get-CodexVersion $cxStub) -like '*0.99.0*')
+    }
+    Test-Case 'Read-CodexQuota: account masked + hashed, plan, both windows; refreshToken false, no credit details, RUST_LOG off, allow-list only' {
+        $r5 = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600
+        Set-CodexStub @{ r5 = $r5 }
+        $q = Read-CodexQuota $cxStub -Reads 1 -TimeoutSec 30
+        $w = $null
+        if ($q.ok -and @($q.reads).Count -ge 1) { $w = Get-CodexWindows @($q.reads)[0].raw }
+        $calls = Get-CodexStubCalls
+        $q.ok -and ($null -eq $q.kind) -and ($q.account.plan -eq 'plus') -and ($q.account.emailMasked -eq 's***@example.com') -and
+            ([string]$q.account.hash -match '^[0-9a-f]{8}$') -and (@($q.reads).Count -eq 1) -and ([long]@($q.reads)[0].epoch -gt 0) -and
+            $w -and ([long]$w.five.resetsAt -eq $r5) -and $w.weekly -and
+            (@($calls | Where-Object { $_ -like 'rpc account/read*"refreshToken":false*' }).Count -eq 1) -and
+            (@($calls | Where-Object { $_ -like 'rpc account/rateLimits/read*"excludeResetCreditDetails":true*' }).Count -eq 1) -and
+            (@($calls | Where-Object { $_ -like 'env *rustlog=off*' }).Count -ge 1) -and (Test-CodexAllowList) -and ((Wait-StubPidsGone) -eq 0)
+    }
+    Test-Case 'Read-CodexQuota -Reads 2: two timed reads, oldest first, through the shadowed sleep' {
+        function Start-Sleep { param($Seconds, $Milliseconds) }
+        Set-CodexStub @{}
+        $q = Read-CodexQuota $cxStub -Reads 2 -IntervalSec 30 -TimeoutSec 30
+        $rs = @($q.reads)
+        $q.ok -and ($rs.Count -eq 2) -and ([long]$rs[1].epoch -ge [long]$rs[0].epoch) -and (Test-CodexAllowList)
+    }
+    Test-Case 'Read-CodexQuota: signed out -> auth, API-key login -> apikey (not auth), free 30d -> ok with no 5h window' {
+        Set-CodexStub @{ profile = 'signedout' }; $so = Read-CodexQuota $cxStub -TimeoutSec 30
+        Set-CodexStub @{ profile = 'apikey' };    $ak = Read-CodexQuota $cxStub -TimeoutSec 30
+        Set-CodexStub @{ profile = 'free30d' };   $fr = Read-CodexQuota $cxStub -TimeoutSec 30
+        $fw = $null
+        if ($fr.ok) { $fw = Get-CodexWindows @($fr.reads)[0].raw }
+        (-not $so.ok) -and ($so.kind -eq 'auth') -and (-not $ak.ok) -and ($ak.kind -eq 'apikey') -and
+            $fr.ok -and $fw -and (-not $fw.five) -and ($fr.account.plan -eq 'free') -and (Test-CodexAllowList)
+    }
+    Test-Case 'Read-CodexQuota: a hung app-server times out in seconds and its process tree is gone' {
+        Set-CodexStub @{ rpc = 'hang' }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $q = Read-CodexQuota $cxStub -TimeoutSec 3
+        $sw.Stop()
+        (-not $q.ok) -and ($q.kind -eq 'other') -and ($sw.Elapsed.TotalSeconds -lt 30) -and ((Wait-StubPidsGone) -eq 0)
+    }
+    Test-Case 'Read-CodexQuota: an app-server that dies after initialize is a clean failure, not a hang' {
+        Set-CodexStub @{ rpc = 'crash' }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $q = Read-CodexQuota $cxStub -TimeoutSec 20
+        $sw.Stop()
+        (-not $q.ok) -and ([string]$q.err) -and ($sw.Elapsed.TotalSeconds -lt 20)
+    }
+    $cxPitUnit = Join-Path $Tmp 'cx-unit-pit'
+    New-Item -ItemType Directory -Path $cxPitUnit -Force | Out-Null
+    Test-Case 'Invoke-CodexPing: the stub accepts the read-only ephemeral argv, stdin is already closed (no timeout), tokens counted, config keys passed' {
+        Set-CodexStub @{}
+        $r = Invoke-CodexPing $cxStub $cxPitUnit @('-c', 'cli_auth_credentials_store="keyring"') -TimeoutSec 60
+        $exec = @(Get-CodexStubCalls | Where-Object { $_ -like 'exec stdin=*' })
+        $r.ok -and ($r.exit -eq 0) -and $r.stream.sawTokens -and ($r.stream.tokens.input -eq 16900) -and ($r.ms -lt 50000) -and
+            ([long]$r.endEpoch -ge [long]$r.startEpoch) -and ($exec.Count -eq 1) -and ($exec[0] -clike '* -c cli_auth_credentials_store="keyring" *') -and
+            ($exec[0] -like '*-s read-only*') -and ($exec[0] -like '*--ephemeral*') -and ($exec[0] -like '*--ignore-user-config*')
+    }
+    Test-Case 'Invoke-CodexPing: limit, auth and an argv the binary refuses each come back as their own kind' {
+        Set-CodexStub @{ exec = 'limit' }; $l = Invoke-CodexPing $cxStub $cxPitUnit @() -TimeoutSec 60
+        Set-CodexStub @{ exec = 'auth' };  $a = Invoke-CodexPing $cxStub $cxPitUnit @() -TimeoutSec 60
+        Set-CodexStub @{ exec = 'usage' }; $u = Invoke-CodexPing $cxStub $cxPitUnit @() -TimeoutSec 60
+        (-not $l.ok) -and ($l.kind -eq 'limit') -and (-not $a.ok) -and ($a.kind -eq 'auth') -and (-not $u.ok) -and ($u.kind -eq 'usage-error') -and
+            ([string]$u.err).Length -le 400
+    }
+    Test-Case 'Invoke-CodexPing: a hung exec is killed at the timeout, tree and all' {
+        Set-CodexStub @{ exec = 'hang' }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-CodexPing $cxStub $cxPitUnit @() -TimeoutSec 5
+        $sw.Stop()
+        (-not $r.ok) -and ($sw.Elapsed.TotalSeconds -lt 40) -and ((Wait-StubPidsGone) -eq 0)
+    }
+
+    Write-Host '-- codex: fire integration (stub codex; scheduler, toast and sleeps doubled) --'
+    # Invoke-CodexFire end to end against the stub, every side effect redirected
+    # like Invoke-FireInt above. Sleeps are no-ops except the two waits the
+    # frozen/sliding verdict needs between reads ($Wait real seconds instead of
+    # 30 and 120: a frozen pair must not also look like a sliding one).
+    $cxIntHome = Join-Path $Tmp 'cx-int-home'
+    New-Item -ItemType Directory -Path $cxIntHome -Force | Out-Null
+    $cxSched = {
+        param([string]$CodexExtra = '')
+        # Codex fires daily at now + 6h (reset now + 11h): beyond any follow-up window
+        '{"proxy":"http://127.0.0.1:9","rules":[],"codex":{"rules":[{"days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],"reset":"' +
+            (Get-Date).AddHours(11).ToString('HH:mm', $cxInv) + '"}],"home":' + (ConvertTo-Json -InputObject $cxIntHome) + $CodexExtra + '}}'
+    }
+    function Invoke-CodexFireInt([hashtable]$Stub = @{}, [string]$Config = '', [string]$Seed = '', [string]$Self = '', [int]$Wait = 0, [string]$MacAgentDir = '') {
+        # one Codex fire -> @{ fire; recs; reg; toast; calls; state }
+        Set-CodexStub $Stub
+        $Root           = $Tmp
+        $LogPath        = Join-Path $Tmp ('cx-int-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.jsonl')
+        if ($Seed) { Set-Content -Path $LogPath -Value $Seed -Encoding UTF8 }
+        $FireLock       = Join-Path $Tmp 'cx-int-claude.lock'
+        $CodexFireLock  = Join-Path $Tmp 'cx-int.lock'
+        $CodexCachePath = Join-Path $Tmp 'state-ratelimits-codex.json'
+        $CodexFirePit   = Join-Path $Tmp 'firepit-codex'
+        Remove-Item $CodexCachePath -ErrorAction SilentlyContinue
+        if (-not $Config) { $Config = & $cxSched }
+        $ConfigPath = New-Fixture 'cx-int-sched.json' @($Config)
+        if ($MacAgentDir) {
+            $OnMac = $true; $LaunchAgentDir = $MacAgentDir
+            function launchctl { }
+            function Get-MacUid { '501' }
+        }
+        $script:CxReg = @(); $script:CxToast = @(); $script:CxWait = $Wait
+        # never a real codex: no candidate list, no resolver, no fallback to a desktop install
+        function Resolve-CodexExe { @{ path = $cxStub; kind = 'env' } }
+        function Get-CodexCandidates { param([switch]$First) @{ path = $cxStub; kind = 'env' } }
+        function Start-Sleep { param($Seconds, $Milliseconds) if (($script:CxWait -gt 0) -and (($Seconds -eq 30) -or ($Seconds -eq 120))) { Microsoft.PowerShell.Utility\Start-Sleep -Seconds $script:CxWait } }
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $script:CxReg += @{ name = $Name; at = $At; nowake = [bool]$NoWake; args = @($ScriptArgs) } }
+        function Remove-StaleOnceJobs { }
+        function Remove-PreheatJobs { param([string]$Pattern) }
+        function Send-Toast { param($Ok, $Anchored, $Kind, $Extra, [string]$Provider, [string]$Text) $script:CxToast += ('{0}|{1}|{2}|{3}|{4}|{5}' -f $Ok, $Anchored, $Kind, $Extra, $Provider, $Text) }
+        function Get-LastLocalActivity { $null }
+        $snap = Get-CxEnvSnapshot
+        if ($Self) { $env:CLAUDE_PREHEAT_SELF = $Self } else { Remove-Item Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue }
+        try { Invoke-CodexFire 6>$null | Out-Null } finally { Restore-CxEnvSnapshot $snap }
+        $recs = @(Read-JsonLines $LogPath)
+        $fire = $recs | Where-Object { ($_.ev -eq 'fire') -and ($_.provider -eq 'codex') } | Select-Object -Last 1
+        $st = $null
+        if (Test-Path $cxState) { try { $st = [long](([System.IO.File]::ReadAllText($cxState) | ConvertFrom-Json).r5) } catch { } }
+        @{ fire = $fire; recs = $recs; reg = @($script:CxReg); toast = @($script:CxToast); calls = @(Get-CodexStubCalls); state = $st }
+    }
+    function Get-CxRecs($r, [string]$Ev) { @($r.recs | Where-Object { ($_.ev -eq $Ev) -and ($_.provider -eq 'codex') }) }
+    function Test-CxNoExec($r) { @($r.calls | Where-Object { $_ -like 'exec stdin=*' }).Count -eq 0 }
+    function Test-CxAllowed($r) {
+        $ok = @('initialize', 'initialized', 'account/read', 'account/rateLimits/read')
+        foreach ($l in @($r.calls | Where-Object { $_ -like 'rpc *' })) { if ($ok -notcontains ($l.Split(' ')[1])) { return $false } }
+        $true
+    }
+
+    # one run feeds several cases: a running 5h window (R5 = now + 30 min)
+    $cxR5Run = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800
+    $cxRun = $null; $cxRunErr = ''
+    try {
+        # a Claude anchored fire 1h ago must not block the Codex follow-up
+        $seedClaude = '{"ev":"fire","ok":true,"anchored":true,"attempts":1,"ts":"' + (Get-Date).AddMinutes(-60).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}'
+        $cxRun = Invoke-CodexFireInt @{ r5 = $cxR5Run } -Seed $seedClaude
+    } catch { $cxRunErr = $_.Exception.Message }
+    Test-Case 'codex fire: a running window is not pinged - running, chase booked 2 min after its reset as a Codex no-wake one-shot, toast says when' {
+        if (-not $cxRun) { return ('run threw: ' + $cxRunErr) }
+        $r = $cxRun; $f = $r.fire
+        $end = [DateTimeOffset]::FromUnixTimeSeconds($cxR5Run).LocalDateTime
+        $once = @(Get-CxRecs $r 'schedule-once') | Select-Object -First 1
+        $at = $null
+        if ($once) { $at = ConvertTo-LocalTime $once.fireAt }
+        $f -and $f.ok -and ($f.pinged -eq $false) -and ($f.state -eq 'running') -and ($f.anchored -eq $false) -and
+            ([string]$f.resets_at -eq $end.ToString('yyyy-MM-dd HH:mm')) -and (Test-CxNoExec $r) -and (Test-CxAllowed $r) -and
+            ((@(Get-CxRecs $r 'codex-read') | Select-Object -First 1).src -eq 'pre') -and
+            $once -and ([string]$once.label -like 'chase*') -and $at -and ([Math]::Abs(($at - $end.AddMinutes(2)).TotalSeconds) -lt 90) -and
+            ($r.reg.Count -eq 1) -and ($r.reg[0].name -like 'ClaudePreheat-Codex-Once-*') -and $r.reg[0].nowake -and
+            (($r.reg[0].args -join ' ') -eq ('fire -Provider codex -Job ' + $r.reg[0].name)) -and
+            ($r.toast.Count -eq 1) -and ($r.toast[0] -like '*|codex|*')
+    }
+    Test-Case 'codex fire: proxy + CODEX_HOME from schedule.json reach the child; the env is put back; the cache is atomic, source fire, email masked' {
+        if (-not $cxRun) { return ('run threw: ' + $cxRunErr) }
+        $cacheF = Join-Path $Tmp 'state-ratelimits-codex.json'
+        $raw = ''; $c = $null
+        try { $raw = Get-Content $cacheF -Raw -Encoding UTF8; $c = $raw | ConvertFrom-Json } catch { }
+        (@($cxRun.calls | Where-Object { $_ -eq ('env https=http://127.0.0.1:9 http=http://127.0.0.1:9 home=' + $cxIntHome + ' rustlog=off') }).Count -ge 1) -and
+            ($env:HTTPS_PROXY -ne 'http://127.0.0.1:9') -and ($env:CODEX_HOME -ne $cxIntHome) -and
+            $c -and ($c.source -eq 'fire') -and ($c.has5h -eq $true) -and ([long]$c.rate_limits.five_hour.resets_at -eq $cxR5Run) -and
+            ($c.account.emailMasked -eq 's***@example.com') -and ($raw -notmatch 'stub\.user@') -and
+            (@(Get-ChildItem $Tmp -Filter 'state-ratelimits-codex*').Count -eq 1)
+    }
+
+    $cxAnch = $null; $cxAnchErr = ''
+    try { $cxAnch = Invoke-CodexFireInt @{ anchor = $true } -Wait 10 } catch { $cxAnchErr = $_.Exception.Message }
+    Test-Case 'codex fire: an idle window, a ping that anchors, a frozen read at pre + elapsed -> anchored, tokens and exe kind journaled, nothing booked' {
+        if (-not $cxAnch) { return ('run threw: ' + $cxAnchErr) }
+        $r = $cxAnch; $f = $r.fire
+        $f -and $f.ok -and ($f.pinged -eq $true) -and ($f.state -eq 'anchored') -and ($f.anchored -eq $true) -and ($f.anchor_src -eq 'ratelimit') -and
+            $r.state -and ([Math]::Abs([long]$f.resets_epoch - $r.state) -le 3) -and ($f.attempts -eq 1) -and
+            ($f.tokens_in -eq 16900) -and ($f.tokens_cached -eq 12000) -and ($f.exe_kind -eq 'env') -and
+            (@($r.calls | Where-Object { $_ -like 'exec stdin=*' }).Count -eq 1) -and (Test-CxAllowed $r) -and
+            (@(Get-CxRecs $r 'codex-read' | Where-Object { $_.src -eq 'post' }).Count -ge 2) -and
+            ($r.reg.Count -eq 0) -and ($r.toast.Count -eq 1)
+    }
+    $cxSlide = $null; $cxSlideErr = ''
+    try { $cxSlide = Invoke-CodexFireInt @{ anchor = $false } -Wait 10 } catch { $cxSlideErr = $_.Exception.Message }
+    Test-Case 'codex fire: a ping that starts nothing (reset keeps sliding) -> sliding after the 120s confirm read, nothing booked' {
+        if (-not $cxSlide) { return ('run threw: ' + $cxSlideErr) }
+        $r = $cxSlide; $f = $r.fire
+        $f -and $f.ok -and ($f.pinged -eq $true) -and ($f.state -eq 'sliding') -and ($f.anchored -eq $false) -and
+            (@(Get-CxRecs $r 'codex-read' | Where-Object { $_.src -eq 'post' }).Count -eq 3) -and ($r.reg.Count -eq 0)
+    }
+    Test-Case 'codex fire: an account with no 5h window (free 30d) is never pinged - no5h, toast once, not again on the next no5h' {
+        $r1 = Invoke-CodexFireInt @{ profile = 'free30d' }
+        $seed = '{"ev":"fire","provider":"codex","ok":false,"kind":"no5h","pinged":false,"state":"no5h","ts":"' + (Get-Date).AddDays(-1).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}'
+        $r2 = Invoke-CodexFireInt @{ profile = 'free30d' } -Seed $seed
+        $f = $r1.fire
+        $f -and (-not $f.ok) -and ($f.kind -eq 'no5h') -and ($f.pinged -eq $false) -and ($f.state -eq 'no5h') -and (Test-CxNoExec $r1) -and
+            ($r1.toast.Count -eq 1) -and $r2.fire -and ($r2.fire.kind -eq 'no5h') -and ($r2.toast.Count -eq 0)
+    }
+    Test-Case 'codex fire: signed out -> auth, API-key login -> apikey; neither pings' {
+        $so = Invoke-CodexFireInt @{ profile = 'signedout' }
+        $ak = Invoke-CodexFireInt @{ profile = 'apikey' }
+        $so.fire -and (-not $so.fire.ok) -and ($so.fire.kind -eq 'auth') -and (Test-CxNoExec $so) -and
+            $ak.fire -and (-not $ak.fire.ok) -and ($ak.fire.kind -eq 'apikey') -and (Test-CxNoExec $ak)
+    }
+    Test-Case 'codex fire: a usage limit fails once (no retry), says limit, claims no anchor' {
+        $r = Invoke-CodexFireInt @{ exec = 'limit' }
+        $f = $r.fire
+        $f -and (-not $f.ok) -and ($f.kind -eq 'limit') -and ($f.attempts -eq 1) -and (-not (Test-Prop $f 'anchored')) -and
+            (@($r.calls | Where-Object { $_ -like 'exec stdin=*' }).Count -eq 1)
+    }
+    Test-Case 'codex fire: exec says "not logged in" after a signed-in pre-read -> config-mismatch, not a re-login prompt, no retry' {
+        $r = Invoke-CodexFireInt @{ exec = 'auth' }
+        $f = $r.fire
+        $f -and (-not $f.ok) -and ($f.kind -eq 'config-mismatch') -and (@($r.calls | Where-Object { $_ -like 'exec stdin=*' }).Count -eq 1)
+    }
+    Test-Case 'codex fire: an exec argv the binary refuses fails the fire instead of passing (retried once, after a read)' {
+        $r = Invoke-CodexFireInt @{ exec = 'usage' }
+        $f = $r.fire
+        $f -and (-not $f.ok) -and ([string]$f.kind) -and ($f.anchored -ne $true) -and ($f.attempts -eq 2) -and
+            (@(Get-CxRecs $r 'codex-read' | Where-Object { $_.src -eq 'retry' }).Count -eq 1) -and ($f.auth_rot -eq 'none')
+    }
+    Test-Case 'codex fire: out of time budget -> no retry and no confirm read (the worst case stays bounded)' {
+        $CodexFireBudgetSec = 0
+        $u = Invoke-CodexFireInt @{ exec = 'usage' }
+        $s = Invoke-CodexFireInt @{ anchor = $false } -Wait 10
+        $u.fire -and ($u.fire.attempts -eq 1) -and (@(Get-CxRecs $u 'codex-read' | Where-Object { $_.src -eq 'retry' }).Count -eq 0) -and
+            $s.fire -and ($s.fire.state -eq 'sliding') -and (@(Get-CxRecs $s 'codex-read' | Where-Object { $_.src -eq 'post' }).Count -eq 2)
+    }
+    $cxSlidingSeed = @(
+        ('{"ev":"fire","provider":"codex","ok":true,"pinged":true,"state":"sliding","anchored":false,"ts":"' + (Get-Date).AddDays(-2).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}'),
+        ('{"ev":"fire","provider":"codex","ok":true,"pinged":true,"state":"sliding","anchored":false,"ts":"' + (Get-Date).AddDays(-1).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}')
+    )
+    Test-Case 'codex fire: two sliding pings in a row pause Codex fires (no codex started at all) until the next Codex apply; a Claude apply does not count' {
+        $p1 = Invoke-CodexFireInt @{} -Seed ($cxSlidingSeed -join "`n")
+        $claudeApply = '{"ev":"apply","tasks":1,"ts":"' + (Get-Date).AddHours(-1).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}'
+        $p2 = Invoke-CodexFireInt @{} -Seed ((@($cxSlidingSeed) + @($claudeApply)) -join "`n")
+        $codexApply = '{"ev":"apply","provider":"codex","tasks":1,"ts":"' + (Get-Date).AddHours(-1).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}'
+        $p3 = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) } -Seed ((@($cxSlidingSeed) + @($codexApply)) -join "`n")
+        $p1.fire -and (-not $p1.fire.ok) -and ($p1.fire.kind -eq 'paused') -and ($p1.fire.pinged -eq $false) -and ($p1.calls.Count -eq 0) -and ($p1.toast.Count -eq 1) -and
+            $p2.fire -and ($p2.fire.kind -eq 'paused') -and
+            $p3.fire -and ($p3.fire.kind -ne 'paused') -and ($p3.fire.state -eq 'running')
+    }
+    Test-Case 'codex fire: PREHEAT_CODEX_FORCE_PING=1 (test switch) gets past the pause' {
+        $snapF = Get-CxEnvSnapshot
+        try {
+            $env:PREHEAT_CODEX_FORCE_PING = '1'
+            $r = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) } -Seed ($cxSlidingSeed -join "`n")
+        } finally { Restore-CxEnvSnapshot $snapF }
+        $r.fire -and ($r.fire.kind -ne 'paused') -and ($r.calls.Count -gt 0)
+    }
+    Test-Case 'codex fire (macOS path): a Codex follow-up never books another, and the spent one-shot deletes its own plist' {
+        $due = (Get-Date).AddMinutes(-1)
+        $stampD = $due.ToString('yyyyMMdd-HHmm', $cxInv)
+        $self = 'ClaudePreheat-Codex-Once-' + $stampD
+        $la = Join-Path $Tmp 'cx-launchagents'
+        New-Item -ItemType Directory -Path $la -Force | Out-Null
+        $plist = Join-Path $la ('com.claude-preheat.Codex-Once-' + $stampD + '.plist')
+        Set-Content -Path $plist -Value 'x' -Encoding ASCII
+        $seed = '{"ev":"schedule-once","provider":"codex","fireAt":"' + $due.ToString('s', $cxInv) + '","label":"chase ratelimits","ts":"' + (Get-Date).AddHours(-3).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) + '"}'
+        $r = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 2400) } -Seed $seed -Self $self -MacAgentDir $la
+        $skip = @(Get-CxRecs $r 'chase-skip') | Select-Object -First 1
+        $r.fire -and ($r.fire.state -eq 'running') -and ($r.reg.Count -eq 0) -and $skip -and ([string]$skip.reason -like '*follow-up*') -and
+            (-not (Test-Path $plist))
+    }
+    Test-Case 'codex fire: a lock held by another live Codex fire is left in place and this fire stands down without starting codex; a fire of our own leaves none' {
+        $lock = Join-Path $Tmp 'cx-int.lock'
+        ('{"pid":' + $PID + ',"job":"ClaudePreheat-Codex-Once-20990101-0000","startedAt":"' + (Get-Date).ToString('s', $cxInv) + '"}') | Set-Content -Path $lock -Encoding UTF8
+        $still = $false
+        try { $r = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) } } finally { $still = Test-Path $lock; Remove-Item $lock -ErrorAction SilentlyContinue }
+        $own = Invoke-CodexFireInt @{ r5 = ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800) }
+        $r.fire -and $still -and ($r.fire.kind -eq 'other') -and ([string]$r.fire.err -like '*another Codex fire*') -and ($r.calls.Count -eq 0) -and
+            ($r.toast.Count -eq 0) -and $own.fire -and ($own.fire.kind -ne 'other') -and (-not (Test-Path $lock))
+    }
+
+    Write-Host '-- codex: apply / off / locks (scheduler doubled) --'
+    function Invoke-ApplyMock([string]$Config, [string]$Provider = 'all', [string]$CodexHomeEnv = '', [switch]$FreshCodexLock, [int]$LockPid = $PID) {
+        # Invoke-Apply with the scheduler doubled -> @{ reg; remove; claude; err; recs; config; calls }
+        $LogPath       = Join-Path $Tmp ('cx-apply-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.jsonl')
+        $ConfigPath    = New-Fixture ('cx-apply-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.json') @($Config)
+        $StatePath     = Join-Path $Tmp 'cx-apply-state.json'
+        $FireLock      = Join-Path $Tmp 'cx-apply-claude.lock'
+        $CodexFireLock = Join-Path $Tmp 'cx-apply-codex.lock'
+        Remove-Item $FireLock, $CodexFireLock -ErrorAction SilentlyContinue
+        if ($FreshCodexLock) { ('{"pid":' + $LockPid + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $CodexFireLock -Encoding UTF8 }
+        $script:AReg = @(); $script:ARemove = @(); $script:AClaude = 0
+        function Start-Sleep { param($Seconds, $Milliseconds) }
+        function Register-PreheatJob { param([string]$Name, [string[]]$Days, [datetime]$At, [switch]$NoWake, [string[]]$ScriptArgs) $a = @(); if ($ScriptArgs) { $a = @($ScriptArgs) }; $script:AReg += @{ name = $Name; days = @($Days); args = $a } }
+        function Remove-PreheatJobs { param([string]$Pattern) $script:ARemove += $Pattern }
+        function Remove-StaleOnceJobs { }
+        function Resolve-ClaudeExe { param([switch]$NoCache) $script:AClaude++; 'C:\stub\claude.exe' }
+        function Test-WakeTimers { }
+        function Limit-LaunchdErrLog { }
+        # belt and braces: should a double above ever be bypassed, nothing real is touched
+        function Register-ScheduledTask { throw 'test: the real Register-ScheduledTask was reached' }
+        function Unregister-ScheduledTask { throw 'test: the real Unregister-ScheduledTask was reached' }
+        function Get-ScheduledTask { }
+        function launchctl { throw 'test: the real launchctl was reached' }
+        Set-CodexStub @{}
+        $snap = Get-CxEnvSnapshot
+        if ($CodexHomeEnv) { $env:CODEX_HOME = $CodexHomeEnv } else { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue }
+        $err = $null
+        try { Invoke-Apply -Provider $Provider 6>$null | Out-Null } catch { $err = $_.Exception.Message } finally { Restore-CxEnvSnapshot $snap }
+        $cfg = $null
+        try { $cfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+        @{ reg = @($script:AReg); remove = @($script:ARemove); claude = $script:AClaude; err = $err; recs = @(Read-JsonLines $LogPath); config = $cfg; calls = @(Get-CodexStubCalls) }
+    }
+    $cxBoth = '{"_readme":"x","proxy":"http://127.0.0.1:9","chase":false,"extra":{"keep":1},"rules":[{"days":["Mon"],"reset":"08:40"}],"codex":{"rules":[{"days":["Tue"],"reset":"15:00"}],"chase":false}}'
+    Test-Case 'apply on an old schedule.json (no codex key): the same Claude task, the same args, one provider-less apply record, codex never spawned' {
+        $r = Invoke-ApplyMock '{"rules":[{"days":["Mon"],"reset":"08:40"}]}'
+        $applies = @($r.recs | Where-Object { $_.ev -eq 'apply' })
+        (-not $r.err) -and ($r.reg.Count -eq 1) -and ($r.reg[0].name -eq 'ClaudePreheat-Wk-0340-Mon') -and
+            ((($r.reg[0].args -join ' ') -eq '') -or (($r.reg[0].args -join ' ') -eq 'fire')) -and
+            ($r.remove -contains 'ClaudePreheat-Wk*') -and ($applies.Count -eq 1) -and (-not (Test-Prop $applies[0] 'provider')) -and
+            ($applies[0].tasks -eq 1) -and ($r.claude -eq 1) -and ($r.calls.Count -eq 0)
+    }
+    Test-Case 'apply with a codex section: both plans, Codex tasks run fire -Provider codex, one apply record each, still no codex spawned' {
+        $r = Invoke-ApplyMock $cxBoth
+        $cx = @($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Codex-Wk-*' })
+        $cl = @($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Wk-*' })
+        $applies = @($r.recs | Where-Object { $_.ev -eq 'apply' })
+        (-not $r.err) -and ($cl.Count -eq 1) -and ($cx.Count -eq 1) -and ($cx[0].name -eq 'ClaudePreheat-Codex-Wk-1000-Tue') -and
+            (($cx[0].args -join ' ') -eq 'fire -Provider codex') -and
+            ($r.remove -contains 'ClaudePreheat-Codex-Wk*') -and ($r.remove -contains 'ClaudePreheat-Wk*') -and
+            ($applies.Count -eq 2) -and (@($applies | Where-Object { $_.provider -eq 'codex' }).Count -eq 1) -and ($r.calls.Count -eq 0)
+    }
+    Test-Case 'apply -Provider codex leaves every Claude task alone and never looks for claude' {
+        $r = Invoke-ApplyMock $cxBoth 'codex'
+        (-not $r.err) -and (@($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Wk-*' }).Count -eq 0) -and
+            (@($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Codex-Wk-*' }).Count -eq 1) -and
+            ($r.remove -notcontains 'ClaudePreheat-Wk*') -and ($r.claude -eq 0) -and
+            (@($r.recs | Where-Object { ($_.ev -eq 'apply') -and (-not (Test-Prop $_ 'provider')) }).Count -eq 0)
+    }
+    Test-Case 'apply for a Codex-only user (empty top-level rules) installs Codex without resolving claude' {
+        $r = Invoke-ApplyMock '{"rules":[],"codex":{"rules":[{"days":["Wed"],"reset":"12:00"}]}}'
+        (-not $r.err) -and ($r.claude -eq 0) -and (@($r.reg | Where-Object { $_.name -eq 'ClaudePreheat-Codex-Wk-0700-Wed' }).Count -eq 1)
+    }
+    Test-Case 'apply records a changed CODEX_HOME into codex.home and keeps every other key' {
+        $h = Join-Path $Tmp 'cx-apply-home'
+        $r = Invoke-ApplyMock $cxBoth 'codex' $h
+        $c = $r.config
+        (-not $r.err) -and $c -and ($c.codex.home -eq $h) -and ($c.proxy -eq 'http://127.0.0.1:9') -and ($c.chase -eq $false) -and
+            ($c.extra.keep -eq 1) -and ($c.codex.chase -eq $false) -and (@($c.codex.rules).Count -eq 1) -and ($c.rules[0].reset -eq '08:40')
+    }
+    Test-Case 'apply: a broken Codex section never stops the Claude plan' {
+        $r = Invoke-ApplyMock '{"rules":[{"days":["Mon"],"reset":"08:40"}],"codex":{"rules":[{"days":["Xyz"],"reset":"15:00"}]}}'
+        (@($r.reg | Where-Object { $_.name -eq 'ClaudePreheat-Wk-0340-Mon' }).Count -eq 1) -and
+            (@($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Codex-*' }).Count -eq 0)
+    }
+    Test-Case 'apply waits for a running Codex fire too: a live .fire-codex.lock fails the Codex half only, the Claude half still applies' {
+        $r = Invoke-ApplyMock $cxBoth 'all' '' -FreshCodexLock
+        ([string]$r.err -like '*codex:*running right now*') -and
+            (@($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Codex-*' }).Count -eq 0) -and ($r.remove -notcontains 'ClaudePreheat-Codex-Wk*') -and
+            (@($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Wk-*' }).Count -eq 1)
+    }
+    Test-Case 'apply -Provider codex: a Codex lock whose process is gone does not block (a killed fire leaves one behind)' {
+        $r = Invoke-ApplyMock $cxBoth 'codex' '' -FreshCodexLock -LockPid ([int]::MaxValue)
+        (-not $r.err) -and (@($r.reg | Where-Object { $_.name -like 'ClaudePreheat-Codex-Wk-*' }).Count -eq 1)
+    }
+    Test-Case 'off / off -Codex: each waits for the lock of what it removes; -Codex removes only Codex tasks' {
+        $LogPath = Join-Path $Tmp 'cx-off.jsonl'
+        $FireLock = Join-Path $Tmp 'cx-off-claude.lock'
+        $CodexFireLock = Join-Path $Tmp 'cx-off-codex.lock'
+        Remove-Item $FireLock, $CodexFireLock -ErrorAction SilentlyContinue
+        $script:LRemove = @()
+        function Start-Sleep { param($Seconds, $Milliseconds) }
+        function Remove-PreheatJobs { param([string]$Pattern) $script:LRemove += $Pattern }
+        function Unregister-ScheduledTask { throw 'test: the real Unregister-ScheduledTask was reached' }
+        function Get-ScheduledTask { }
+        function launchctl { throw 'test: the real launchctl was reached' }
+        $fresh = '{"pid":' + $PID + ',"job":"x","startedAt":"2026-01-01T00:00:00"}'
+        $fresh | Set-Content -Path $CodexFireLock -Encoding UTF8
+        $m1 = ''; try { Invoke-Off 6>$null } catch { $m1 = $_.Exception.Message }
+        $m2 = ''; try { Invoke-Off -Provider 'codex' 6>$null } catch { $m2 = $_.Exception.Message }
+        $m3 = ''; try { Wait-FireLock -MaxSec 1 -Path $CodexFireLock } catch { $m3 = $_.Exception.Message }
+        $blocked = $script:LRemove.Count
+        Remove-Item $CodexFireLock -ErrorAction SilentlyContinue
+        # a running CLAUDE fire does not hold up removing the Codex tasks
+        $fresh | Set-Content -Path $FireLock -Encoding UTF8
+        $m4 = ''; try { Invoke-Off -Provider 'codex' 6>$null } catch { $m4 = $_.Exception.Message }
+        Remove-Item $FireLock -ErrorAction SilentlyContinue
+        $codexOnly = @($script:LRemove)
+        $script:LRemove = @()
+        Invoke-Off 6>$null
+        ($m1 -like '*running right now*') -and ($m2 -like '*running right now*') -and ($m3 -like '*running right now*') -and ($blocked -eq 0) -and
+            (-not $m4) -and ($codexOnly.Count -eq 1) -and ($codexOnly[0] -eq 'ClaudePreheat-Codex-*') -and ($script:LRemove -contains 'ClaudePreheat*')
+    }
+    Test-Case 'the one-shot sweep covers Codex one-shots on macOS: spent plist booted out, pending and running kept, orphan Codex label swept, scoped by provider' {
+        $OnMac = $true
+        $LaunchAgentDir = Join-Path $Tmp 'cx-sweep-la'
+        New-Item -ItemType Directory -Path $LaunchAgentDir -Force | Out-Null
+        # 20200103 is past due but still running (two one-shots delivered together at wake): kept
+        foreach ($n in @('Codex-Once-20200101-0000', 'Codex-Once-20991231-2300', 'Once-20200101-0000', 'Codex-Once-20200103-0000')) {
+            Set-Content -Path (Join-Path $LaunchAgentDir ('com.claude-preheat.' + $n + '.plist')) -Value '<plist/>' -Encoding ASCII
+        }
+        $script:Boot = @()
+        function Get-MacUid { '501' }
+        function launchctl {
+            if (($args[0] -eq 'print') -and ([string]$args[1] -match 'Codex-Once-2020010[34]')) { return 'state = running' }
+            if ($args[0] -eq 'print') { return 'services = { com.claude-preheat.Codex-Once-20200102-0000 com.claude-preheat.Codex-Once-20991231-2300 com.claude-preheat.Codex-Once-20200104-0000 }' }
+            if ($args[0] -eq 'bootout') { $script:Boot += [string]$args[1] }
+        }
+        function Unregister-ScheduledTask { throw 'test: the real Unregister-ScheduledTask was reached' }
+        function Get-ScheduledTask { }
+        $snapS = Get-CxEnvSnapshot
+        $claudeKept = $false
+        try {
+            Remove-Item Env:CLAUDE_PREHEAT_SELF -ErrorAction SilentlyContinue
+            # a Codex-scoped sweep (Codex fire / apply -Provider codex) never touches a Claude one-shot
+            Remove-StaleOnceJobs 'codex'
+            $claudeKept = Test-Path (Join-Path $LaunchAgentDir 'com.claude-preheat.Once-20200101-0000.plist')
+            Remove-StaleOnceJobs
+        } finally { Restore-CxEnvSnapshot $snapS }
+        $claudeKept -and (Test-Path (Join-Path $LaunchAgentDir 'com.claude-preheat.Codex-Once-20200103-0000.plist')) -and
+            (@($script:Boot | Where-Object { $_ -like '*Codex-Once-20200103-0000' -or $_ -like '*Codex-Once-20200104-0000' }).Count -eq 0) -and
+            (-not (Test-Path (Join-Path $LaunchAgentDir 'com.claude-preheat.Codex-Once-20200101-0000.plist'))) -and
+            (Test-Path (Join-Path $LaunchAgentDir 'com.claude-preheat.Codex-Once-20991231-2300.plist')) -and
+            (-not (Test-Path (Join-Path $LaunchAgentDir 'com.claude-preheat.Once-20200101-0000.plist'))) -and
+            (@($script:Boot | Where-Object { $_ -like '*com.claude-preheat.Codex-Once-20200102-0000' }).Count -ge 1) -and
+            (@($script:Boot | Where-Object { $_ -like '*Codex-Once-20991231-2300' }).Count -eq 0)
+    }
 }
 
 # ------------------------------------------------------------------ panel.ps1
@@ -1107,11 +1910,16 @@ try {
         ($r.Code -ne 403) -and ($r.Code -gt 0)
     }
     Test-Case 'POST /api/preheat/apply rejects an unusable rule set -> 400' {
+        # an EMPTY rule set is valid since Codex support (Codex-only users) and
+        # would rewrite this checkout's schedule.json and re-register the real
+        # tasks - it is exercised only against the throwaway panel root below
         $o = @{ Origin = "http://localhost:$panelPort" }
-        $empty = Invoke-PanelPost '/api/preheat/apply' '{"rules":[]}' $o 'application/json'
         $noDay = Invoke-PanelPost '/api/preheat/apply' '{"rules":[{"days":[],"reset":"09:00"}]}' $o 'application/json'
         $badHr = Invoke-PanelPost '/api/preheat/apply' '{"rules":[{"days":["Mon"],"reset":"25:00"}]}' $o 'application/json'
-        ($empty.Code -eq 400) -and ($noDay.Code -eq 400) -and ($badHr.Code -eq 400)
+        # the stale baseMtime is the safety net: even a panel that forgot to check
+        # the provider must stop at the lock, never write the real schedule
+        $badPv = Invoke-PanelPost '/api/preheat/apply' '{"provider":"gemini","rules":[{"days":["Mon"],"reset":"09:00"}],"baseMtime":"1"}' $o 'application/json'
+        ($noDay.Code -eq 400) -and ($badHr.Code -eq 400) -and ($badPv.Code -eq 400)
     }
     Test-Case 'POST /api/preheat/apply refuses a stale baseMtime -> 409' {
         # THE only rule-valid apply this suite may send: the optimistic lock has
@@ -1127,6 +1935,251 @@ try {
     }
 } finally {
     if ($panelProc) { try { Stop-Process -Id $panelProc.Id -Force -ErrorAction SilentlyContinue } catch { } }
+}
+
+# ------------------------------------------- Codex: throwaway preheat root
+# A copy of the product in the temp dir with its own schedule.json, journal
+# and caches: the CLI runs there as a child process (status/report -Codex
+# exactly as typed), and a second panel serves it. Its preheat.ps1 is a
+# stand-in that RECORDS every scheduler-touching command (apply, at, +Nh...)
+# instead of running it, and hands status/report/learn to the real script -
+# so a panel save can be tested for real without registering a single task.
+Write-Host ''
+Write-Host '-- codex: CLI + panel in a throwaway preheat root (stub codex) --'
+$cxRoot = Join-Path $Tmp 'cxroot'
+New-Item -ItemType Directory -Path (Join-Path $cxRoot 'web') -Force | Out-Null
+foreach ($f in @('panel.ps1', 'platform.ps1', 'codex.ps1', 'mcp-empty.json', 'run-hidden.vbs')) {
+    if (Test-Path (Join-Path $Repo $f)) { Copy-Item (Join-Path $Repo $f) $cxRoot -Force }
+}
+Copy-Item (Join-Path $Repo (Join-Path 'web' 'index.html')) (Join-Path $cxRoot 'web') -Force
+Copy-Item (Join-Path $Repo 'preheat.ps1') (Join-Path $cxRoot 'preheat-real.ps1') -Force
+$cxBackendLog = Join-Path $cxRoot 'backend-calls.txt'
+Set-Content -Path (Join-Path $cxRoot 'preheat.ps1') -Encoding ASCII -Value @(
+    '# self-test stand-in (see test.ps1): records scheduler-touching commands, runs read-only ones',
+    '$wrapReal = Join-Path $PSScriptRoot ''preheat-real.ps1''',
+    'if (($args.Count -ge 1) -and ($args[0] -eq ''__selftest__'')) { . $wrapReal ''__selftest__''; return }',
+    'Add-Content -Path (Join-Path $PSScriptRoot ''backend-calls.txt'') -Value ($args -join '' '') -Encoding ASCII',
+    'if (($args.Count -ge 1) -and (@(''status'', ''report'', ''learn'') -contains $args[0])) {',
+    '    & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wrapReal @args',
+    '    exit $LASTEXITCODE',
+    '}',
+    'exit 0')
+$cxRootHome = Join-Path $cxRoot 'codex-home'
+New-Item -ItemType Directory -Path $cxRootHome -Force | Out-Null
+$cxRootSched = '{"_readme":"x","proxy":"","chase":true,"extra":{"keep":1},"rules":[{"days":["Mon"],"reset":"10:00"}],' +
+    '"codex":{"rules":[{"days":["Tue"],"reset":"15:00"}],"chase":false,"home":' + (ConvertTo-Json -InputObject $cxRootHome) + '}}'
+[System.IO.File]::WriteAllText((Join-Path $cxRoot 'schedule.json'), $cxRootSched, (New-Object System.Text.UTF8Encoding($false)))
+# the anchored Codex fire 1h ago whose window resets in 4h: the rolling check compares against it
+$cxRootR5 = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 4 * 3600
+$cxHomeP  = [Environment]::GetFolderPath('UserProfile')
+$cxUser   = [Environment]::UserName
+$cxTs = { param([int]$Min) (Get-Date).AddMinutes($Min).ToString('yyyy-MM-ddTHH:mm:sszzz', $cxInv) }
+@(
+    ('{"ev":"fire","ok":true,"anchored":true,"attempts":1,"ts":"' + (& $cxTs -300) + '"}'),
+    ('{"ev":"fire","provider":"codex","ok":false,"kind":"other","pinged":false,"state":"unknown","attempts":1,"err":' +
+        (ConvertTo-Json -InputObject ('spawn failed in ' + $cxHomeP + '\.codex for stub.user@example.com as ' + $cxUser)) + ',"ts":"' + (& $cxTs -120) + '"}'),
+    ('{"ev":"fire","provider":"codex","ok":true,"pinged":true,"state":"anchored","anchored":true,"anchor_src":"ratelimit","plan":"plus","resets_epoch":' + $cxRootR5 +
+        ',"resets_at":"' + [DateTimeOffset]::FromUnixTimeSeconds($cxRootR5).LocalDateTime.ToString('yyyy-MM-dd HH:mm', $cxInv) + '","attempts":1,"tokens_in":16900,"ts":"' + (& $cxTs -60) + '"}')
+) | Set-Content -Path (Join-Path $cxRoot 'preheat-log.jsonl') -Encoding UTF8
+
+function Invoke-CxCli([string[]]$CliArgs) {
+    # the real preheat.ps1 of the throwaway root, as a child process -> @{ code; out }
+    $ErrorActionPreference = 'Continue'   # 5.1: a native stderr line under 2>&1 must not throw
+    $out = & $cxShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $cxRoot 'preheat-real.ps1') @CliArgs 2>&1 | Out-String
+    @{ code = $LASTEXITCODE; out = $out }
+}
+function Get-CxRootRecs([string]$Ev) { @(Read-JsonLines (Join-Path $cxRoot 'preheat-log.jsonl') | Where-Object { ($_.ev -eq $Ev) -and ($_.provider -eq 'codex') }) }
+
+Test-Case 'status -Codex: a live read through the stub - masked account, plan, the 5h window, rolling check says unchanged, cache + codex-read written' {
+    Set-CodexStub @{ r5 = $cxRootR5 }
+    $before = @(Get-CxRootRecs 'codex-read').Count
+    $o = Invoke-CxCli @('status', '-Codex')
+    $reads = @(Get-CxRootRecs 'codex-read')
+    $cache = $null
+    try { $cache = Get-Content (Join-Path $cxRoot 'state-ratelimits-codex.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    ($o.code -eq 0) -and $o.out.Contains('s***@example.com') -and (-not $o.out.Contains('stub.user@')) -and ($o.out -match 'plus') -and
+        ($o.out -match 'reset unchanged') -and ($reads.Count -eq $before + 1) -and ($reads[-1].src -eq 'status') -and
+        $cache -and ($cache.source -eq 'status') -and (Test-CodexAllowList)
+}
+Test-Case 'status -Codex: a reset that moved later than the anchored fire recorded is reported as rolling, with drift_s on the codex-read' {
+    Set-CodexStub @{ r5 = ($cxRootR5 + 900) }
+    $o = Invoke-CxCli @('status', '-Codex')
+    $last = @(Get-CxRootRecs 'codex-read') | Select-Object -Last 1
+    ($o.code -eq 0) -and ($o.out -match 'moved later') -and $last -and (Test-Prop $last 'drift_s') -and ([long]$last.drift_s -ge 840)
+}
+Test-Case 'status -Codex -Json: the cache object plus installed / exeKind / version / signedIn' {
+    Set-CodexStub @{ r5 = $cxRootR5 }
+    $o = Invoke-CxCli @('status', '-Codex', '-Json')
+    $j = $null
+    try { $j = $o.out | ConvertFrom-Json } catch { }
+    ($o.code -eq 0) -and $j -and ($j.installed -eq $true) -and ($j.exeKind -eq 'env') -and ([string]$j.version -like '*0.99.0*') -and
+        ($j.signedIn -eq $true) -and ($j.has5h -eq $true) -and ($j.source -eq 'status')
+}
+Test-Case 'report -Codex: paste-back text with no email, home path or user name in any spelling' {
+    Set-CodexStub @{ r5 = $cxRootR5 }
+    $o = Invoke-CxCli @('report', '-Codex')
+    $ok = ($o.code -eq 0) -and ($o.out -match '(?i)codex') -and ($o.out -match 'anchored') -and
+        ($o.out -notmatch 'stub\.user@') -and (-not $o.out.Contains($cxHomeP)) -and (-not $o.out.Contains(($cxHomeP -replace '\\', '/'))) -and
+        (-not $o.out.Contains(($cxHomeP -replace '\\', '\\')))
+    # an all-digit user name stays as a bare word (it is a number) - never as a path segment
+    if (($cxUser.Length -ge 4) -and ($cxUser -notmatch '^\d+$')) { $ok = $ok -and ($o.out -notmatch ('\b' + [regex]::Escape($cxUser) + '\b')) }
+    $ok = $ok -and ($o.out -notmatch ('[\\/]' + [regex]::Escape($cxUser) + '[\\/]'))
+    $ok
+}
+Test-Case 'report without -Codex prints a usage hint; learn -Codex says Claude-only and exits 0; a bad -Provider is a usage error' {
+    $r = Invoke-CxCli @('report')
+    $l = Invoke-CxCli @('learn', '-Codex')
+    $b = Invoke-CxCli @('status', '-Provider', 'gemini')
+    ($r.out -match 'report -Codex') -and ($l.code -eq 0) -and ($l.out -match 'Claude-only') -and
+        (($b.code -ne 0) -or ($b.out -match 'usage'))
+}
+Test-Case 'status / status -Json with a codex section: a codex block, every task tagged with its provider, lastActivity kept' {
+    $s = Invoke-CxCli @('status')
+    $o = Invoke-CxCli @('status', '-Json')
+    $j = $null
+    try { $j = $o.out | ConvertFrom-Json } catch { }
+    $tagged = $true
+    if ($j) { foreach ($t in @($j.tasks)) { if (@('claude', 'codex') -notcontains [string]$t.provider) { $tagged = $false } } }
+    ($s.code -eq 0) -and ($s.out -match '(?i)codex') -and $j -and $tagged -and ($null -ne $j.PSObject.Properties['lastActivity']) -and
+        $j.codex -and ($j.codex.configured -eq $true) -and ($null -ne $j.codex.PSObject.Properties['tasks'])
+}
+
+$cxPanelPort = 7880
+$cxPanelProc = $null
+try {
+    $shell = $env:PREHEAT_TEST_SHELL
+    if ($shell -ne 'powershell' -and $shell -ne 'pwsh') {
+        $shell = 'pwsh'
+        if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) { $shell = 'powershell' }
+    }
+    $spArgs = @{
+        FilePath = $shell; PassThru = $true
+        ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $cxRoot 'panel.ps1'), '-Port', $cxPanelPort, '-NoBrowser')
+    }
+    if ($cxOnWin) { $spArgs.WindowStyle = 'Hidden' }
+    $env:PREHEAT_PANEL_LOG = Join-Path $Tmp 'panel-cx-log.txt'
+    Set-CodexStub @{ profile = 'free30d' }
+    $cxPanelProc = Start-Process @spArgs
+    Remove-Item Env:PREHEAT_PANEL_LOG -ErrorAction SilentlyContinue
+    $cxBase = "http://localhost:$cxPanelPort"
+    $cxOrigin = @{ Origin = "http://localhost:$cxPanelPort" }
+    $cxUp = $false
+    for ($i = 0; $i -lt 25 -and -not $cxUp; $i++) {
+        Start-Sleep -Milliseconds 700
+        try { $null = Invoke-WebRequest -Uri "$cxBase/api/status" -UseBasicParsing -TimeoutSec 5; $cxUp = $true } catch { }
+    }
+    function Get-CxJson([string]$path) { (Invoke-WebRequest -Uri ($cxBase + $path) -UseBasicParsing -TimeoutSec 30).Content | ConvertFrom-Json }
+    function Invoke-CxPost([string]$path, [string]$body, [int]$TimeoutSec = 30) {
+        try {
+            $r = Invoke-WebRequest -Uri ($cxBase + $path) -Method POST -Body $body -ContentType 'application/json' -Headers $cxOrigin -UseBasicParsing -TimeoutSec $TimeoutSec
+            return @{ Code = $r.StatusCode; Body = $r.Content }
+        } catch {
+            $code = 0
+            if ($_.Exception.Response) { $code = $_.Exception.Response.StatusCode.value__ }
+            return @{ Code = $code; Body = '' }
+        }
+    }
+    function Get-CxRootConfig { Get-Content (Join-Path $cxRoot 'schedule.json') -Raw -Encoding UTF8 | ConvertFrom-Json }
+
+    Test-Case 'codex panel comes up on the throwaway root' { $cxUp }
+    Test-Case 'GET /api/status: codex installed (the stub, kind env) without spawning it; every task carries its provider' {
+        $before = @(Get-CodexStubCalls | Where-Object { $_ -like 'start *' }).Count
+        $s = Get-CxJson '/api/status'
+        $tagged = $true
+        foreach ($t in @($s.preheat.tasks)) { if (@('claude', 'codex') -notcontains [string]$t.provider) { $tagged = $false } }
+        $s.codex -and ($s.codex.installed -eq $true) -and ($s.codex.exeKind -eq 'env') -and $tagged -and
+            (@(Get-CodexStubCalls | Where-Object { $_ -like 'start *' }).Count -eq $before)
+    }
+    Test-Case 'GET /api/schedule?provider=: each section its own rules and its own token; no provider = Claude' {
+        $cl = Get-CxJson '/api/schedule'
+        $cx = Get-CxJson '/api/schedule?provider=codex'
+        ($cl.rules[0].days[0] -eq 'Mon') -and ($cx.rules[0].days[0] -eq 'Tue') -and $cl.mtime -and $cx.mtime -and
+            ($null -eq $cx.PSObject.Properties['proxy'])
+    }
+    Test-Case 'POST apply: the token is per section - a Codex save does not 409 a Claude save; each writes only its own section, keeps every other key' {
+        $cl0 = Get-CxJson '/api/schedule'
+        $cx0 = Get-CxJson '/api/schedule?provider=codex'
+        Remove-Item $cxBackendLog -ErrorAction SilentlyContinue
+        Set-CodexStub @{ profile = 'free30d' }
+        # free30d: no 5h window readable - the save is NOT refused for that
+        $a = Invoke-CxPost '/api/preheat/apply' ('{"provider":"codex","rules":[{"days":["Wed"],"reset":"16:00"}],"baseMtime":' + (ConvertTo-Json -InputObject ([string]$cx0.mtime)) + '}')
+        $b = Invoke-CxPost '/api/preheat/apply' ('{"rules":[{"days":["Thu"],"reset":"14:00"}],"baseMtime":' + (ConvertTo-Json -InputObject ([string]$cl0.mtime)) + '}')
+        $c = Get-CxRootConfig
+        $calls = @()
+        if (Test-Path $cxBackendLog) { $calls = @(Get-Content $cxBackendLog) }
+        ($a.Code -eq 200) -and ($b.Code -eq 200) -and
+            ($c.rules[0].days[0] -eq 'Thu') -and ($c.rules[0].reset -eq '14:00') -and
+            ($c.codex.rules[0].days[0] -eq 'Wed') -and ($c.codex.chase -eq $false) -and ($c.codex.home -eq $cxRootHome) -and
+            ($c.extra.keep -eq 1) -and ($c.proxy -eq '') -and ($c.chase -eq $true) -and
+            ($calls -contains 'apply -Provider codex') -and ($calls -contains 'apply -Provider claude') -and
+            (@(Get-CodexStubCalls | Where-Object { $_ -like 'start *' }).Count -eq 0)
+    }
+    Test-Case 'POST apply: a stale Codex token -> 409, an unknown provider -> 400, an empty Codex rule set is allowed' {
+        $cx0 = Get-CxJson '/api/schedule?provider=codex'
+        $stale = Invoke-CxPost '/api/preheat/apply' '{"provider":"codex","rules":[{"days":["Fri"],"reset":"16:00"}],"baseMtime":"1"}'
+        $bad   = Invoke-CxPost '/api/preheat/apply' '{"provider":"gemini","rules":[{"days":["Fri"],"reset":"16:00"}],"baseMtime":"1"}'
+        $empty = Invoke-CxPost '/api/preheat/apply' ('{"provider":"codex","rules":[],"baseMtime":' + (ConvertTo-Json -InputObject ([string]$cx0.mtime)) + '}')
+        $c = Get-CxRootConfig
+        ($stale.Code -eq 409) -and ($bad.Code -eq 400) -and ($empty.Code -eq 200) -and (@($c.codex.rules).Count -eq 0) -and
+            ($c.rules[0].days[0] -eq 'Thu')
+    }
+    Test-Case 'POST apply (Codex) on a schedule.json that does not parse -> 409 and the file untouched; while a Codex fire runs -> 409 busy' {
+        $sf = Join-Path $cxRoot 'schedule.json'
+        $keep = [System.IO.File]::ReadAllText($sf)
+        $lk = Join-Path $cxRoot '.fire-codex.lock'
+        $broken = '{"rules": [ {"days": ["Thu"], "reset": "14:00" '
+        try {
+            [System.IO.File]::WriteAllText($sf, $broken)
+            $u = Invoke-CxPost '/api/preheat/apply' '{"provider":"codex","rules":[{"days":["Fri"],"reset":"16:00"}]}'
+            $after = [System.IO.File]::ReadAllText($sf)
+            [System.IO.File]::WriteAllText($sf, $keep)
+            ('{"pid":' + $PID + ',"job":"x","startedAt":"2026-01-01T00:00:00"}') | Set-Content -Path $lk -Encoding UTF8
+            $b = Invoke-CxPost '/api/preheat/apply' '{"provider":"codex","rules":[{"days":["Fri"],"reset":"16:00"}]}'
+        } finally {
+            [System.IO.File]::WriteAllText($sf, $keep)
+            Remove-Item $lk -ErrorAction SilentlyContinue
+        }
+        ($u.Code -eq 409) -and ($after -eq $broken) -and ($b.Code -eq 409) -and ([System.IO.File]::ReadAllText($sf) -eq $keep)
+    }
+    Test-Case 'POST once with provider codex hands -Codex to the backend' {
+        Remove-Item $cxBackendLog -ErrorAction SilentlyContinue
+        $r = Invoke-CxPost '/api/preheat/once' '{"kind":"plus","value":"2h","provider":"codex"}'
+        $calls = @()
+        if (Test-Path $cxBackendLog) { $calls = @(Get-Content $cxBackendLog) }
+        ($r.Code -eq 200) -and ($calls.Count -eq 1) -and ($calls[0] -match '(^| )\+2h( |$)') -and ($calls[0] -match '(^| )-Codex( |$)')
+    }
+    Test-Case 'GET /api/ratelimits?provider=codex: the Codex cache verbatim, {} without one' {
+        $cf = Join-Path $cxRoot 'state-ratelimits-codex.json'
+        Remove-Item $cf -ErrorAction SilentlyContinue
+        $none = (Invoke-WebRequest -Uri "$cxBase/api/ratelimits?provider=codex" -UseBasicParsing -TimeoutSec 15).Content
+        [System.IO.File]::WriteAllText($cf, '{"capturedAt":"2026-10-26T00:00:00Z","source":"fixture","has5h":false}', (New-Object System.Text.UTF8Encoding($false)))
+        $some = (Invoke-WebRequest -Uri "$cxBase/api/ratelimits?provider=codex" -UseBasicParsing -TimeoutSec 15).Content | ConvertFrom-Json
+        ($none.Trim() -match '^\{\s*\}$') -and ($some.source -eq 'fixture') -and ($some.has5h -eq $false)
+    }
+    Test-Case 'GET /api/events?provider=: Codex fires on the Codex tab only, the Claude list unchanged' {
+        $cx = @((Get-CxJson '/api/events?provider=codex').events)
+        $cl = @((Get-CxJson '/api/events').events)
+        ($cx.Count -ge 2) -and (@($cx | Where-Object { $_.provider -ne 'codex' }).Count -eq 0) -and
+            ($cl.Count -eq 1) -and (@($cl | Where-Object { $_.provider -eq 'codex' }).Count -eq 0)
+    }
+    Test-Case 'GET /api/learn?provider=codex answers {unsupported:true}' {
+        (Get-CxJson '/api/learn?provider=codex').unsupported -eq $true
+    }
+    Test-Case 'POST /api/codex/refresh: 409 while a Codex fire holds the lock; otherwise one status -Codex -Json through the stub, allow-list only' {
+        $lock = Join-Path $cxRoot '.fire-codex.lock'
+        ('{"pid":' + $PID + ',"job":"x","startedAt":"' + (Get-Date).ToString('s', $cxInv) + '"}') | Set-Content -Path $lock -Encoding UTF8
+        $busy = Invoke-CxPost '/api/codex/refresh' '{}'
+        Remove-Item $lock -ErrorAction SilentlyContinue
+        Set-CodexStub @{ profile = 'free30d' }
+        $r = Invoke-CxPost '/api/codex/refresh' '{}' 90
+        $j = $null
+        try { $j = $r.Body | ConvertFrom-Json } catch { }
+        ($busy.Code -eq 409) -and ($r.Code -eq 200) -and $j -and ($j.installed -eq $true) -and ($j.has5h -eq $false) -and
+            (@(Get-CodexStubCalls | Where-Object { $_ -like 'rpc account/rateLimits/read*' }).Count -ge 1) -and (Test-CodexAllowList) -and
+            (@(Get-CodexStubCalls | Where-Object { $_ -like 'exec *' }).Count -eq 0)
+    }
+} finally {
+    if ($cxPanelProc) { try { Stop-Process -Id $cxPanelProc.Id -Force -ErrorAction SilentlyContinue } catch { } }
 }
 
 # -------------------------------------------------- statusline tap (node)
@@ -1234,11 +2287,12 @@ Test-Case 'every clock parse pins InvariantCulture, not the desktop culture' {
     # and calendar. The runtime happens to accept ':' anyway today, so the
     # culture case above cannot see this slip - only the source can.
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'platform.ps1')) {
+    foreach ($f in @('preheat.ps1', 'platform.ps1', 'codex.ps1')) {
         $c = Get-Content (Join-Path $Repo $f) -Raw -Encoding UTF8
         $all = ([regex]::Matches($c, 'ParseExact')).Count
         $pinned = ([regex]::Matches($c, 'ParseExact\([^\r\n]*InvariantCulture')).Count
-        if (($all -lt 1) -or ($all -ne $pinned)) { $ok = $false }
+        # codex.ps1 works in epoch seconds and may have no ParseExact at all
+        if ((($all -lt 1) -and ($f -ne 'codex.ps1')) -or ($all -ne $pinned)) { $ok = $false }
     }
     $ok
 }
@@ -1293,7 +2347,8 @@ Test-Case 'Quote-Arg doubles backslash runs before quotes (argv-splice guard)' {
     # escapes the quote itself lets a trailing-backslash value break out of its
     # argument. The panel's quoter must double backslash runs before any quote
     # and before the closing quote.
-    $p = Get-Content (Join-Path $Repo 'panel.ps1') -Raw -Encoding UTF8
+    # it lives in platform.ps1 since Codex support (the codex ping quotes with it too)
+    $p = (Get-Content (Join-Path $Repo 'panel.ps1') -Raw -Encoding UTF8) + (Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8)
     $p.Contains('(\\*)"') -and $p.Contains('(\\+)$')
 }
 Test-Case 'week-grid chips edit in place via the clock picker, committed on blur/Enter' {
@@ -1316,7 +2371,7 @@ Test-Case 'every shipped script carries a UTF-8 BOM (5.1 decodes BOM-less as ANS
     # legacy codepage: on cp936 the middle-dot chars in comments/corpus turn
     # to mojibake, and a bare [] class once became an invalid regex
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1')) {
+    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1', 'codex.ps1')) {
         $b = [System.IO.File]::ReadAllBytes((Join-Path $Repo $f))
         if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) { $ok = $false }
     }
@@ -1331,6 +2386,9 @@ Test-Case 'every ExitCode-reading Start-Process touches .Handle first (PS 5.1 nu
         $c = Get-Content (Join-Path $Repo $f) -Raw -Encoding UTF8
         if (([regex]::Matches($c, '\$null = \$p\.Handle')).Count -lt 1) { $ok = $false }
     }
+    # codex.ps1 judges the exec exit code the same way (its variable may differ)
+    $cx = Get-Content (Join-Path $Repo 'codex.ps1') -Raw -Encoding UTF8
+    if (([regex]::Matches($cx, '\$null = \$\w+\.Handle')).Count -lt 1) { $ok = $false }
     $ok
 }
 Test-Case 'statusline on/off consult BOTH settings files and the sidecar path' {
@@ -1343,14 +2401,14 @@ Test-Case 'statusline on/off consult BOTH settings files and the sidecar path' {
 }
 Test-Case 'every script parses' {
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1')) {
+    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'test.ps1', 'codex.ps1', (Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
         try { $null = [scriptblock]::Create((Get-Content (Join-Path $Repo $f) -Raw)) } catch { $ok = $false }
     }
     $ok
 }
 Test-Case 'no PowerShell 7-only syntax (project claims 5.1 support)' {
     $ok = $true
-    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1')) {
+    foreach ($f in @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'codex.ps1', (Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
         $c = Get-Content (Join-Path $Repo $f) -Raw
         if ($c -match '\?\?' -or $c -match '\)\s*\?\s*[^\s]+\s*:\s') { $ok = $false }
     }
@@ -1372,7 +2430,8 @@ Test-Case 'the panel surfaces the ratelimit cache bilingually' {
 Test-Case 'personal state stays out of git' {
     $ignored = @('schedule.json', 'preheat-log.jsonl', '.claude',
         'state-ratelimits.json', 'statusline-original.json',
-        'launchd-err.log', 'claude-ignite-promo', '.fire.lock')
+        'launchd-err.log', 'claude-ignite-promo', '.fire.lock',
+        '.fire-codex.lock', 'state-ratelimits-codex.json', 'firepit-codex')
     $ok = $true
     foreach ($p in $ignored) {
         git -C $Repo check-ignore $p 2>$null | Out-Null
@@ -1380,8 +2439,90 @@ Test-Case 'personal state stays out of git' {
     }
     $ok
 }
+$cxProductPs1 = @('preheat.ps1', 'panel.ps1', 'platform.ps1', 'install.ps1', 'codex.ps1')
+Test-Case 'every product .ps1/.vbs/.cjs is pure ASCII after the BOM (5.1 reads a BOM-less byte >= 0x80 through the ANSI code page)' {
+    # web/index.html is exempt: it carries the Chinese strings on purpose
+    $files = @(Get-ChildItem -Path $Repo -Filter '*.ps1' | ForEach-Object { $_.FullName }) +
+        @((Join-Path $Repo 'run-hidden.vbs'), (Join-Path $Repo 'statusline-tap.cjs')) +
+        @(Get-ChildItem -Path (Join-Path $Repo (Join-Path '.github' 'workflows')) -Filter '*.ps1' | ForEach-Object { $_.FullName })
+    $bad = @()
+    foreach ($f in $files) {
+        if (-not (Test-Path $f)) { continue }
+        $b = [System.IO.File]::ReadAllBytes($f)
+        $start = 0
+        if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $start = 3 }
+        for ($i = $start; $i -lt $b.Length; $i++) { if ($b[$i] -ge 0x80) { $bad += (Split-Path $f -Leaf); break } }
+    }
+    if ($bad.Count -gt 0) { return ('non-ASCII in: ' + ($bad -join ', ')) }
+    $true
+}
+Test-Case 'no PowerShell 7-only runtime API in product scripts (ArgumentList, Kill($true), StandardInputEncoding, -AsHashtable, bare $IsWindows)' {
+    # the syntax guard above cannot see these: they parse fine on 5.1 and
+    # only throw when the line runs - inside a scheduled fire nobody watches
+    $bad = @()
+    foreach ($f in @($cxProductPs1) + @((Join-Path '.github' (Join-Path 'workflows' 'stub-codex.ps1')))) {
+        $n = 0
+        foreach ($line in @(Get-Content (Join-Path $Repo $f) -Encoding UTF8)) {
+            $n++
+            $t = $line.Trim()
+            if ($t.StartsWith('#')) { continue }
+            if (($t -match '\.ArgumentList\b') -or ($t -match 'Kill\(\s*\$true\s*\)') -or ($t -match 'StandardInputEncoding') -or
+                ($t -match '-AsHashtable') -or ($t -match 'ConvertFrom-Json[^|;]*-Depth') -or ($t -match '-Encoding\s+utf8NoBOM') -or
+                (($t -match '\$Is(Windows|MacOS|Linux)\b') -and ($t -notmatch '\btry\b'))) { $bad += ('{0}:{1}' -f $f, $n) }
+        }
+    }
+    if ($bad.Count -gt 0) { return ('7-only API at ' + ($bad -join ', ')) }
+    $true
+}
+Test-Case 'the codex RPC allow-list holds exactly the four read-only methods (no reset-credit consume, no usage/model calls)' {
+    $c = Get-Content (Join-Path $Repo 'codex.ps1') -Raw -Encoding UTF8
+    $m = [regex]::Match($c, "@\(([^)]*'account/rateLimits/read'[^)]*)\)")
+    if (-not $m.Success) { return 'no @(...) allow-list naming account/rateLimits/read found in codex.ps1' }
+    $items = @([regex]::Matches($m.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+    ($items.Count -eq 4) -and ($items -contains 'initialize') -and ($items -contains 'initialized') -and
+        ($items -contains 'account/read') -and ($items -contains 'account/rateLimits/read') -and
+        ($m.Groups[1].Value -notmatch 'consume|usage/read|model/list')
+}
+Test-Case 'the codex exec argv in source is the safe ping: ephemeral, read-only sandbox, user config/rules ignored, features off, no escalation flag' {
+    $c = Get-Content (Join-Path $Repo 'codex.ps1') -Raw -Encoding UTF8
+    $ok = $c.Contains('--ephemeral') -and $c.Contains('--ignore-user-config') -and $c.Contains('--ignore-rules') -and
+        $c.Contains('--skip-git-repo-check') -and ($c -match "'-s'\s*,\s*'read-only'|-s read-only") -and
+        $c.Contains('features.hooks=false') -and $c.Contains('features.plugins=false') -and $c.Contains('Reply with exactly: hi')
+    foreach ($f in @('hooks', 'memories', 'goals', 'apps', 'plugins')) { $ok = $ok -and $c.Contains('features.' + $f + '=false') }
+    # no model, effort or profile pinned: the account's default meters the bucket the user works in
+    $ok -and ($c -notmatch '--dangerously-bypass|--full-auto|--yolo|danger-full-access|workspace-write') -and
+        ($c -notmatch "'-m'|`"-m`"|--model|--profile|--oss|model_reasoning_effort")
+}
+Test-Case 'no product line reads auth.json (Test-Path and the mtime only)' {
+    $bad = @()
+    foreach ($f in $cxProductPs1) {
+        foreach ($line in @(Get-Content (Join-Path $Repo $f) -Encoding UTF8)) {
+            if (($line -match 'auth\.json') -and ($line -match 'Get-Content|ReadAll|Copy-Item|OpenRead|Import-|ConvertFrom-Json|\[System\.IO\.File\]::Open')) { $bad += $f }
+        }
+    }
+    $bad.Count -eq 0
+}
+Test-Case 'the macOS stale-once sweep and the e2e sweep both cover Codex labels' {
+    $p = Get-Content (Join-Path $Repo 'platform.ps1') -Raw -Encoding UTF8
+    $e = Get-Content (Join-Path $Repo (Join-Path '.github' (Join-Path 'workflows' 'e2e-mac.ps1'))) -Raw -Encoding UTF8
+    $p.Contains("`$labelRe += 'Codex-'") -and $p.Contains(")Once-\d{8}-\d{4}')") -and $e.Contains('com\.claude-preheat\.[A-Za-z0-9-]+') -and $e.Contains('-Codex')
+}
+Test-Case 'panel page: Claude | Codex tabs remembered, provider on every call, Refresh wired, the no-5h-window banner in both languages' {
+    $h = Get-Content (Join-Path $Repo (Join-Path 'web' 'index.html')) -Raw -Encoding UTF8
+    $cut = $h.IndexOf('  en: {')
+    if ($cut -lt 0) { return $false }
+    $zh = $h.Substring(0, $cut); $en = $h.Substring($cut)
+    # 'du bu dao 5 xiao shi e du chuang' by code point: this file stays pure ASCII
+    $no5h = (-join ([char[]]@(0x8BFB, 0x4E0D, 0x5230))) + ' 5 ' + (-join ([char[]]@(0x5C0F, 0x65F6, 0x989D, 0x5EA6, 0x7A97)))
+    ($h -match 'clr_provider') -and ($h -match '/api/codex/refresh') -and ($h -match 'provider=') -and
+        $zh.Contains($no5h) -and ($en -match '(?i)\bno\b[^"''\n]{0,40}5[- ]?h(our)?\b[^"''\n]{0,20}window')
+}
 
 # ----------------------------------------------------------------- summary
+foreach ($n in $cxEnvPrev.Keys) {
+    if ($null -eq $cxEnvPrev[$n]) { Remove-Item ('Env:' + $n) -ErrorAction SilentlyContinue }
+    else { [Environment]::SetEnvironmentVariable($n, $cxEnvPrev[$n]) }
+}
 Remove-Item $Tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

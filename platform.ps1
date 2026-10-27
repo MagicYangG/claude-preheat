@@ -8,7 +8,8 @@ One scheduling contract, two backends:
   macOS   : launchd user LaunchAgents (~/Library/LaunchAgents/com.claude-preheat.*)
 
 Job names are identical on both platforms (ClaudePreheat-Wk-HHmm-Days and
-ClaudePreheat-Once-yyyyMMdd-HHmm). On macOS a name maps 1:1 to the launchd
+ClaudePreheat-Once-yyyyMMdd-HHmm; Codex jobs carry an extra Codex- after the
+prefix, see Get-JobProvider). On macOS a name maps 1:1 to the launchd
 label com.claude-preheat.<name minus the ClaudePreheat- prefix>, and the NAME
 is the schedule: launchd has no NextRunTime query, so next-fire times are
 recomputed from the name alone (Get-JobNextRun).
@@ -34,6 +35,25 @@ $JobNamePrefix      = 'ClaudePreheat-'
 $LaunchdLabelPrefix = 'com.claude-preheat.'
 $LaunchAgentDir     = if ($OnMac) { Join-Path $HOME (Join-Path 'Library' 'LaunchAgents') } else { $null }
 $LaunchdErrLog      = Join-Path $PlatformRoot 'launchd-err.log'
+
+function Get-JobProvider([string]$Name) {
+    # which provider a job belongs to - the one place that knows the naming:
+    # every name site (sweeps, next-run decode, spent check, status views)
+    # asks here instead of matching prefixes of its own
+    if ($Name -like 'ClaudePreheat-Codex-*') { return 'codex' }
+    'claude'
+}
+
+function Quote-Arg([string]$a) {
+    if ($a -notmatch '[\s"]') { return $a }
+    # Windows argv rules: a backslash run is literal UNLESS it precedes a quote.
+    # Escaping only the quote (" -> \") lets a value ending in \" splice extra
+    # argv tokens into the child process - double every backslash run before a
+    # quote (and before the closing quote), then escape the quote itself.
+    $escaped = [regex]::Replace($a, '(\\*)"', { param($m) ($m.Groups[1].Value * 2) + '\"' })
+    $escaped = [regex]::Replace($escaped, '(\\+)$', { param($m) $m.Groups[1].Value * 2 })
+    '"' + $escaped + '"'
+}
 
 function Get-ClaudeHome {
     # USERPROFILE wins when present (Windows reality, and how tests redirect the
@@ -159,12 +179,13 @@ function ConvertFrom-LaunchdLabel([string]$label) { $JobNamePrefix + $label.Subs
 
 function Get-JobNextRun([string]$name) {
     # the job name carries its whole schedule - see the header note
-    if ($name -match '^ClaudePreheat-Once-(\d{8})-(\d{4})$') {
+    # (?:Codex-)? - a Codex job decodes exactly like its Claude twin
+    if ($name -match '^ClaudePreheat-(?:Codex-)?Once-(\d{8})-(\d{4})$') {
         # InvariantCulture, not $null: $null means CurrentCulture, and a non-
         # Gregorian calendar (th-TH, ar-SA) parses these digits into a wrong year
         try { return [datetime]::ParseExact($Matches[1] + $Matches[2], 'yyyyMMddHHmm', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
     }
-    if ($name -match '^ClaudePreheat-Wk-(\d{2})(\d{2})-([A-Za-z]+)$') {
+    if ($name -match '^ClaudePreheat-(?:Codex-)?Wk-(\d{2})(\d{2})-([A-Za-z]+)$') {
         $tod  = New-Object timespan ([int]$Matches[1]), ([int]$Matches[2]), 0
         $tags = $Matches[3]
         $map  = @{ Mon = 'Monday'; Tue = 'Tuesday'; Wed = 'Wednesday'; Thu = 'Thursday'; Fri = 'Friday'; Sat = 'Saturday'; Sun = 'Sunday' }
@@ -388,15 +409,33 @@ function Remove-PreheatJobs {
     }
 }
 
-function Remove-StaleOnceJobs {
+function Test-LaunchdRunning([string]$Label) {
+    # launchd's own view: a plist on disk cannot tell a one-shot whose fire is
+    # running (a Codex fire takes minutes) from a spent one
+    try {
+        $uid = Get-MacUid
+        return (((& launchctl print "gui/$uid/$Label" 2>$null) -join "`n") -match 'state = running')
+    } catch { return $false }
+}
+
+function Remove-StaleOnceJobs([string]$Provider = 'all') {
     # a fired one-shot must not linger: on Windows its trigger is spent, on
-    # macOS the Month/Day calendar spec would come around AGAIN next year
+    # macOS the Month/Day calendar spec would come around AGAIN next year.
+    # $Provider (claude|codex|all): a fire or a provider-scoped apply sweeps
+    # only its own provider's one-shots - the ones whose lock it holds.
+    $pats = @(); $labelRe = @()
+    if ($Provider -ne 'codex') { $pats += 'ClaudePreheat-Once*'; $labelRe += '' }
+    if ($Provider -ne 'claude') { $pats += 'ClaudePreheat-Codex-Once*'; $labelRe += 'Codex-' }
     if ($OnMac) {
-        foreach ($j in @(Get-PreheatJobs 'ClaudePreheat-Once*')) {
+        $onceJobs = @()
+        foreach ($pat in $pats) { $onceJobs += @(Get-PreheatJobs $pat) }
+        foreach ($j in $onceJobs) {
             # never boot out the job whose fire is running right now: a fire that
             # launchd delivers late (wake from sleep) is already past-due by its
-            # own name, and bootout would SIGTERM it before the ping
+            # own name, and bootout would SIGTERM it before the ping. Not our
+            # own only - two one-shots delivered together at wake both run.
             if ($env:CLAUDE_PREHEAT_SELF -and ($j.name -eq $env:CLAUDE_PREHEAT_SELF)) { continue }
+            if (Test-LaunchdRunning (ConvertTo-LaunchdLabel $j.name)) { continue }
             if ($j.next -and ($j.next -lt (Get-Date).AddMinutes(-3))) {
                 Remove-PreheatJobs $j.name
             }
@@ -410,17 +449,21 @@ function Remove-StaleOnceJobs {
             $selfLabel = $null
             if ($env:CLAUDE_PREHEAT_SELF) { $selfLabel = ConvertTo-LaunchdLabel $env:CLAUDE_PREHEAT_SELF }
             $done = @{}
-            foreach ($m in [regex]::Matches($printed, 'com\.claude-preheat\.Once-\d{8}-\d{4}')) {
+            foreach ($m in [regex]::Matches($printed, 'com\.claude-preheat\.(' + ($labelRe -join '|') + ')Once-\d{8}-\d{4}')) {
                 $label = $m.Value
                 if ($done[$label]) { continue }
                 $done[$label] = $true
                 if ($selfLabel -and ($label -eq $selfLabel)) { continue }
                 if (Test-Path (Join-Path $LaunchAgentDir ($label + '.plist'))) { continue }
+                # a fire deletes its plist on the way out: still running = keep
+                if (Test-LaunchdRunning $label) { continue }
                 & launchctl bootout "gui/$uid/$label" 2>$null | Out-Null
             }
         } catch { }
     } else {
-        Get-ScheduledTask -TaskName 'ClaudePreheat-Once*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $tasks = @()
+        foreach ($pat in $pats) { $tasks += @(Get-ScheduledTask -TaskName $pat -ErrorAction SilentlyContinue) }
+        $tasks | ForEach-Object {
             # never unregister a task whose instance is running: the vbs shim
             # now waits for the fire, so that instance may be THIS very process,
             # and deleting a running task can tear its process tree down
@@ -476,13 +519,34 @@ function Test-WakeTimers {
     } catch { }
 }
 
-function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '', [string]$Extra = '') {
+function Send-Toast([bool]$Ok, $Anchored = $null, [string]$Kind = '', [string]$Extra = '', [string]$Provider = 'claude', [string]$Text = '') {
     # $Anchored: $true = this ping opened a fresh window, $false = it landed in
     # a window that was already running (harmless, but the toast should not
     # claim credit), $null = unknown. $Kind names the failure so an expired
     # login gets the one message that tells the user what to actually do.
+    # Codex: $Kind carries the fire's state or failure kind (Invoke-CodexFire),
+    # each with its own line - a Codex login is fixed with a different command.
+    # $Text overrides whatever the rest would say.
     $msg = 'preheat FAILED - check preheat-log.jsonl'
-    if ($Ok) {
+    if ($Text) {
+        $msg = $Text
+    } elseif ($Provider -eq 'codex') {
+        $msg = switch ($Kind) {
+            'anchored'        { 'Codex window preheated - new 5h window anchored'; break }
+            'running'         { 'Codex window already running - no ping sent' + $Extra; break }
+            'moved'           { 'Codex window opened by someone else' + $Extra; break }
+            'sliding'         { 'Codex ping did not start a window - see: preheat status -Codex'; break }
+            'unknown'         { 'Codex pinged - window state unreadable, see: preheat status -Codex'; break }
+            'no5h'            { 'Codex: this account has no 5h window - preheat skipped, no quota spent'; break }
+            'auth'            { 'Codex preheat FAILED - login expired? run: codex login'; break }
+            'apikey'          { 'Codex preheat skipped - API key sign-in has no 5h window'; break }
+            'config-mismatch' { 'Codex preheat FAILED - the ping could not use your login (config mismatch), see: preheat report -Codex'; break }
+            'notfound'        { 'Codex preheat FAILED - codex not found (set PREHEAT_CODEX_EXE)'; break }
+            'limit'           { 'Codex preheat skipped - usage limit already hit'; break }
+            'paused'          { 'Codex preheat paused - 2 pings in a row started no window; resume: preheat apply -Provider codex'; break }
+            default           { 'Codex preheat FAILED - check preheat-log.jsonl' }
+        }
+    } elseif ($Ok) {
         if ($null -eq $Anchored)   { $msg = 'window preheated' }
         elseif ($Anchored -eq $true) { $msg = 'window preheated - new 5h window anchored' }
         else                       { $msg = 'ping landed in a running window - anchor unchanged' }

@@ -1,5 +1,5 @@
 {
-  "_readme": "days: Mon..Sun | reset = HH:mm target reset time (previous 5h window expiry); fire time auto = reset - 5h | edit then run: preheat apply | chase: false = no follow-up ping when a scheduled preheat lands in a running window",
+  "_readme": "days: Mon..Sun | reset = HH:mm target reset time (previous 5h window expiry); fire time auto = reset - 5h | edit then run: preheat apply | chase: false = no follow-up ping when a scheduled preheat lands in a running window | Codex (beta): add \"codex\": {\"rules\": [same format], \"chase\": true} to preheat Codex too, then: preheat apply",
   "proxy": "",
   "chase": true,
   "rules": [
