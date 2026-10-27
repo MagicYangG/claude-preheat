@@ -53,7 +53,7 @@ Codex 支持目前是 beta。同一套 `schedule.json`、面板和计划任务�
 
 **要求**：已安装 [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) 或 Codex 桌面端，并用 ChatGPT 账号登录（API key 登录没有 5 小时窗，不会 ping）。Plus 等有 5 小时窗的套餐可用；Free / Go / Pro 读不到 5 小时窗时直接跳过、不花额度（Go 实测只有 30 天窗）；其他套餐读不到时照样 ping、会花额度。只预热 Codex 不需要 Claude Code 和 Claude 订阅。
 
-**启用**：最省事的是打开面板，切到页顶的 Codex 标签，选好时刻后应用（只动 Codex 一边）。手改的话，在仓库目录的 `schedule.json`（install.ps1 生成）里加一个 `codex` 键，和现有的 `rules`、`proxy` 同级（上一项末尾补逗号；预热时刻同样 = reset − 5h）：
+**启用**：可以直接让 AI 编程工具帮你配（说一句「把 Codex 预热设成工作日 15:00 重置」），也可以打开面板，切到页顶的 Codex 标签，选好时刻后应用（只动 Codex 一边）。手改的话，在仓库目录的 `schedule.json`（install.ps1 生成）里加一个 `codex` 键，和现有的 `rules`、`proxy` 同级（上一项末尾补逗号；预热时刻同样 = reset − 5h）：
 
 ```json
 "codex": { "rules": [ { "days": ["Mon", "Tue", "Wed", "Thu", "Fri"], "reset": "15:00" } ], "chase": true }

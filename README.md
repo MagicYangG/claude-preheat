@@ -53,7 +53,7 @@ Codex support is a beta for now. The same `schedule.json`, panel and scheduled t
 
 **Requirements**: the [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) or the Codex desktop app, signed in with a ChatGPT account (an API-key sign-in has no 5-hour window, so nothing is pinged). Plus and other plans with a 5-hour window work; Free / Go / Pro skip and spend nothing when no 5-hour window can be read (Go, checked on a real account, has only a 30-day window); any other plan whose window cannot be read is still pinged and spends quota. Claude Code and a Claude subscription are not needed if you only preheat Codex.
 
-**Enable**: the easiest way is the panel: switch to the Codex tab at the top, pick the times and apply (only the Codex side is touched). To edit by hand, add a `codex` key to `schedule.json` in the repo directory (created by install.ps1), at the same level as the existing `rules` and `proxy` (add a comma after the previous entry; fire time is again reset − 5h):
+**Enable**: just ask your AI coding tool to set it up (say "set Codex preheat to a 15:00 reset on weekdays"), or open the panel, switch to the Codex tab at the top, pick the times and apply (only the Codex side is touched). To edit by hand, add a `codex` key to `schedule.json` in the repo directory (created by install.ps1), at the same level as the existing `rules` and `proxy` (add a comma after the previous entry; fire time is again reset − 5h):
 
 ```json
 "codex": { "rules": [ { "days": ["Mon", "Tue", "Wed", "Thu", "Fri"], "reset": "15:00" } ], "chase": true }

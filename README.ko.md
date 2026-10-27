@@ -53,7 +53,7 @@ Codex 지원은 현재 beta입니다. 같은 `schedule.json`, 패널, 예약 작
 
 **요구 사항**: [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) 또는 Codex 데스크톱 앱을 설치하고 ChatGPT 계정으로 로그인해 두어야 합니다(API 키 로그인에는 5시간 윈도우가 없으므로 핑을 보내지 않습니다). Plus 등 5시간 윈도우가 있는 요금제에서 쓸 수 있습니다. Free / Go / Pro는 5시간 윈도우를 읽지 못하면 건너뛰고 사용량을 쓰지 않습니다(Go는 실제 계정에서 확인한 결과 30일 윈도우만 있습니다). 그 밖의 요금제에서 읽지 못하면 그대로 핑을 보내고 사용량을 씁니다. Codex만 예열한다면 Claude Code와 Claude 구독은 필요 없습니다.
 
-**켜기**: 가장 쉬운 방법은 패널입니다. 페이지 상단에서 Codex 탭으로 바꾸고 시각을 골라 적용하세요(Codex 쪽만 바뀝니다). 직접 편집한다면 저장소 디렉터리의 `schedule.json`(install.ps1이 생성)에 `codex` 키를 추가합니다. 기존 `rules`, `proxy` 와 같은 수준에 두고, 바로 앞 항목 끝에 쉼표를 붙이세요(예열 시각은 마찬가지로 reset − 5h):
+**켜기**: AI 코딩 도구에 맡기면 간단합니다("Codex 예열을 평일 15:00 리셋으로 설정해 줘"라고만 말하면 됩니다). 패널에서는 페이지 상단에서 Codex 탭으로 바꾸고 시각을 골라 적용하세요(Codex 쪽만 바뀝니다). 직접 편집한다면 저장소 디렉터리의 `schedule.json`(install.ps1이 생성)에 `codex` 키를 추가합니다. 기존 `rules`, `proxy` 와 같은 수준에 두고, 바로 앞 항목 끝에 쉼표를 붙이세요(예열 시각은 마찬가지로 reset − 5h):
 
 ```json
 "codex": { "rules": [ { "days": ["Mon", "Tue", "Wed", "Thu", "Fri"], "reset": "15:00" } ], "chase": true }
